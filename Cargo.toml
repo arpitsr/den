@@ -1,0 +1,15 @@
+[package]
+name = "sb"
+version = "0.1.0"
+edition = "2021"
+description = "Run any local coding-agent CLI inside an AgentFS sandbox, with typed SDK access to the resulting state."
+
+[[bin]]
+name = "sb"
+path = "src/main.rs"
+
+[dependencies]
+agentfs-sdk = "0.6.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
+libc = "0.2"
