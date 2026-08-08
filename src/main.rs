@@ -108,14 +108,29 @@ fn session_id(profile: &str) -> String {
     if std::env::var("PIT_NEW").as_deref() == Ok("1") {
         return new_uuid();
     }
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    format!("{}-{}", profile, slug(&cwd))
+    format!("{}-{}", profile, slug(&cwd_string()))
 }
 
 fn agentfs_bin() -> String {
     std::env::var("PIT_AGENTFS").unwrap_or_else(|_| "agentfs".to_string())
+}
+
+/// ~/.agentfs/run — where sessions (and their delta DBs) persist
+fn run_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join(".agentfs/run"))
+}
+
+fn cwd_string() -> String {
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Run one future on a throwaway runtime (sync CLI entry points).
+/// Note: if the future itself returns Result, you need `??` at the call site.
+fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
+    Ok(tokio::runtime::Runtime::new()?.block_on(f))
 }
 
 /// Reuse-or-recreate gate for the persisted session dir.
@@ -137,37 +152,16 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
     if std::env::var("PIT_NO_DROP").as_deref() == Ok("1") {
         return Ok(());
     }
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let run_dir = PathBuf::from(format!("{home}/.agentfs/run"));
+    let run_dir = run_dir()?;
     let dir = run_dir.join(sid);
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let stamp = format!("{cwd}\n{}", allows.join("\n"));
+    let stamp = format!("{}\n{}", cwd_string(), allows.join("\n"));
     let stamp_path = run_dir.join(".stamps").join(sid);
 
     if dir.exists() {
         if std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
             return Ok(()); // same config — join, keeping the previous delta
         }
-        // A previous run may have left a stale FUSE mount on <dir>/mnt (crash,
-        // timeout, Ctrl-C cleanup race). Unmount before touching the dir, else
-        // the kernel keeps a mount attached to a dead path and the next
-        // session at that path fails with ENOENT.
-        let mnt = dir.join("mnt");
-        if mnt.exists() {
-            // `fusermount -uz` (lazy unmount); fall back to `umount -l`.
-            let unmounted = Command::new("fusermount")
-                .args(["-uz", &mnt.to_string_lossy()])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !unmounted {
-                let _ = Command::new("umount")
-                    .args(["-l", &mnt.to_string_lossy()])
-                    .status();
-            }
-        }
+        unmount_stale(&dir.join("mnt"));
         if session_has_changes(&dir) {
             // ponytail: archives are never GC'd — rm ~/.agentfs/run/*.archived-* by hand
             let ts = std::time::SystemTime::now()
@@ -191,6 +185,27 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// A previous run may have left a stale FUSE mount on <dir>/mnt (crash,
+/// timeout, Ctrl-C cleanup race). Unmount before touching the dir, else the
+/// kernel keeps a mount attached to a dead path and the next session at that
+/// path fails with ENOENT.
+fn unmount_stale(mnt: &Path) {
+    if !mnt.exists() {
+        return;
+    }
+    // `fusermount -uz` (lazy unmount); fall back to `umount -l`.
+    let unmounted = Command::new("fusermount")
+        .args(["-uz", &mnt.to_string_lossy()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !unmounted {
+        let _ = Command::new("umount")
+            .args(["-l", &mnt.to_string_lossy()])
+            .status();
+    }
+}
+
 /// True if the session's delta DB records any change. Fails closed (true) so
 /// an unreadable DB gets archived, not deleted.
 fn session_has_changes(dir: &Path) -> bool {
@@ -198,21 +213,19 @@ fn session_has_changes(dir: &Path) -> bool {
     if !db.exists() {
         return false;
     }
-    let has = |rt: tokio::runtime::Runtime| {
-        rt.block_on(async {
-            let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
-            match AgentFS::open(opts).await {
-                Ok(a) => {
-                    let (delta, whiteouts) = fetch_diff(&a).await;
-                    !delta.is_empty() || !whiteouts.is_empty()
-                }
-                Err(_) => true,
+    let check = async {
+        let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+        match AgentFS::open(opts).await {
+            Ok(a) => {
+                let (delta, whiteouts) = fetch_diff(&a).await;
+                !delta.is_empty() || !whiteouts.is_empty()
             }
-        })
+            Err(_) => true,
+        }
     };
     match tokio::runtime::Runtime::new() {
-        Ok(rt) => has(rt),
-        Err(_) => true,
+        Ok(rt) => rt.block_on(check),
+        Err(_) => true, // can't build a runtime -> treat as "has changes"
     }
 }
 
@@ -287,11 +300,8 @@ fn build_argv(
             )
         })
     {
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
         v.push("--name".into());
-        v.push(slug(&cwd));
+        v.push(slug(&cwd_string()));
     }
     for a in passthrough {
         v.push(a.clone());
@@ -301,8 +311,7 @@ fn build_argv(
 
 // ---- AgentFS SDK: open a persisted session delta DB --------------------------
 fn delta_db_path(sid: &str) -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(format!("{home}/.agentfs/run/{sid}/delta.db")))
+    Ok(run_dir()?.join(sid).join("delta.db"))
 }
 
 /// Open the session's delta layer via the SDK. Returns None if the DB isn't
@@ -365,13 +374,13 @@ async fn print_run_summary(sid: &str) {
             ""
         }
     );
-    for p in sorted(&delta).iter().take(20) {
+    for p in sorted(&delta).into_iter().take(20) {
         eprintln!("  + {p}");
     }
     if delta.len() > 20 {
         eprintln!("  … {} more", delta.len() - 20);
     }
-    for p in sorted(&whiteouts).iter().take(20) {
+    for p in sorted(&whiteouts).into_iter().take(20) {
         eprintln!("  - {p}");
     }
     if whiteouts.len() > 20 {
@@ -381,10 +390,9 @@ async fn print_run_summary(sid: &str) {
 
 // ---- subcommands -------------------------------------------------------------
 
-fn cmd_run(profile_name: &str, passthrough: &[String]) -> Result<i32> {
+fn cmd_run(profile_name: &str, sid: &str, passthrough: &[String]) -> Result<i32> {
     let bin = agentfs_bin();
-    let sid = session_id(profile_name);
-    let argv = build_argv(&bin, profile_name, &sid, passthrough)?;
+    let argv = build_argv(&bin, profile_name, sid, passthrough)?;
     // spawn + wait (not exec) so we can print the SDK delta summary afterwards
     // signal handlers so SIGINT goes to the sandboxed agent (same pgrp) and
     // not to `pit`.
@@ -402,8 +410,7 @@ fn cmd_run(profile_name: &str, passthrough: &[String]) -> Result<i32> {
     };
     // This runs after the sandboxed agent has exited and the delta DB is
     // persisted — the point where we bind the SDK.
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(print_run_summary(&sid));
+    block_on(print_run_summary(sid))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -419,8 +426,7 @@ fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
 }
 
 fn cmd_inspect(sid: &str) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
+    block_on(async move {
         let db_path = delta_db_path(sid)?;
         let agent = match open_session(sid).await? {
             Some(a) => a,
@@ -450,7 +456,7 @@ fn cmd_inspect(sid: &str) -> Result<()> {
             }
         }
         Ok(())
-    })
+    })?
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -543,13 +549,11 @@ fn prompt_session_selection(rows: &[SessionRow]) -> Result<String> {
 }
 
 fn load_session_rows() -> Result<(PathBuf, Vec<SessionRow>)> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let run_dir = PathBuf::from(format!("{home}/.agentfs/run"));
+    let run_dir = run_dir()?;
     if !run_dir.exists() {
         return Ok((run_dir, Vec::new()));
     }
-    let rt = tokio::runtime::Runtime::new()?;
-    let rows = rt.block_on(collect_session_rows(&run_dir))?;
+    let rows = block_on(collect_session_rows(&run_dir))??;
     Ok((run_dir, rows))
 }
 
@@ -647,19 +651,12 @@ fn main() -> Result<()> {
             let (pname, passthrough) = split_profile(rest)?;
             cmd_dump(&pname, &passthrough)
         }
-        [c] if c == "inspect" => {
-            let sid = select_session()?;
-            cmd_inspect(&sid)
-        }
-        [c, flag] if c == "inspect" && flag == "--select" => {
-            let sid = select_session()?;
-            cmd_inspect(&sid)
-        }
         [c, rest @ ..] if c == "inspect" => {
-            let sid = rest
-                .first()
-                .ok_or_else(|| anyhow!("pit inspect [--select|<session-id>]"))?;
-            cmd_inspect(sid)
+            let sid = match rest.first().map(String::as_str) {
+                None | Some("--select") => select_session()?,
+                Some(sid) => sid.to_string(),
+            };
+            cmd_inspect(&sid)
         }
         [pname, passthrough @ ..] => {
             if profile(pname).is_none() {
@@ -676,7 +673,7 @@ fn main() -> Result<()> {
             let sid = session_id(pname);
             let allows = effective_allows(&profile(pname).expect("profile checked above"));
             drop_stale_session(&sid, &allows)?;
-            let code = cmd_run(pname, passthrough)?;
+            let code = cmd_run(pname, &sid, passthrough)?;
             std::process::exit(code);
         }
     }
