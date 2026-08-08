@@ -89,10 +89,10 @@ same dir **resumes** the same sandbox (changes persist across calls).
 
 | env            | effect                                                          |
 |----------------|----------------------------------------------------------------|
-| `SB_SESSION`   | pin/resume this session id instead of the `<profile>-<dir>` default |
-| `SB_NEW=1`     | start a fresh unique session, nothing carried over             |
+| `PIT_SESSION`   | pin/resume this session id instead of the `<profile>-<dir>` default |
+| `PIT_NEW=1`     | start a fresh unique session, nothing carried over             |
 | `PIT_AGENTFS`   | path to the `agentfs` binary (default: from `PATH`)            |
-| `SB_QUIET=1`   | don't print the post-run delta summary                          |
+| `PIT_QUIET=1`   | don't print the post-run delta summary                          |
 
 ### Inspecting sessions
 
