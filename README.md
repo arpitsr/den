@@ -67,8 +67,9 @@ pit opencode
 pit list                      # configured profiles
 pit selftest                  # sanity-check argv assembly (no agentfs needed)
 pit dump codex exec --json    # print the exact `agentfs run` argv (no exec)
-pit sessions                   # list persisted sessions with changed/deleted counts
-pit inspect <session-id>       # open a session's delta DB and show diff + timeline
+pit sessions                  # list persisted sessions with changed/deleted counts
+pit sessions --select         # show numbered sessions, choose one, print its id
+pit inspect [session-id]      # open a session's delta DB; omit id to choose interactively
 ```
 
 The wrapped agent runs normally and sees its own working tree; writes land in the
@@ -97,8 +98,9 @@ same dir **resumes** the same sandbox (changes persist across calls).
 ### Inspecting sessions
 
 ```bash
-pit sessions                  # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
-pit inspect <session-id>     # full diff +, deletions -, and tool-call timeline
+pit sessions                 # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
+pit sessions --select        # number the list, prompt for a choice, print the selected id
+pit inspect [session-id]     # full diff +, deletions -, and tool-call timeline; omit id to select
 ```
 
 The tool-call timeline is only populated if the agent *itself* records tool calls
