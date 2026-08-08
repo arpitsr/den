@@ -18,10 +18,10 @@
 //!   pit selftest                 sanity-check argv assembly (no agentfs needed)
 //!
 //! Env:
-//!   SB_SESSION=<id>  reuse/resume this session id (default <profile>-<cwd-slug>)
-//!   SB_NEW=1         start a fresh unique session instead of the default id
+//!   PIT_SESSION=<id>  reuse/resume this session id (default <profile>-<cwd-slug>)
+//!   PIT_NEW=1         start a fresh unique session instead of the default id
 //!   PIT_AGENTFS=<bin>  path to the agentfs binary (default: agentfs on PATH)
-//!   SB_QUIET=1       don't print the post-run delta summary
+//!   PIT_QUIET=1       don't print the post-run delta summary
 
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{anyhow, bail, Context, Result};
@@ -85,14 +85,14 @@ fn new_uuid() -> String {
     format!("sid-{nanos:x}")
 }
 
-/// session id: SB_SESSION wins, else SB_NEW=1 -> fresh uuid, else <profile>-<cwd-slug>
+/// session id: PIT_SESSION wins, else PIT_NEW=1 -> fresh uuid, else <profile>-<cwd-slug>
 fn session_id(profile: &str) -> String {
-    if let Ok(s) = std::env::var("SB_SESSION") {
+    if let Ok(s) = std::env::var("PIT_SESSION") {
         if !s.is_empty() {
             return s;
         }
     }
-    if std::env::var("SB_NEW").as_deref() == Ok("1") {
+    if std::env::var("PIT_NEW").as_deref() == Ok("1") {
         return new_uuid();
     }
     let cwd = std::env::current_dir()
@@ -119,9 +119,9 @@ fn agentfs_bin() -> String {
 ///   config changed, delta has work -> archive (rename aside), never delete
 ///
 /// "Config" = cwd + effective --allow list, stamped to .stamps/<sid>.
-/// SB_NO_DROP=1 keeps the old join-blind behaviour.
+/// PIT_NO_DROP=1 keeps the old join-blind behaviour.
 fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
-    if std::env::var("SB_NO_DROP").as_deref() == Ok("1") {
+    if std::env::var("PIT_NO_DROP").as_deref() == Ok("1") {
         return Ok(());
     }
     let home = std::env::var("HOME").context("HOME not set")?;
@@ -304,7 +304,7 @@ fn sorted(v: &HashSet<String>) -> Vec<&String> {
 
 /// compact post-run summary: "session X — 3 changed, 1 deleted" + capped listing
 async fn print_run_summary(sid: &str) {
-    if std::env::var("SB_QUIET").as_deref() == Ok("1") {
+    if std::env::var("PIT_QUIET").as_deref() == Ok("1") {
         return;
     }
     let agent = match open_session(sid).await {
@@ -449,14 +449,14 @@ fn cmd_sessions() -> Result<()> {
 
 fn cmd_selftest() -> Result<()> {
     // Deterministic: pin the session id, assert argv assembly + passthrough.
-    std::env::set_var("SB_SESSION", "selftest-sid");
+    std::env::set_var("PIT_SESSION", "selftest-sid");
     let argv = build_argv(
         "agentfs",
         "codex",
         &session_id("codex"),
         &["exec".into(), "--json".into(), "-m".into(), "gpt-5".into()],
     )?;
-    std::env::remove_var("SB_SESSION");
+    std::env::remove_var("PIT_SESSION");
 
     let joined = argv.join("\u{1f}"); // unit separator so substring matches are unambiguous
     macro_rules! check {
