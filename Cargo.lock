@@ -1307,6 +1307,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pit"
+version = "0.1.0"
+dependencies = [
+ "agentfs-sdk",
+ "anyhow",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1595,16 +1605,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "sb"
-version = "0.1.0"
-dependencies = [
- "agentfs-sdk",
- "anyhow",
- "libc",
- "tokio",
-]
 
 [[package]]
 name = "schannel"

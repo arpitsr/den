@@ -1,4 +1,4 @@
-//! sb — run any local coding-agent CLI inside an AgentFS sandbox, with typed
+//! pit — run any local coding-agent CLI inside an AgentFS sandbox, with typed
 //! SDK access to what it did.
 //!
 //! Design split (see README.md):
@@ -10,17 +10,17 @@
 //!     typed diff (changed/deleted paths) + tool-call timeline.
 //!
 //! Usage:
-//!   sb <profile> [args...]      run the agent in the sandbox; print delta after
-//!   sb dump <profile> [args...] print the `agentfs run` argv (no exec)
-//!   sb inspect <session-id>     open a session's delta DB and show diff+timeline
-//!   sb sessions                 list persisted sessions under ~/.agentfs/run
-//!   sb list                     list configured profiles
-//!   sb selftest                 sanity-check argv assembly (no agentfs needed)
+//!   pit <profile> [args...]      run the agent in the sandbox; print delta after
+//!   pit dump <profile> [args...] print the `agentfs run` argv (no exec)
+//!   pit inspect <session-id>     open a session's delta DB and show diff+timeline
+//!   pit sessions                 list persisted sessions under ~/.agentfs/run
+//!   pit list                     list configured profiles
+//!   pit selftest                 sanity-check argv assembly (no agentfs needed)
 //!
 //! Env:
 //!   SB_SESSION=<id>  reuse/resume this session id (default <profile>-<cwd-slug>)
 //!   SB_NEW=1         start a fresh unique session instead of the default id
-//!   SB_AGENTFS=<bin>  path to the agentfs binary (default: agentfs on PATH)
+//!   PIT_AGENTFS=<bin>  path to the agentfs binary (default: agentfs on PATH)
 //!   SB_QUIET=1       don't print the post-run delta summary
 
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
@@ -102,7 +102,7 @@ fn session_id(profile: &str) -> String {
 }
 
 fn agentfs_bin() -> String {
-    std::env::var("SB_AGENTFS").unwrap_or_else(|_| "agentfs".to_string())
+    std::env::var("PIT_AGENTFS").unwrap_or_else(|_| "agentfs".to_string())
 }
 
 /// Reuse-or-recreate gate for the persisted session dir.
@@ -163,10 +163,10 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
                 .unwrap_or(0);
             let name = format!("{sid}.archived-{ts}");
             std::fs::rename(&dir, run_dir.join(&name)).with_context(|| format!("archive session {sid}"))?;
-            eprintln!("sb: config changed — archived previous session as {name} (sb inspect {name} to view)");
+            eprintln!("pit: config changed — archived previous session as {name} (pit inspect {name} to view)");
         } else {
             std::fs::remove_dir_all(&dir).with_context(|| format!("drop stale session {sid}"))?;
-            eprintln!("sb: dropped stale session {sid} (config changed, nothing to keep)");
+            eprintln!("pit: dropped stale session {sid} (config changed, nothing to keep)");
         }
     }
 
@@ -202,13 +202,13 @@ fn session_has_changes(dir: &Path) -> bool {
     }
 }
 
-/// Ignore SIGINT/SIGTERM in `sb` itself while the sandboxed agent runs.
+/// Ignore SIGINT/SIGTERM in `pit` itself while the sandboxed agent runs.
 /// `agentfs run` and the agent are in the same process group, so when you hit
 /// Ctrl-C the kernel delivers SIGINT to the whole group. `agentfs` already
-/// handles it (forward to child; SIGKILL on the second). If `sb` kept the
+/// handles it (forward to child; SIGKILL on the second). If `pit` kept the
 /// default disposition it would die mid-wait and short-circuit that cleanup.
 /// Ignoring here lets the agent own the keyboard exactly as it would without
-/// the wrapper — `sb` just waits for `agentfs` to exit and then reports.
+/// the wrapper — `pit` just waits for `agentfs` to exit and then reports.
 fn ignore_stdin_signals() {
     // SAFETY: sigaction with a valid struct and zeroed sa_mask is well-defined;
     // we install SIG_IGN which is async-signal-safe. No handler touches state.
@@ -346,7 +346,7 @@ fn cmd_run(profile_name: &str, passthrough: &[String]) -> Result<i32> {
     let argv = build_argv(&bin, profile_name, &sid, passthrough)?;
     // spawn + wait (not exec) so we can print the SDK delta summary afterwards
     // signal handlers so SIGINT goes to the sandboxed agent (same pgrp) and
-    // not to `sb`.
+    // not to `pit`.
     ignore_stdin_signals();
     let status = match Command::new(&argv[0]).args(&argv[1..]).status() {
         Ok(s) => s,
@@ -354,7 +354,7 @@ fn cmd_run(profile_name: &str, passthrough: &[String]) -> Result<i32> {
             bail!(
                 "agentfs CLI not found. Install it:\n  \
                  curl -fsSL https://github.com/tursodatabase/agentfs/releases/latest/download/agentfs-installer.sh | sh\n\
-                 (or set SB_AGENTFS=/path/to/agentfs)"
+                 (or set PIT_AGENTFS=/path/to/agentfs)"
             );
         }
         Err(e) => bail!("failed to spawn {bin}: {e}"),
@@ -481,12 +481,12 @@ fn cmd_selftest() -> Result<()> {
 
 fn usage() -> String {
     "usage:\n  \
-     sb <profile> [args...]      run agent in the sandbox\n  \
-     sb dump <profile> [args...] print the agentfs run argv\n  \
-     sb inspect <session-id>     show diff + timeline for a session\n  \
-     sb sessions                 list persisted sessions\n  \
-     sb list                     list profiles\n  \
-     sb selftest                 sanity check\n"
+     pit <profile> [args...]      run agent in the sandbox\n  \
+     pit dump <profile> [args...] print the agentfs run argv\n  \
+     pit inspect <session-id>     show diff + timeline for a session\n  \
+     pit sessions                 list persisted sessions\n  \
+     pit list                     list profiles\n  \
+     pit selftest                 sanity check\n"
         .to_string()
 }
 
@@ -517,7 +517,7 @@ fn main() -> Result<()> {
         [c, rest @ ..] if c == "inspect" => {
             let sid = rest
                 .first()
-                .ok_or_else(|| anyhow!("sb inspect <session-id>"))?;
+                .ok_or_else(|| anyhow!("pit inspect <session-id>"))?;
             cmd_inspect(sid)
         }
         [pname, passthrough @ ..] => {
@@ -526,7 +526,7 @@ fn main() -> Result<()> {
                     "unknown profile '{pname}' (defined: {}). {}",
                     list_profiles().join(" "),
                     if pname == "run" {
-                        "(did you mean: sb <profile>? run is implicit)"
+                        "(did you mean: pit <profile>? run is implicit)"
                     } else {
                         ""
                     }
@@ -544,7 +544,7 @@ fn main() -> Result<()> {
 /// For `dump`: everything after `dump` is `<profile> [passthrough...]`.
 fn split_profile(rest: &[String]) -> Result<(String, Vec<String>)> {
     match rest {
-        [] => bail!("sb dump <profile> [args...]"),
+        [] => bail!("pit dump <profile> [args...]"),
         [p, rest @ ..] => {
             if profile(p).is_none() {
                 bail!("unknown profile '{p}' (defined: {})", list_profiles().join(" "));

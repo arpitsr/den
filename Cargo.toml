@@ -1,11 +1,11 @@
 [package]
-name = "sb"
+name = "pit"
 version = "0.1.0"
 edition = "2021"
 description = "Run any local coding-agent CLI inside an AgentFS sandbox, with typed SDK access to the resulting state."
 
 [[bin]]
-name = "sb"
+name = "pit"
 path = "src/main.rs"
 
 [dependencies]
