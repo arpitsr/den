@@ -1,5 +1,5 @@
 //! Throwaway: build a session delta DB that looks like what `agentfs run` would
-//! leave behind, so we can exercise `sb inspect` / `sb sessions` (and the
+//! leave behind, so we can exercise `pit inspect` / `pit sessions` (and the
 //! post-run SDK summary) without installing the real agentfs CLI.
 //!
 //!   cargo run --example mkdelta -- <session-id> [base-dir]
