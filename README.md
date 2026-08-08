@@ -1,4 +1,4 @@
-# sb (Rust) — local coding agents, sandboxed with AgentFS, with typed SDK state
+# pit (Rust) — local coding agents, sandboxed with AgentFS, with typed SDK state
 
 A Rust binary that launches any local coding-agent CLI (`claude`, `codex`,
 `gemini`, `opencode`, `pi`, …) inside an [AgentFS](https://github.com/tursodatabase/agentfs)
@@ -49,30 +49,30 @@ installed and authed on your `PATH`.
 ## Build & install
 
 ```bash
-cd sb-rs
+cd pit
 cargo build --release           # heavy first build: pulls turso + sync (~280 crates)
 # then either:
 cargo run --release -- <profile> [args...]     # from the project dir
-cargo install --path .                         # installs a binary named `sb`
+cargo install --path .                         # installs a binary named `pit`
 ```
 
 ## Use
 
 ```bash
 cd /path/to/your/project     # this dir becomes the copy-on-write sandbox base
-sb claude "refactor auth"    # runs `claude` inside the sandbox; prints delta diff after
-sb codex  "fix the flaky test"
-sb pi     "..."
-sb opencode
-sb list                      # configured profiles
-sb selftest                  # sanity-check argv assembly (no agentfs needed)
-sb dump codex exec --json    # print the exact `agentfs run` argv (no exec)
-sb sessions                   # list persisted sessions with changed/deleted counts
-sb inspect <session-id>       # open a session's delta DB and show diff + timeline
+pit claude "refactor auth"    # runs `claude` inside the sandbox; prints delta diff after
+pit codex  "fix the flaky test"
+pit pi     "..."
+pit opencode
+pit list                      # configured profiles
+pit selftest                  # sanity-check argv assembly (no agentfs needed)
+pit dump codex exec --json    # print the exact `agentfs run` argv (no exec)
+pit sessions                   # list persisted sessions with changed/deleted counts
+pit inspect <session-id>       # open a session's delta DB and show diff + timeline
 ```
 
 The wrapped agent runs normally and sees its own working tree; writes land in the
-delta layer, not on disk. After the agent exits, `sb` opens the persisted delta DB
+delta layer, not on disk. After the agent exits, `pit` opens the persisted delta DB
 via the SDK and prints a compact diff:
 
 ```
@@ -84,21 +84,21 @@ agentfs: session codex-myproject — 3 changed, 1 deleted
 
 ### Resume / fresh / quiet
 
-By default the session id is `<profile>-<dirname>`, so re-running `sb claude` in the
+By default the session id is `<profile>-<dirname>`, so re-running `pit claude` in the
 same dir **resumes** the same sandbox (changes persist across calls).
 
 | env            | effect                                                          |
 |----------------|----------------------------------------------------------------|
 | `SB_SESSION`   | pin/resume this session id instead of the `<profile>-<dir>` default |
 | `SB_NEW=1`     | start a fresh unique session, nothing carried over             |
-| `SB_AGENTFS`   | path to the `agentfs` binary (default: from `PATH`)            |
+| `PIT_AGENTFS`   | path to the `agentfs` binary (default: from `PATH`)            |
 | `SB_QUIET=1`   | don't print the post-run delta summary                          |
 
 ### Inspecting sessions
 
 ```bash
-sb sessions                  # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
-sb inspect <session-id>     # full diff +, deletions -, and tool-call timeline
+pit sessions                  # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
+pit inspect <session-id>     # full diff +, deletions -, and tool-call timeline
 ```
 
 The tool-call timeline is only populated if the agent *itself* records tool calls
@@ -113,13 +113,13 @@ Built into `src/main.rs` (`fn profile`): `claude`, `codex`, `gemini`, `opencode`
 `pi`. Each maps to a command plus extra `--allow` host dirs (beyond AgentFS's
 defaults: `~/.config`, `~/.cache`, `~/.local`, `~/.npm`, `~/.claude`, `~/.codex`,
 `~/.gemini`, `~/.amp`). To add a custom agent, add a match arm. When you have more
-than a couple of custom agents, bring in a TOML config (`~/.config/sb/agents.toml`)
+than a couple of custom agents, bring in a TOML config (`~/.config/pit/agents.toml`)
 — YAGNI until then.
 
 ## Project layout
 
 ```
-sb-rs/
+pit/
   Cargo.toml            agentfs-sdk 0.6.4, tokio, anyhow
   src/main.rs           the binary: profiles, argv assembly, run/inspect/sessions/dump/selftest
   examples/mkdelta.rs   throwaway: builds a fake session delta DB via the SDK (used to test
@@ -139,5 +139,5 @@ sb-rs/
 - **TOML config + a TUI** → once there are several custom agents or you want a
   session browser over the delta DBs.
 
-The bash `./sb` at the repo root (the original prototype) can be deleted once this
+The bash `./pit` at the repo root (the original prototype) can be deleted once this
 Rust binary is installed; it's kept only as a reference for the same behaviour.
