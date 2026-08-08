@@ -26,6 +26,7 @@
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -41,10 +42,22 @@ fn profile(name: &str) -> Option<Profile> {
     let home = std::env::var("HOME").ok()?;
     let cfg = || vec![format!("{home}/.config")];
     Some(match name {
-        "claude" => Profile { cmd: vec!["claude".into()], allows: cfg() },
-        "codex" => Profile { cmd: vec!["codex".into()], allows: cfg() },
-        "gemini" => Profile { cmd: vec!["gemini".into()], allows: cfg() },
-        "pi" => Profile { cmd: vec!["pi".into()], allows: cfg().into_iter().chain([format!("{home}/.pi")]).collect() },
+        "claude" => Profile {
+            cmd: vec!["claude".into()],
+            allows: cfg(),
+        },
+        "codex" => Profile {
+            cmd: vec!["codex".into()],
+            allows: cfg(),
+        },
+        "gemini" => Profile {
+            cmd: vec!["gemini".into()],
+            allows: cfg(),
+        },
+        "pi" => Profile {
+            cmd: vec!["pi".into()],
+            allows: cfg().into_iter().chain([format!("{home}/.pi")]).collect(),
+        },
         "opencode" => Profile {
             cmd: vec!["opencode".into()],
             allows: vec![format!("{home}/.config"), format!("{home}/.opencode")],
@@ -162,7 +175,8 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let name = format!("{sid}.archived-{ts}");
-            std::fs::rename(&dir, run_dir.join(&name)).with_context(|| format!("archive session {sid}"))?;
+            std::fs::rename(&dir, run_dir.join(&name))
+                .with_context(|| format!("archive session {sid}"))?;
             eprintln!("pit: config changed — archived previous session as {name} (pit inspect {name} to view)");
         } else {
             std::fs::remove_dir_all(&dir).with_context(|| format!("drop stale session {sid}"))?;
@@ -215,13 +229,19 @@ fn ignore_stdin_signals() {
     for sig in [libc::SIGINT, libc::SIGTERM] {
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
         sa.sa_sigaction = libc::SIG_IGN;
-        unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()); }
+        unsafe {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
     }
 }
 
 /// profile allow dirs that actually exist on this host (missing ones are skipped)
 fn effective_allows(p: &Profile) -> Vec<String> {
-    p.allows.iter().filter(|a| Path::new(a).exists()).cloned().collect()
+    p.allows
+        .iter()
+        .filter(|a| Path::new(a).exists())
+        .cloned()
+        .collect()
 }
 
 /// The exact argv we'd pass to exec `agentfs run`. Used by run, dump, selftest.
@@ -232,9 +252,17 @@ fn build_argv(
     passthrough: &[String],
 ) -> Result<Vec<String>> {
     let p = profile(profile_name).ok_or_else(|| {
-        anyhow!("unknown profile '{profile_name}' (defined: {})", list_profiles().join(" "))
+        anyhow!(
+            "unknown profile '{profile_name}' (defined: {})",
+            list_profiles().join(" ")
+        )
     })?;
-    let mut v = vec![agentfs.to_string(), "run".into(), "--session".into(), sid.to_string()];
+    let mut v = vec![
+        agentfs.to_string(),
+        "run".into(),
+        "--session".into(),
+        sid.to_string(),
+    ];
     for a in effective_allows(&p) {
         v.push("--allow".into());
         v.push(a);
@@ -247,7 +275,16 @@ fn build_argv(
     // renaming a session you're resuming would be a surprise.
     if profile_name == "pi"
         && !passthrough.iter().any(|a| {
-            matches!(a.as_str(), "-c" | "--continue" | "-r" | "--resume" | "--session" | "-n" | "--name" | "--no-session")
+            matches!(
+                a.as_str(),
+                "-c" | "--continue"
+                    | "-r"
+                    | "--resume"
+                    | "--session"
+                    | "-n"
+                    | "--name"
+                    | "--no-session"
+            )
         })
     {
         let cwd = std::env::current_dir()
@@ -322,7 +359,11 @@ async fn print_run_summary(sid: &str) {
         "agentfs: session {sid} — {} changed, {} deleted {}",
         delta.len(),
         whiteouts.len(),
-        if untouched { "(host tree untouched)" } else { "" }
+        if untouched {
+            "(host tree untouched)"
+        } else {
+            ""
+        }
     );
     for p in sorted(&delta).iter().take(20) {
         eprintln!("  + {p}");
@@ -367,7 +408,12 @@ fn cmd_run(profile_name: &str, passthrough: &[String]) -> Result<i32> {
 }
 
 fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
-    let argv = build_argv(&agentfs_bin(), profile_name, &session_id(profile_name), passthrough)?;
+    let argv = build_argv(
+        &agentfs_bin(),
+        profile_name,
+        &session_id(profile_name),
+        passthrough,
+    )?;
     println!("{}", argv.join(" "));
     Ok(())
 }
@@ -396,7 +442,10 @@ fn cmd_inspect(sid: &str) -> Result<()> {
         if !recent.is_empty() {
             println!("timeline ({}):", recent.len());
             for t in &recent {
-                let dur = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_else(|| "--".into());
+                let dur = t
+                    .duration_ms
+                    .map(|d| format!("{d}ms"))
+                    .unwrap_or_else(|| "--".into());
                 println!("  {:>5}  {:<8}  {:<8}  {}", t.id, t.name, t.status, dur);
             }
         }
@@ -404,46 +453,126 @@ fn cmd_inspect(sid: &str) -> Result<()> {
     })
 }
 
-fn cmd_sessions() -> Result<()> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let run_dir = PathBuf::from(format!("{home}/.agentfs/run"));
-    if !run_dir.exists() {
-        println!("(no sessions at {})", run_dir.display());
-        return Ok(());
-    }
-    let mut sids: Vec<String> = std::fs::read_dir(&run_dir)?
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionRow {
+    sid: String,
+    changed: Option<(usize, usize)>,
+    base_path: String,
+}
+
+async fn collect_session_rows(run_dir: &Path) -> Result<Vec<SessionRow>> {
+    let mut sids: Vec<String> = std::fs::read_dir(run_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.'))
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     sids.sort();
-    if sids.is_empty() {
-        println!("(no sessions)");
-        return Ok(());
+
+    let mut rows = Vec::with_capacity(sids.len());
+    for sid in sids {
+        let session_dir = run_dir.join(&sid);
+        let db = session_dir.join("delta.db");
+        let base_path = std::fs::read_to_string(session_dir.join("base_path"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let changed = if db.exists() {
+            let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+            match AgentFS::open(opts).await {
+                Ok(agent) => {
+                    let (delta, whiteouts) = fetch_diff(&agent).await;
+                    Some((delta.len(), whiteouts.len()))
+                }
+                Err(_) => Some((0, 0)),
+            }
+        } else {
+            None
+        };
+        rows.push(SessionRow {
+            sid,
+            changed,
+            base_path,
+        });
+    }
+    Ok(rows)
+}
+
+fn format_session_rows(rows: &[SessionRow], numbered: bool) -> String {
+    rows.iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let prefix = if numbered {
+                format!("[{}]\t", idx + 1)
+            } else {
+                String::new()
+            };
+            let counts = match row.changed {
+                Some((changed, deleted)) => format!("{changed} changed, {deleted} deleted"),
+                None => "(no delta DB)".to_string(),
+            };
+            format!("{prefix}{}\t{counts}\t{}", row.sid, row.base_path)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_session_selection(input: &str, rows: &[SessionRow]) -> Result<String> {
+    let choice = input.trim();
+    if choice.is_empty() {
+        bail!("no session selected");
+    }
+    if let Ok(n) = choice.parse::<usize>() {
+        if (1..=rows.len()).contains(&n) {
+            return Ok(rows[n - 1].sid.clone());
+        }
+        bail!("selection {n} is out of range (1-{})", rows.len());
+    }
+    if rows.iter().any(|row| row.sid == choice) {
+        return Ok(choice.to_string());
+    }
+    bail!("unknown session '{choice}'");
+}
+
+fn prompt_session_selection(rows: &[SessionRow]) -> Result<String> {
+    eprintln!("{}", format_session_rows(rows, true));
+    eprint!("select session: ");
+    std::io::stderr().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    parse_session_selection(&input, rows)
+}
+
+fn load_session_rows() -> Result<(PathBuf, Vec<SessionRow>)> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let run_dir = PathBuf::from(format!("{home}/.agentfs/run"));
+    if !run_dir.exists() {
+        return Ok((run_dir, Vec::new()));
     }
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        for sid in &sids {
-            let db = delta_db_path(sid)?;
-            let base_path = std::fs::read_to_string(format!("{home}/.agentfs/run/{sid}/base_path"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if !db.exists() {
-                println!("{sid}\t(no delta DB)\t{base_path}");
-                continue;
-            }
-            let (n_changed, n_deleted) = match open_session(sid).await {
-                Ok(Some(a)) => {
-                    let (d, w) = fetch_diff(&a).await;
-                    (d.len(), w.len())
-                }
-                _ => (0, 0),
-            };
-            println!("{sid}\t{n_changed} changed, {n_deleted} deleted\t{base_path}");
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
+    let rows = rt.block_on(collect_session_rows(&run_dir))?;
+    Ok((run_dir, rows))
+}
+
+fn select_session() -> Result<String> {
+    let (run_dir, rows) = load_session_rows()?;
+    if rows.is_empty() {
+        bail!("no sessions at {}", run_dir.display());
+    }
+    prompt_session_selection(&rows)
+}
+
+fn cmd_sessions(select: bool) -> Result<()> {
+    let (run_dir, rows) = load_session_rows()?;
+    if rows.is_empty() {
+        println!("(no sessions at {})", run_dir.display());
+        return Ok(());
+    }
+    if select {
+        let sid = prompt_session_selection(&rows)?;
+        println!("{sid}");
+    } else {
+        println!("{}", format_session_rows(&rows, false));
+    }
     Ok(())
 }
 
@@ -468,7 +597,10 @@ fn cmd_selftest() -> Result<()> {
     }
     check!(argv[0] == "agentfs", "bin slot");
     check!(argv[1] == "run", "run subcommand");
-    check!(joined.contains("\u{1f}--session\u{1f}selftest-sid\u{1f}"), "session id");
+    check!(
+        joined.contains("\u{1f}--session\u{1f}selftest-sid\u{1f}"),
+        "session id"
+    );
     check!(
         joined.contains("\u{1f}codex\u{1f}exec\u{1f}--json\u{1f}-m\u{1f}gpt-5"),
         "passthrough incl. flags"
@@ -483,8 +615,8 @@ fn usage() -> String {
     "usage:\n  \
      pit <profile> [args...]      run agent in the sandbox\n  \
      pit dump <profile> [args...] print the agentfs run argv\n  \
-     pit inspect <session-id>     show diff + timeline for a session\n  \
-     pit sessions                 list persisted sessions\n  \
+     pit inspect [session-id]     show diff + timeline for a session\n  \
+     pit sessions [--select]      list persisted sessions, optionally choose one\n  \
      pit list                     list profiles\n  \
      pit selftest                 sanity check\n"
         .to_string()
@@ -505,7 +637,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         [c] if c == "selftest" => cmd_selftest(),
-        [c] if c == "sessions" => cmd_sessions(),
+        [c] if c == "sessions" => cmd_sessions(false),
+        [c, flag] if c == "sessions" && flag == "--select" => cmd_sessions(true),
         [c] if c == "help" || c == "--help" || c == "-h" => {
             println!("{}", usage());
             Ok(())
@@ -514,10 +647,18 @@ fn main() -> Result<()> {
             let (pname, passthrough) = split_profile(rest)?;
             cmd_dump(&pname, &passthrough)
         }
+        [c] if c == "inspect" => {
+            let sid = select_session()?;
+            cmd_inspect(&sid)
+        }
+        [c, flag] if c == "inspect" && flag == "--select" => {
+            let sid = select_session()?;
+            cmd_inspect(&sid)
+        }
         [c, rest @ ..] if c == "inspect" => {
             let sid = rest
                 .first()
-                .ok_or_else(|| anyhow!("pit inspect <session-id>"))?;
+                .ok_or_else(|| anyhow!("pit inspect [--select|<session-id>]"))?;
             cmd_inspect(sid)
         }
         [pname, passthrough @ ..] => {
@@ -547,9 +688,72 @@ fn split_profile(rest: &[String]) -> Result<(String, Vec<String>)> {
         [] => bail!("pit dump <profile> [args...]"),
         [p, rest @ ..] => {
             if profile(p).is_none() {
-                bail!("unknown profile '{p}' (defined: {})", list_profiles().join(" "));
+                bail!(
+                    "unknown profile '{p}' (defined: {})",
+                    list_profiles().join(" ")
+                );
             }
             Ok((p.clone(), rest.to_vec()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_rows_include_numbered_choices() {
+        let rows = vec![
+            SessionRow {
+                sid: "codex-alpha".into(),
+                changed: Some((2, 1)),
+                base_path: "/tmp/alpha".into(),
+            },
+            SessionRow {
+                sid: "pi-beta".into(),
+                changed: None,
+                base_path: String::new(),
+            },
+        ];
+
+        let rendered = format_session_rows(&rows, true);
+
+        assert!(rendered.contains("[1]\tcodex-alpha\t2 changed, 1 deleted\t/tmp/alpha"));
+        assert!(rendered.contains("[2]\tpi-beta\t(no delta DB)\t"));
+    }
+
+    #[test]
+    fn parse_session_selection_accepts_index_or_session_id() {
+        let rows = vec![
+            SessionRow {
+                sid: "codex-alpha".into(),
+                changed: None,
+                base_path: String::new(),
+            },
+            SessionRow {
+                sid: "pi-beta".into(),
+                changed: None,
+                base_path: String::new(),
+            },
+        ];
+
+        assert_eq!(parse_session_selection("2", &rows).unwrap(), "pi-beta");
+        assert_eq!(
+            parse_session_selection("codex-alpha", &rows).unwrap(),
+            "codex-alpha"
+        );
+    }
+
+    #[test]
+    fn parse_session_selection_rejects_unknown_values() {
+        let rows = vec![SessionRow {
+            sid: "codex-alpha".into(),
+            changed: None,
+            base_path: String::new(),
+        }];
+
+        assert!(parse_session_selection("0", &rows).is_err());
+        assert!(parse_session_selection("missing", &rows).is_err());
     }
 }
