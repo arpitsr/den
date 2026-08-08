@@ -41,10 +41,22 @@ fn profile(name: &str) -> Option<Profile> {
     let home = std::env::var("HOME").ok()?;
     let cfg = || vec![format!("{home}/.config")];
     Some(match name {
-        "claude" => Profile { cmd: vec!["claude".into()], allows: cfg() },
-        "codex" => Profile { cmd: vec!["codex".into()], allows: cfg() },
-        "gemini" => Profile { cmd: vec!["gemini".into()], allows: cfg() },
-        "pi" => Profile { cmd: vec!["pi".into()], allows: cfg().into_iter().chain([format!("{home}/.pi")]).collect() },
+        "claude" => Profile {
+            cmd: vec!["claude".into()],
+            allows: cfg(),
+        },
+        "codex" => Profile {
+            cmd: vec!["codex".into()],
+            allows: cfg(),
+        },
+        "gemini" => Profile {
+            cmd: vec!["gemini".into()],
+            allows: cfg(),
+        },
+        "pi" => Profile {
+            cmd: vec!["pi".into()],
+            allows: cfg().into_iter().chain([format!("{home}/.pi")]).collect(),
+        },
         "opencode" => Profile {
             cmd: vec!["opencode".into()],
             allows: vec![format!("{home}/.config"), format!("{home}/.opencode")],
@@ -162,7 +174,8 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let name = format!("{sid}.archived-{ts}");
-            std::fs::rename(&dir, run_dir.join(&name)).with_context(|| format!("archive session {sid}"))?;
+            std::fs::rename(&dir, run_dir.join(&name))
+                .with_context(|| format!("archive session {sid}"))?;
             eprintln!("pit: config changed — archived previous session as {name} (pit inspect {name} to view)");
         } else {
             std::fs::remove_dir_all(&dir).with_context(|| format!("drop stale session {sid}"))?;
@@ -215,13 +228,19 @@ fn ignore_stdin_signals() {
     for sig in [libc::SIGINT, libc::SIGTERM] {
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
         sa.sa_sigaction = libc::SIG_IGN;
-        unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()); }
+        unsafe {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
     }
 }
 
 /// profile allow dirs that actually exist on this host (missing ones are skipped)
 fn effective_allows(p: &Profile) -> Vec<String> {
-    p.allows.iter().filter(|a| Path::new(a).exists()).cloned().collect()
+    p.allows
+        .iter()
+        .filter(|a| Path::new(a).exists())
+        .cloned()
+        .collect()
 }
 
 /// The exact argv we'd pass to exec `agentfs run`. Used by run, dump, selftest.
@@ -232,9 +251,17 @@ fn build_argv(
     passthrough: &[String],
 ) -> Result<Vec<String>> {
     let p = profile(profile_name).ok_or_else(|| {
-        anyhow!("unknown profile '{profile_name}' (defined: {})", list_profiles().join(" "))
+        anyhow!(
+            "unknown profile '{profile_name}' (defined: {})",
+            list_profiles().join(" ")
+        )
     })?;
-    let mut v = vec![agentfs.to_string(), "run".into(), "--session".into(), sid.to_string()];
+    let mut v = vec![
+        agentfs.to_string(),
+        "run".into(),
+        "--session".into(),
+        sid.to_string(),
+    ];
     for a in effective_allows(&p) {
         v.push("--allow".into());
         v.push(a);
@@ -247,7 +274,16 @@ fn build_argv(
     // renaming a session you're resuming would be a surprise.
     if profile_name == "pi"
         && !passthrough.iter().any(|a| {
-            matches!(a.as_str(), "-c" | "--continue" | "-r" | "--resume" | "--session" | "-n" | "--name" | "--no-session")
+            matches!(
+                a.as_str(),
+                "-c" | "--continue"
+                    | "-r"
+                    | "--resume"
+                    | "--session"
+                    | "-n"
+                    | "--name"
+                    | "--no-session"
+            )
         })
     {
         let cwd = std::env::current_dir()
@@ -322,7 +358,11 @@ async fn print_run_summary(sid: &str) {
         "agentfs: session {sid} — {} changed, {} deleted {}",
         delta.len(),
         whiteouts.len(),
-        if untouched { "(host tree untouched)" } else { "" }
+        if untouched {
+            "(host tree untouched)"
+        } else {
+            ""
+        }
     );
     for p in sorted(&delta).iter().take(20) {
         eprintln!("  + {p}");
@@ -367,7 +407,12 @@ fn cmd_run(profile_name: &str, passthrough: &[String]) -> Result<i32> {
 }
 
 fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
-    let argv = build_argv(&agentfs_bin(), profile_name, &session_id(profile_name), passthrough)?;
+    let argv = build_argv(
+        &agentfs_bin(),
+        profile_name,
+        &session_id(profile_name),
+        passthrough,
+    )?;
     println!("{}", argv.join(" "));
     Ok(())
 }
@@ -396,7 +441,10 @@ fn cmd_inspect(sid: &str) -> Result<()> {
         if !recent.is_empty() {
             println!("timeline ({}):", recent.len());
             for t in &recent {
-                let dur = t.duration_ms.map(|d| format!("{d}ms")).unwrap_or_else(|| "--".into());
+                let dur = t
+                    .duration_ms
+                    .map(|d| format!("{d}ms"))
+                    .unwrap_or_else(|| "--".into());
                 println!("  {:>5}  {:<8}  {:<8}  {}", t.id, t.name, t.status, dur);
             }
         }
@@ -468,7 +516,10 @@ fn cmd_selftest() -> Result<()> {
     }
     check!(argv[0] == "agentfs", "bin slot");
     check!(argv[1] == "run", "run subcommand");
-    check!(joined.contains("\u{1f}--session\u{1f}selftest-sid\u{1f}"), "session id");
+    check!(
+        joined.contains("\u{1f}--session\u{1f}selftest-sid\u{1f}"),
+        "session id"
+    );
     check!(
         joined.contains("\u{1f}codex\u{1f}exec\u{1f}--json\u{1f}-m\u{1f}gpt-5"),
         "passthrough incl. flags"
@@ -547,7 +598,10 @@ fn split_profile(rest: &[String]) -> Result<(String, Vec<String>)> {
         [] => bail!("pit dump <profile> [args...]"),
         [p, rest @ ..] => {
             if profile(p).is_none() {
-                bail!("unknown profile '{p}' (defined: {})", list_profiles().join(" "));
+                bail!(
+                    "unknown profile '{p}' (defined: {})",
+                    list_profiles().join(" ")
+                );
             }
             Ok((p.clone(), rest.to_vec()))
         }
