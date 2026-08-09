@@ -1,50 +1,42 @@
-# pit (Rust) — local coding agents, sandboxed with AgentFS, with typed SDK state
+# pit (Rust) — local coding agents, sandboxed, with typed SDK state
 
 A Rust binary that launches any local coding-agent CLI (`claude`, `codex`,
-`gemini`, `opencode`, `pi`, …) inside an [AgentFS](https://github.com/tursodatabase/agentfs)
-sandbox, and binds the `agentfs-sdk` crate to give you typed, in-process access
-to what the sandboxed agent did.
+`gemini`, `opencode`, `pi`, …) inside an OS-level sandbox (FUSE copy-on-write
+overlay + user/mount namespaces), and binds the `agentfs-sdk` crate for typed,
+in-process access to what the sandboxed agent did.
 
-## Design — why it splits the way it does
+## Design
 
-AgentFS is two things:
+The sandbox layer is **in this binary** — no `agentfs` CLI dependency:
 
-1. **The OS sandbox** — FUSE + user/mount namespaces on Linux (NFS + `sandbox-exec`
-   on macOS). It makes the current working directory a copy-on-write overlay:
-   host files become read-only, every write is captured to a SQLite delta DB,
-   and the rest of the filesystem is locked read-only except a small allowlist.
-   This lives in the **`agentfs` CLI** (`cli/src/sandbox/linux.rs`, ~400 lines of
-   unsafe libc), *not* in the published `agentfs-sdk` crate.
+- `src/sandbox.rs` — `fork`/`unshare` user+mount namespaces, uid/gid mapping,
+  `MS_REC|MS_PRIVATE`, bind-mount of the overlay onto the cwd, read-only
+  remount of everything else (small allowlist), exec, signal forwarding.
+- `src/fuse.rs` + `src/mount.rs` — the FUSE filesystem (published `fuser`
+  crate) that serves the copy-on-write overlay. The current working directory
+  is the sandbox base: host files are read-only, every write is captured to a
+  SQLite delta DB, deletes become whiteouts.
+- The storage layer is `agentfs-sdk` (`AgentFS { kv, fs, tools }`): a
+  POSIX-like filesystem, a key-value store, and a tool-call audit trail in
+  one SQLite file at `~/.agentfs/run/<sid>/delta.db`.
 
-2. **The storage layer** — `AgentFS { kv, fs, tools }`: a POSIX-like filesystem,
-   a key-value store, and a tool-call audit trail, all backed by one SQLite
-   file. This **is** in the `agentfs-sdk` crate.
+pit opens that DB in-process and surfaces a typed diff (`get_delta_paths` /
+`get_whiteouts` / `is_overlay_enabled`) and tool-call timeline
+(`tools.recent`). The session layout is identical to agentfs's, so existing
+agentfs sessions interoperate.
 
-So this binary deliberately does **not** reimplement the sandbox. It:
-
-- **execs `agentfs run`** for the OS sandbox (the one component that already does
-  the dangerous job correctly — porting ~400 lines of unsafe, platform-specific
-  `fork`/`unshare`/`mount` into your binary is the non-lazy path and a second
-  macOS path on top), and
-- **binds `agentfs-sdk`** for everything around it: resolving a session id to its
-  persisted delta DB (`~/.agentfs/run/<sid>/delta.db`), opening it in-process, and
-  surfacing a typed diff (`get_delta_paths` / `get_whiteouts` / `is_overlay_enabled`)
-  and tool-call timeline (`tools.recent`).
-
-If you want the SDK to *be* the sandbox (drop FUSE/namespaces, build an agent loop
-whose tools call `agent.fs.*` / `agent.kv.*` directly), that's a different project —
-see "When to grow it" below.
+If you want the SDK to *be* the sandbox (drop FUSE/namespaces, build an agent
+loop whose tools call `agent.fs.*` / `agent.kv.*` directly), that's a
+different project — see "When to grow it" below.
 
 ## Prereqs
 
-Install the `agentfs` CLI once (the Rust binary shells out to it for the sandbox):
+Linux with FUSE available (`fusermount3` or `fusermount` on `PATH` — the same
+runtime requirement agentfs has). macOS is not supported (no sandbox path; the
+binary bails with a clear message).
 
-```bash
-curl -fsSL https://github.com/tursodatabase/agentfs/releases/latest/download/agentfs-installer.sh | sh
-```
-
-Any agent CLI you wrap (`claude`/`codex`/`gemini`/`opencode`/`pi`) must already be
-installed and authed on your `PATH`.
+Any agent CLI you wrap (`claude`/`codex`/`gemini`/`opencode`/`pi`) must already
+be installed and authed on your `PATH`.
 
 ## Build & install
 
@@ -65,22 +57,25 @@ pit codex  "fix the flaky test"
 pit pi     "..."
 pit opencode
 pit list                      # configured profiles
-pit selftest                  # sanity-check argv assembly (no agentfs needed)
-pit dump codex exec --json    # print the exact `agentfs run` argv (no exec)
+pit selftest                  # sanity-check argv assembly
+pit selftest --sandbox        # full round-trip: mount, delta, whiteouts, ro-enforcement
+pit dump codex exec --json    # print the exact run argv (no exec)
 pit sessions                  # list persisted sessions with changed/deleted counts
 pit sessions --select         # show numbered sessions, choose one, print its id
 pit inspect [session-id]      # open a session's delta DB; omit id to choose interactively
 pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's delta DB
 pit restore <file.ltx> [--to db]                      # apply an LTX backup (and chain) back
 pit ltx <file.ltx>            # inspect/verify a backup file
+pit replicate [sid] [url]     # litestream daemon: stream the session's delta DB to S3
+pit pull [sid] [url] [--force] [--to db]              # restore the session from its S3 replica
 ```
 
-The wrapped agent runs normally and sees its own working tree; writes land in the
-delta layer, not on disk. After the agent exits, `pit` opens the persisted delta DB
-via the SDK and prints a compact diff:
+The wrapped agent runs normally and sees its own working tree; writes land in
+the delta layer, not on disk. After the agent exits, `pit` opens the persisted
+delta DB via the SDK and prints a compact diff:
 
 ```
-agentfs: session codex-myproject — 3 changed, 1 deleted
+pit: session codex-myproject — 3 changed, 1 deleted
   + /src/auth.rs
   + /src/auth_test.rs
   - README.md
@@ -95,22 +90,22 @@ same dir **resumes** the same sandbox (changes persist across calls).
 |----------------|----------------------------------------------------------------|
 | `PIT_SESSION`   | pin/resume this session id instead of the `<profile>-<dir>` default |
 | `PIT_NEW=1`     | start a fresh unique session, nothing carried over             |
-| `PIT_AGENTFS`   | path to the `agentfs` binary (default: from `PATH`)            |
 | `PIT_QUIET=1`   | don't print the post-run delta summary                          |
+| `PIT_LITESTREAM`| path to the `litestream` binary (default: from `PATH`)          |
+| `PIT_REPLICA`   | replica URL for `pit replicate`/`pit pull` (default: `LITESTREAM_REPLICA_URL`, then `LITESTREAM_BUCKET`) |
 
 ### Inspecting sessions
 
 ```bash
-pit sessions                 # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
-pit sessions --select        # number the list, prompt for a choice, print the selected id
-pit inspect [session-id]     # full diff +, deletions -, and tool-call timeline; omit id to select
+pit sessions                  # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
+pit sessions --select         # number the list, prompt for a choice, print the selected id
+pit inspect [session-id]      # full diff +, deletions -, and tool-call timeline; omit id to select
 ```
 
 The tool-call timeline is only populated if the agent *itself* records tool calls
 through the `agentfs-sdk` (an agent you wrote). Wrapped CLIs like `claude`/`codex`
 leave it empty — for those, the useful SDK surface is the delta diff (what files
-the agent created/modified/deleted), which is exactly `agentfs diff` but typed and
-in-process.
+the agent created/modified/deleted), which is typed and in-process.
 
 ### LTX backups
 
@@ -157,10 +152,51 @@ pit restore codex-myproj.ltx --to /tmp/other.db
   A DB large enough to contain SQLite's lock-byte page (≥1 GiB at 4 KiB pages)
   is refused — LTX cannot store that page.
 
+### Litestream replication (continuous, off-host)
+
+If a replica is configured and the [litestream](https://litestream.io) binary
+is installed, `pit` wraps it in command-line mode — no config file, credentials
+come from the standard `AWS_*` / `LITESTREAM_*` env vars:
+
+```bash
+# one-time:
+curl -s https://litestream.io/install.sh | sh
+
+# per shell (or your agent's env):
+export PIT_REPLICA=s3://my-bucket/coding-agents   # bucket is fixed; path is per-session
+# or: LITESTREAM_REPLICA_URL=s3://...  /  LITESTREAM_BUCKET=my-bucket
+# plus AWS creds (S3, or any S3-compatible endpoint via AWS_ENDPOINT_URL):
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+
+pit codex "fix the flaky test" --autostart   # litestream streams the session to S3 while the agent works
+pit replicate codex-myproject                  # same, as a foreground daemon (Ctrl-C stops it)
+pit pull codex-myproject                       # restore newest state back into the session dir
+pit pull codex-myproject --force --to /tmp/db  # overwrite / restore elsewhere
+```
+
+* `pit <profile> --autostart` prefers litestream when a replica is configured
+  **and** the binary is installed; otherwise it falls back to the local LTX
+  watch above. A detached `pit replicate <sid>` streams
+  `~/.agentfs/run/<sid>/delta.db` to `s3://<bucket>/<sid>/db` continuously
+  (litestream's ~1s sync), survives Ctrl-C on the run (log:
+  `~/.agentfs/run/<sid>/replicate.log`), exits on its own when the session is
+  deleted, and refuses a second daemon on the same session (flock). Stop it
+  with `kill $(pgrep -f "pit replicate <sid>")`.
+* Replica URL resolution: explicit arg `pit replicate <sid> s3://...` >
+  `PIT_REPLICA` > `LITESTREAM_REPLICA_URL` > `LITESTREAM_BUCKET` (synthesized
+  to `s3://<bucket>/<sid>/db`, so sessions never collide in one bucket).
+  `PIT_LITESTREAM` overrides the binary path.
+* The daemon runs with `-restore-if-db-not-exists`, so a fresh machine that
+  starts a session with an existing replica pulls it back automatically.
+  `pit pull` runs `litestream restore` with `-if-replica-exists` (a
+  never-backed-up session is a no-op) and `-integrity-check quick`; it
+  refuses to overwrite an existing DB unless `--force`. Don't pull into a
+  session while its agent is still running — same hazard as LTX restore.
+
 ## Profiles
 
 Built into `src/main.rs` (`fn profile`): `claude`, `codex`, `gemini`, `opencode`,
-`pi`. Each maps to a command plus extra `--allow` host dirs (beyond AgentFS's
+`pi`. Each maps to a command plus extra `--allow` host dirs (beyond the sandbox
 defaults: `~/.config`, `~/.cache`, `~/.local`, `~/.npm`, `~/.claude`, `~/.codex`,
 `~/.gemini`, `~/.amp`). To add a custom agent, add a match arm. When you have more
 than a couple of custom agents, bring in a TOML config (`~/.config/pit/agents.toml`)
@@ -170,8 +206,11 @@ than a couple of custom agents, bring in a TOML config (`~/.config/pit/agents.to
 
 ```
 pit/
-  Cargo.toml            agentfs-sdk 0.6.4, tokio, anyhow, litetx (LTX backup), rusqlite
-  src/main.rs           the binary: profiles, argv assembly, run/inspect/sessions/dump/selftest
+  Cargo.toml            agentfs-sdk 0.6.4, fuser (FUSE), tokio, anyhow, litetx, rusqlite
+  src/main.rs           profiles, argv assembly, run/inspect/sessions/dump/selftest
+  src/sandbox.rs        fork/unshare namespaces, read-only remount, exec, signals
+  src/fuse.rs           FUSE filesystem serving the COW overlay (fuser)
+  src/mount.rs          mount lifecycle (fusermount), MountHandle, helpers
   src/backup.rs         LTX backup/restore/inspect of session delta DBs (litetx + rusqlite)
   examples/mkdelta.rs   throwaway: builds a fake session delta DB via the SDK (used to test
                         inspect/sessions + backups without the real agentfs CLI)
@@ -184,12 +223,14 @@ pit/
   sandbox (the agent has no other FS access), no FUSE/namespaces needed. This is
   what `agentfs-sdk` is designed for and is the cleanest next step if you want
   programmatic control of the agent instead of wrapping a CLI.
-- **Reimplement the OS sandbox in Rust** → only if you can't tolerate the
-  `agentfs` CLI dependency. You'd port `cli/src/sandbox/linux.rs` (and the NFS
-  path for macOS). ~400 lines of unsafe libc with a second platform branch.
-- **Backup to an off-host sink** → `pit backup` writes a local `.ltx`; wire it
-  to `rclone`/`scp`/object storage plus a retention policy (the checksummed,
-  append-only LTX format is made for that).
+- **macOS support** → the port covers Linux only. The original agentfs CLI has an
+  NFS-based macOS path; bring that in if macOS matters.
+- **Off-host backup** → already wired: `pit replicate`/`pit pull` wrap
+  litestream (continuous S3 replication of the delta DB; see above). If you
+  want retention tuning, snapshots on a schedule, or a control socket, point
+  litestream at a config file instead of env vars (`pit replicate` uses
+  command-line mode; a hand-written `litestream.yml` still works — it's just
+  a binary litestream is exec'd with either way).
 - **TOML config + a TUI** → once there are several custom agents or you want a
   session browser over the delta DBs.
 
