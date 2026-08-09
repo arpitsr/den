@@ -1,37 +1,51 @@
 //! pit — run any local coding-agent CLI inside an AgentFS sandbox, with typed
 //! SDK access to what it did.
 //!
-//! Design split (see README.md):
-//!   * OS sandbox: exec'd by the `agentfs` CLI (`agentfs run ...`). The FUSE +
-//!     user/mount-namespace isolation is NOT in the agentfs-sdk crate; it's
-//!     ~400 lines of unsafe libc in the CLI. We do not reimplement it.
-//!   * State: this binary binds `agentfs-sdk` to open the session's persisted
-//!     delta DB (`~/.agentfs/run/<sid>/delta.db`) in-process and surface a
-//!     typed diff (changed/deleted paths) + tool-call timeline.
+//! The sandbox is in-process (src/sandbox.rs, ported from the agentfs CLI,
+//! MIT): a FUSE overlay (src/fuse.rs, via the published `fuser` crate) makes
+//! the cwd copy-on-write, a fork+unshare child gets a fresh user+mount
+//! namespace with the rest of the filesystem read-only, and every write lands
+//! in the session's SQLite delta DB (~/.agentfs/run/<sid>/delta.db). After the
+//! agent exits we bind `agentfs-sdk` to open that DB in-process and surface a
+//! typed diff (changed/deleted paths) + tool-call timeline.
 //!
 //! Usage:
 //!   pit <profile> [args...]      run the agent in the sandbox; print delta after
-//!   pit dump <profile> [args...] print the `agentfs run` argv (no exec)
+//!   pit dump <profile> [args...] print the resolved sandbox plan (no exec)
 //!   pit inspect <session-id>     open a session's delta DB and show diff+timeline
 //!   pit sessions                 list persisted sessions under ~/.agentfs/run
+//!   pit replicate [sid] [url]    litestream daemon: stream the delta DB to S3 continuously
+//!   pit pull [sid] [url]         restore a session's delta DB from the litestream replica
 //!   pit list                     list configured profiles
-//!   pit selftest                 sanity-check argv assembly (no agentfs needed)
+//!   pit selftest                 sanity-check argv assembly
 //!
 //! Env:
 //!   PIT_SESSION=<id>  reuse/resume this session id (default <profile>-<cwd-slug>)
 //!   PIT_NEW=1         start a fresh unique session instead of the default id
-//!   PIT_AGENTFS=<bin>  path to the agentfs binary (default: agentfs on PATH)
 //!   PIT_QUIET=1       don't print the post-run delta summary
+//!   PIT_LITESTREAM=<bin>  path to the litestream binary (default: litestream on PATH)
+//!   PIT_REPLICA=<url>    replica URL (default: LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET)
+//!   PIT_DETACHED=1  (internal) spawned detached by --autostart; survives Ctrl-C on the run
 
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
 mod backup;
+#[cfg(target_os = "linux")]
+mod fuse;
+#[cfg(target_os = "linux")]
+mod mount;
+#[cfg(target_os = "linux")]
+mod sandbox;
 
 #[derive(Clone)]
 struct Profile {
@@ -114,8 +128,49 @@ fn session_id(profile: &str) -> String {
     format!("{}-{}", profile, slug(&cwd_string()))
 }
 
-fn agentfs_bin() -> String {
-    std::env::var("PIT_AGENTFS").unwrap_or_else(|_| "agentfs".to_string())
+fn litestream_bin() -> String {
+    std::env::var("PIT_LITESTREAM").unwrap_or_else(|_| "litestream".to_string())
+}
+
+/// true if `bin` is an existing path itself, or resolves on PATH
+fn bin_found(bin: &str) -> bool {
+    if bin.contains('/') {
+        return Path::new(bin).exists();
+    }
+    std::env::var_os("PATH").is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| d.join(bin).is_file())
+    })
+}
+
+/// Replica URL for a session's delta.db: explicit arg wins, then
+/// PIT_REPLICA, then LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET with a
+/// per-session path. Credentials are litestream's business (AWS_*/LITESTREAM_*
+/// env vars — command-line mode, see https://litestream.io/reference/replicate/).
+fn replica_url(sid: &str, explicit: Option<&str>) -> Result<String> {
+    if let Some(u) = explicit {
+        return Ok(u.to_string());
+    }
+    for var in ["PIT_REPLICA", "LITESTREAM_REPLICA_URL"] {
+        if let Ok(u) = std::env::var(var) {
+            if !u.is_empty() {
+                return Ok(u);
+            }
+        }
+    }
+    if let Ok(b) = std::env::var("LITESTREAM_BUCKET") {
+        if !b.is_empty() {
+            return Ok(format!("s3://{b}/{sid}/db"));
+        }
+    }
+    bail!(
+        "no replica configured — set PIT_REPLICA=s3://bucket/path, \
+         LITESTREAM_REPLICA_URL, or LITESTREAM_BUCKET"
+    )
+}
+
+/// true when `--autostart` should stream via litestream instead of the LTX watch
+fn litestream_autostart(sid: &str) -> bool {
+    bin_found(&litestream_bin()) && replica_url(sid, None).is_ok()
 }
 
 /// ~/.agentfs/run — where sessions (and their delta DBs) persist
@@ -232,25 +287,6 @@ fn session_has_changes(dir: &Path) -> bool {
     }
 }
 
-/// Ignore SIGINT/SIGTERM in `pit` itself while the sandboxed agent runs.
-/// `agentfs run` and the agent are in the same process group, so when you hit
-/// Ctrl-C the kernel delivers SIGINT to the whole group. `agentfs` already
-/// handles it (forward to child; SIGKILL on the second). If `pit` kept the
-/// default disposition it would die mid-wait and short-circuit that cleanup.
-/// Ignoring here lets the agent own the keyboard exactly as it would without
-/// the wrapper — `pit` just waits for `agentfs` to exit and then reports.
-fn ignore_stdin_signals() {
-    // SAFETY: sigaction with a valid struct and zeroed sa_mask is well-defined;
-    // we install SIG_IGN which is async-signal-safe. No handler touches state.
-    for sig in [libc::SIGINT, libc::SIGTERM] {
-        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
-        sa.sa_sigaction = libc::SIG_IGN;
-        unsafe {
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
-        }
-    }
-}
-
 /// profile allow dirs that actually exist on this host (missing ones are skipped)
 fn effective_allows(p: &Profile) -> Vec<String> {
     p.allows
@@ -260,32 +296,16 @@ fn effective_allows(p: &Profile) -> Vec<String> {
         .collect()
 }
 
-/// The exact argv we'd pass to exec `agentfs run`. Used by run, dump, selftest.
-fn build_argv(
-    agentfs: &str,
-    profile_name: &str,
-    sid: &str,
-    passthrough: &[String],
-) -> Result<Vec<String>> {
+/// The argv we exec inside the sandbox (command + passthrough). Used by run,
+/// dump, selftest.
+fn build_argv(profile_name: &str, passthrough: &[String]) -> Result<Vec<String>> {
     let p = profile(profile_name).ok_or_else(|| {
         anyhow!(
             "unknown profile '{profile_name}' (defined: {})",
             list_profiles().join(" ")
         )
     })?;
-    let mut v = vec![
-        agentfs.to_string(),
-        "run".into(),
-        "--session".into(),
-        sid.to_string(),
-    ];
-    for a in effective_allows(&p) {
-        v.push("--allow".into());
-        v.push(a);
-    }
-    for c in &p.cmd {
-        v.push(c.clone());
-    }
+    let mut v = p.cmd.clone();
     // pi: default the session display name to the cwd slug so it's findable
     // in `pi -r`. Skip on resume/continue/session or an explicit --name —
     // renaming a session you're resuming would be a surprise.
@@ -401,30 +421,35 @@ fn cmd_run(
     autostart: bool,
     auto_out: Option<PathBuf>,
 ) -> Result<i32> {
-    let bin = agentfs_bin();
-    let argv = build_argv(&bin, profile_name, sid, passthrough)?;
-    // spawn + wait (not exec) so we can print the SDK delta summary afterwards
-    // signal handlers so SIGINT goes to the sandboxed agent (same pgrp) and
-    // not to `pit`.
-    ignore_stdin_signals();
+    let argv = build_argv(profile_name, passthrough)?;
+    let allows = effective_allows(&profile(profile_name).expect("profile checked by caller"));
     if autostart {
         spawn_watch(sid, auto_out.as_deref())?;
     }
-    let status = match Command::new(&argv[0]).args(&argv[1..]).status() {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            bail!(
-                "agentfs CLI not found. Install it:\n  \
-                 curl -fsSL https://github.com/tursodatabase/agentfs/releases/latest/download/agentfs-installer.sh | sh\n\
-                 (or set PIT_AGENTFS=/path/to/agentfs)"
-            );
-        }
-        Err(e) => bail!("failed to spawn {bin}: {e}"),
+    // The sandbox is in-process: FUSE overlay + fork/unshare child. The child
+    // keeps the default signal dispositions (inherited across fork), and the
+    // sandbox parent installs forward-to-child handlers itself, so Ctrl-C
+    // reaches the agent directly — no wrapper in between to ignore it.
+    #[cfg(target_os = "linux")]
+    // block_on wraps the Result, so unwrap twice (see the `??` note at block_on).
+    let code = block_on(sandbox::run_cmd(
+        allows,
+        sid.to_string(),
+        PathBuf::from(&argv[0]),
+        argv[1..].to_vec(),
+    ))
+    ??;
+    #[cfg(not(target_os = "linux"))]
+    let code = {
+        // ponytail: the macOS NFS+sandbox-exec path was not ported; the FUSE
+        // sandbox is Linux-only. Re-add when macOS matters (port cli/src/sandbox/darwin.rs).
+        let _ = (allows, &argv);
+        bail!("pit's in-process sandbox is Linux-only; run pit on Linux")
     };
     // This runs after the sandboxed agent has exited and the delta DB is
     // persisted — the point where we bind the SDK.
     block_on(print_run_summary(sid))?;
-    Ok(status.code().unwrap_or(1))
+    Ok(code)
 }
 
 /// Strip pit's own `--autostart [--out <base.ltx>]` from a run's passthrough
@@ -452,14 +477,62 @@ fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Vec<String>) {
     (true, out, pass)
 }
 
-/// `pit <profile> --autostart`: spawn a detached `pit backup <sid> --watch`
-/// for the session about to run, so the delta DB streams to `<sid>.ltx` (or
-/// `--out`) while the agent works. The child inherits `pit run`'s SIG_IGN for
-/// SIGINT/SIGTERM, so it survives Ctrl-C; `pit backup --watch` restores the
-/// TERM default itself so `kill` can stop it, and exits on its own when the
-/// session DB is deleted. A second autostart on the same session is refused
-/// by the watcher's flock.
+/// Spawn a detached `pit` subcommand for this session: stdin null, output to
+/// `<session>/<log_name>`, PIT_DETACHED=1 so the subcommand knows it must
+/// survive `pit run`'s Ctrl-C. The child inherits `pit run`'s SIG_IGN for
+/// SIGINT/SIGTERM, so it outlives Ctrl-C; subcommands restore TERM handling
+/// themselves so `kill` still stops them.
+fn spawn_detached(sid: &str, args: &[&str], log_name: &str) -> Result<u32> {
+    let log = crate::run_dir()?.join(sid).join(log_name);
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log_file = OpenOptions::new().create(true).append(true).open(&log)?;
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(args)
+        .env("PIT_DETACHED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone()?))
+        .stderr(Stdio::from(log_file));
+    // SAFETY: pre_exec runs post-fork in the child; sigaction(SIG_IGN) is
+    // async-signal-safe, so the detached daemon ignores INT/TERM (it restores
+    // TERM handling itself) and survives Ctrl-C on the run.
+    unsafe {
+        cmd.pre_exec(|| {
+            // SAFETY: see ignore_int_term.
+            ignore_int_term();
+            Ok(())
+        });
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawn detached {} for session {sid}", args[0]))?;
+    Ok(child.id())
+}
+
+/// `pit <profile> --autostart`: stream the session's changes while the agent
+/// works. Preferred: a detached litestream daemon continuously replicating
+/// the delta DB to S3 (`pit replicate <sid>`), when a replica is configured
+/// (PIT_REPLICA / LITESTREAM_REPLICA_URL / LITESTREAM_BUCKET) and the
+/// binary is installed. Fallback: the local LTX chain watch (`pit backup
+/// <sid> --watch` -> `<sid>.ltx`). Both survive Ctrl-C on the run, refuse a
+/// second autostart on the same session (flock), and exit on their own when
+/// the session is deleted.
+///
+/// Detached children get SIGINT/SIGTERM ignored via pre_exec so Ctrl-C on
+/// the run (which the sandbox parent forwards to the agent) doesn't kill
+/// the streaming daemon. They restore normal TERM handling themselves for
+/// `kill`.
 fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
+    if litestream_autostart(sid) {
+        let pid = spawn_detached(sid, &["replicate", sid], "replicate.log")?;
+        eprintln!(
+            "pit: autostarted litestream for {sid} -> {} (pid {pid}, log: {})",
+            replica_url(sid, None)?,
+            crate::run_dir()?.join(sid).join("replicate.log").display()
+        );
+        return Ok(());
+    }
     let out = out
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(format!("{sid}.ltx")));
@@ -468,12 +541,22 @@ fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let log_file = OpenOptions::new().create(true).append(true).open(&log)?;
-    let child = Command::new(std::env::current_exe()?)
-        .args(["backup", sid, "--watch", "--out"])
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["backup", sid, "--watch", "--out"])
         .arg(&out)
+        .env("PIT_DETACHED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file.try_clone()?))
-        .stderr(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file));
+    // SAFETY: see spawn_detached — SIG_IGN pre-exec so Ctrl-C doesn't kill it.
+    unsafe {
+        cmd.pre_exec(|| {
+            // SAFETY: see ignore_int_term.
+            ignore_int_term();
+            Ok(())
+        });
+    }
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawn backup watch for session {sid}"))?;
     drop(child); // detached: the watcher outlives this run
@@ -485,14 +568,240 @@ fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// SIG_IGN for SIGINT/SIGTERM, to be installed in a forked child pre-exec
+/// (async-signal-safe).
+unsafe fn ignore_int_term() {
+    // SAFETY: sigaction with zeroed struct; SIG_IGN is async-signal-safe.
+    let mut sa: libc::sigaction = std::mem::zeroed();
+    sa.sa_sigaction = libc::SIG_IGN;
+    libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+}
+
+// ---- litestream replication (continuous, off-host) --------------------------
+
+/// One daemon per session: exclusive flock on <session>/replicate.lock for
+/// the process lifetime (mirrors the LTX watcher's lock_watch). The lock
+/// dies with the process — no stale-pid bookkeeping.
+fn replicate_lock(sid: &str) -> Result<File> {
+    let path = run_dir()?.join(sid).join("replicate.lock");
+    let f = File::create(&path)?;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        bail!(
+            "another litestream daemon is already replicating session {sid} ({})",
+            path.display()
+        );
+    }
+    Ok(f)
+}
+
+/// Forward a signal to the litestream child so it shuts down cleanly instead
+/// of being orphaned when `pit replicate` is Ctrl-C'd or killed.
+static LITESTREAM_PID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn forward_to_litestream(_sig: i32) {
+    let pid = LITESTREAM_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+fn install_forwarder(sig: i32) {
+    // SAFETY: handler only calls kill(2) on a stored pid — async-signal-safe.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = forward_to_litestream as *const () as usize;
+    unsafe {
+        libc::sigaction(sig, &sa, std::ptr::null_mut());
+    }
+}
+
+/// How long to keep a session's db absent before declaring the session
+/// deleted and stopping the daemon.
+const REAP_POLL: Duration = Duration::from_secs(5);
+
+/// `pit replicate [sid] [replica-url]` — run a litestream daemon that
+/// continuously replicates the session's delta.db to S3. Command-line mode
+/// (`litestream replicate <db> <url>`, flags before positionals); credentials
+/// come from AWS_*/LITESTREAM_* env vars, so no config file is generated.
+/// `-restore-if-db-not-exists` pulls the session back from the replica on a
+/// fresh machine. Foreground by default (Ctrl-C stops it); `pit <profile>
+/// --autostart` spawns it detached, and it then exits on its own when the
+/// session dir is deleted (else it would hold replicate.lock forever and
+/// block the next run).
+fn cmd_replicate_args(rest: &[String]) -> Result<()> {
+    let mut sid = None;
+    let mut url = None;
+    for a in rest {
+        if a.contains("://") {
+            if url.is_some() {
+                bail!("unexpected argument '{a}'");
+            }
+            url = Some(a.clone());
+        } else if sid.is_none() {
+            sid = Some(a.clone());
+        } else {
+            bail!("unexpected argument '{a}'");
+        }
+    }
+    let sid = match sid {
+        Some(s) => s,
+        None => select_session()?,
+    };
+    cmd_replicate(&sid, url.as_deref())
+}
+
+fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
+    let url = replica_url(sid, url_opt)?;
+    let bin = litestream_bin();
+    if !bin_found(&bin) {
+        bail!(
+            "litestream not found. Install it:\n  \
+             curl -s https://litestream.io/install.sh | sh\n\
+             (or set PIT_LITESTREAM=/path/to/litestream)"
+        );
+    }
+    let session_dir = run_dir()?.join(sid);
+    std::fs::create_dir_all(&session_dir)?;
+    let db = session_dir.join("delta.db");
+    let _lock = replicate_lock(sid)?;
+    // Manual runs: Ctrl-C must stop litestream. Detached runs keep the
+    // inherited SIG_IGN for SIGINT so they survive Ctrl-C on `pit run`;
+    // TERM is restored in both so `kill` works.
+    if std::env::var("PIT_DETACHED").as_deref() != Ok("1") {
+        install_forwarder(libc::SIGINT);
+    }
+    install_forwarder(libc::SIGTERM);
+    let mut child = Command::new(&bin)
+        .args(["replicate", "-restore-if-db-not-exists"])
+        .arg(&db)
+        .arg(&url)
+        .stdin(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to spawn {bin}"))?;
+    LITESTREAM_PID.store(child.id() as i32, Ordering::Relaxed);
+    eprintln!(
+        "pit: litestream replicating {sid} -> {url} (pid {}, db: {})",
+        child.id(),
+        db.display()
+    );
+    // Reap: exit when the session is deleted (mirrors the LTX watcher). A
+    // never-seen db is just a session still starting up — keep waiting.
+    let mut seen_db = db.exists();
+    let mut gone = 0;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                bail!("{bin} exited with {status}");
+            }
+            return Ok(());
+        }
+        std::thread::sleep(REAP_POLL);
+        let dir_gone = !session_dir.exists();
+        let db_gone = seen_db && !db.exists();
+        if dir_gone || db_gone {
+            gone += 1;
+        } else {
+            gone = 0;
+            seen_db = seen_db || db.exists();
+        }
+        if gone >= 3 {
+            eprintln!("pit: session {sid} gone — stopping litestream");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(());
+        }
+    }
+}
+
+/// `pit pull [sid] [replica-url] [--force] [--to <db>]` — restore the
+/// session's delta.db from the litestream replica (newest state), defaulting
+/// back into the session dir. Refuses to overwrite an existing db unless
+/// --force; `-if-replica-exists` makes a never-backed-up session a no-op.
+fn cmd_pull_args(rest: &[String]) -> Result<()> {
+    let mut sid = None;
+    let mut url = None;
+    let mut force = false;
+    let mut to = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--force" | "-f" => {
+                force = true;
+                i += 1;
+            }
+            "--to" => to = Some(take_value(rest, &mut i, "--to")?),
+            s if s.contains("://") => {
+                if url.is_some() {
+                    bail!("unexpected argument '{s}'");
+                }
+                url = Some(s.to_string());
+                i += 1;
+            }
+            s => {
+                if sid.is_some() {
+                    bail!("unexpected argument '{s}'");
+                }
+                sid = Some(s.to_string());
+                i += 1;
+            }
+        }
+    }
+    let sid = match sid {
+        Some(s) => s,
+        None => select_session()?,
+    };
+    cmd_pull(&sid, url.as_deref(), force, to)
+}
+
+fn cmd_pull(sid: &str, url_opt: Option<&str>, force: bool, to: Option<PathBuf>) -> Result<()> {
+    let url = replica_url(sid, url_opt)?;
+    let bin = litestream_bin();
+    if !bin_found(&bin) {
+        bail!(
+            "litestream not found. Install it:\n  \
+             curl -s https://litestream.io/install.sh | sh\n\
+             (or set PIT_LITESTREAM=/path/to/litestream)"
+        );
+    }
+    let to = to.unwrap_or(delta_db_path(sid)?);
+    let mut args = vec![
+        "restore".to_string(),
+        "-if-replica-exists".to_string(),
+        "-integrity-check".to_string(),
+        "quick".to_string(),
+        "-o".to_string(),
+        to.display().to_string(),
+        url.clone(),
+    ];
+    if force {
+        args.insert(2, "-force".to_string());
+    }
+    let status = Command::new(&bin)
+        .args(&args)
+        .status()
+        .with_context(|| format!("failed to spawn {bin}"))?;
+    if !status.success() {
+        bail!("litestream restore failed ({status}) — pull into a fresh path with --to, or --force to overwrite");
+    }
+    println!("pit: restored {sid} from {url} -> {}", to.display());
+    Ok(())
+}
+
 fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
-    let argv = build_argv(
-        &agentfs_bin(),
-        profile_name,
-        &session_id(profile_name),
-        passthrough,
-    )?;
-    println!("{}", argv.join(" "));
+    let sid = session_id(profile_name);
+    let argv = build_argv(profile_name, passthrough)?;
+    let allows = effective_allows(&profile(profile_name).expect("profile checked by caller"));
+    println!("session: {sid}");
+    println!("delta db: {}", delta_db_path(&sid)?.display());
+    println!("command:  {}", argv.join(" "));
+    if allows.is_empty() {
+        println!("allow:    (defaults only)");
+    } else {
+        println!("allow:    {}", allows.join(" "));
+    }
     Ok(())
 }
 
@@ -651,13 +960,15 @@ fn cmd_sessions(select: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_selftest() -> Result<()> {
+fn cmd_selftest(rest: &[String]) -> Result<()> {
+    if rest.iter().any(|a| a == "--sandbox") {
+        selftest_sandbox()?;
+        return Ok(());
+    }
     // Deterministic: pin the session id, assert argv assembly + passthrough.
     std::env::set_var("PIT_SESSION", "selftest-sid");
     let argv = build_argv(
-        "agentfs",
         "codex",
-        &session_id("codex"),
         &["exec".into(), "--json".into(), "-m".into(), "gpt-5".into()],
     )?;
     std::env::remove_var("PIT_SESSION");
@@ -670,28 +981,137 @@ fn cmd_selftest() -> Result<()> {
             }
         };
     }
-    check!(argv[0] == "agentfs", "bin slot");
-    check!(argv[1] == "run", "run subcommand");
+    check!(argv[0] == "codex", "command slot");
     check!(
-        joined.contains("\u{1f}--session\u{1f}selftest-sid\u{1f}"),
-        "session id"
-    );
-    check!(
-        joined.contains("\u{1f}codex\u{1f}exec\u{1f}--json\u{1f}-m\u{1f}gpt-5"),
+        joined.contains("codex\u{1f}exec\u{1f}--json\u{1f}-m\u{1f}gpt-5"),
         "passthrough incl. flags"
     );
-    check!(joined.contains("--allow"), "at least one --allow");
     println!("selftest OK");
     println!("  {}", argv.join(" "));
+    Ok(())
+}
+
+/// Full sandbox round-trip: FUSE overlay + fork/unshare child in a temp dir.
+/// Verifies (1) writes land in the delta DB, not on the host, (2) deletes
+/// become whiteouts, (3) the host tree is untouched, (4) the rest of the
+/// filesystem is actually read-only.
+fn selftest_sandbox() -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    bail!("selftest --sandbox is Linux-only");
+
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::env::temp_dir().join(format!("pit-sandbox-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("README.md"), "hello\n")?;
+        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::write(dir.join("src/a.txt"), "orig\n")?;
+        std::env::set_current_dir(&dir)?;
+
+        let sid = format!("selftest-sandbox-{}", std::process::id());
+        let script = "echo new > created.txt; rm README.md; mkdir -p dir1; echo x > dir1/f.txt";
+        let code = block_on(sandbox::run_cmd(
+            Vec::new(),
+            sid.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+        ))
+        ??;
+        check_sandbox(code == 0, true, "sandboxed script exit code")?;
+
+        // Host tree untouched: README.md still here, created.txt never written.
+        check_sandbox(
+            std::fs::read_to_string(dir.join("README.md"))
+                .map(|s| s == "hello\n")
+                .unwrap_or(false),
+            true,
+            "host README.md untouched",
+        )?;
+        check_sandbox(
+            !dir.join("created.txt").exists(),
+            true,
+            "created.txt not on host",
+        )?;
+
+        // Delta DB: created.txt + dir1/f.txt changed, README.md deleted.
+        let sid_check = sid.clone();
+        let (delta, whiteouts) = block_on(async move {
+            let agent = open_session(&sid_check).await?.context("no delta DB after run")?;
+            let d = agent.get_delta_paths().await.unwrap_or_default();
+            let w = agent.get_whiteouts().await.unwrap_or_default();
+            anyhow::Ok((d, w))
+        })
+        ??;
+        for p in ["/created.txt", "/dir1/f.txt"] {
+            check_sandbox(delta.contains(p), true, &format!("delta contains {p}"))?;
+        }
+        check_sandbox(
+            whiteouts.contains("/README.md"),
+            true,
+            "whiteout contains /README.md",
+        )?;
+
+        // Read-only enforcement: /etc is not writable from inside the sandbox.
+        let diag = format!("/tmp/pit-sandbox-diag-{}.txt", std::process::id());
+        let code = block_on(sandbox::run_cmd(
+            Vec::new(),
+            sid.clone(),
+            "/bin/sh".into(),
+            vec![
+                "-c".into(),
+                format!("{{ ls -la; echo ---; cat created.txt; }} > {diag} 2>&1"),
+            ],
+        ))
+        ??;
+        if let Ok(d) = std::fs::read_to_string(&diag) {
+            println!("{d}");
+        }
+        let _ = std::fs::remove_file(&diag);
+        check_sandbox(code == 0, true, "diagnostic run exit code")?;
+
+        let code = block_on(sandbox::run_cmd(
+            Vec::new(),
+            sid.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "touch /etc/pit-sandbox-evil".into()],
+        ))
+        ??;
+        check_sandbox(code != 0, true, "/etc write rejected (EROFS)")?;
+
+        // Session join: second run with the same sid joins, delta survives.
+        let code = block_on(sandbox::run_cmd(
+            Vec::new(),
+            sid.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "echo more >> created.txt".into()],
+        ))
+        ??;
+        check_sandbox(code == 0, true, "join-session run exit code")?;
+
+        std::fs::remove_dir_all(&dir)?;
+        let _ = std::fs::remove_dir_all(delta_db_path(&sid)?.parent().unwrap_or(std::path::Path::new("")));
+        println!("sandbox selftest OK (mount, delta, whiteouts, ro-enforcement, join)");
+    }
+    Ok(())
+}
+
+fn check_sandbox(cond: bool, expected: bool, what: &str) -> Result<()> {
+    if cond != expected {
+        bail!("sandbox selftest FAIL: {what} (got {cond}, expected {expected})");
+    }
     Ok(())
 }
 
 fn usage() -> String {
     "usage:\n  \
      pit <profile> [args...]      run agent in the sandbox; --autostart streams a backup watch\n  \
-     pit dump <profile> [args...] print the agentfs run argv\n  \
+     pit dump <profile> [args...] print the resolved sandbox plan (no exec)\n  \
      pit inspect [session-id]     show diff + timeline for a session\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
+     pit replicate [sid] [url]    stream a session's delta DB to S3 via litestream (daemon)
+  \
+     pit pull [sid] [url] [--force] [--to db]   restore a session from its litestream replica
+  \
      pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  LTX backup of a session's delta DB\n  \
      pit restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
      pit ltx <file.ltx>         inspect/verify a backup file\n  \
@@ -714,7 +1134,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        [c] if c == "selftest" => cmd_selftest(),
+        [c, rest @ ..] if c == "selftest" => cmd_selftest(rest),
         [c] if c == "sessions" => cmd_sessions(false),
         [c, flag] if c == "sessions" && flag == "--select" => cmd_sessions(true),
         [c] if c == "help" || c == "--help" || c == "-h" => {
@@ -733,6 +1153,8 @@ fn main() -> Result<()> {
             cmd_inspect(&sid)
         }
         [c, rest @ ..] if c == "backup" => cmd_backup_args(rest),
+        [c, rest @ ..] if c == "replicate" => cmd_replicate_args(rest),
+        [c, rest @ ..] if c == "pull" => cmd_pull_args(rest),
         [c, rest @ ..] if c == "restore" => cmd_restore_args(rest),
         [c, rest @ ..] if c == "ltx" => {
             let path = rest.first().context("pit ltx <file.ltx>")?;
@@ -961,5 +1383,53 @@ mod tests {
         let (auto, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
         assert!(auto);
         assert_eq!(pass, v(&["-y"]));
+    }
+
+    #[test]
+    fn replica_url_resolution_precedence() {
+        std::env::set_var("LITESTREAM_BUCKET", "mybucket");
+        std::env::remove_var("PIT_REPLICA");
+        std::env::remove_var("LITESTREAM_REPLICA_URL");
+
+        // bucket alone synthesizes a per-session path
+        assert_eq!(
+            replica_url("codex-foo", None).unwrap(),
+            "s3://mybucket/codex-foo/db"
+        );
+        // explicit arg beats everything
+        assert_eq!(
+            replica_url("codex-foo", Some("s3://other/x")).unwrap(),
+            "s3://other/x"
+        );
+        // LITESTREAM_REPLICA_URL beats the bucket
+        std::env::set_var("LITESTREAM_REPLICA_URL", "s3://env-bucket/env-path");
+        assert_eq!(
+            replica_url("codex-foo", None).unwrap(),
+            "s3://env-bucket/env-path"
+        );
+        // PIT_REPLICA beats both
+        std::env::set_var("PIT_REPLICA", "s3://pit-bucket/pit-path");
+        assert_eq!(
+            replica_url("codex-foo", None).unwrap(),
+            "s3://pit-bucket/pit-path"
+        );
+        std::env::remove_var("PIT_REPLICA");
+        std::env::remove_var("LITESTREAM_REPLICA_URL");
+        std::env::remove_var("LITESTREAM_BUCKET");
+        assert!(replica_url("codex-foo", None).is_err());
+    }
+
+    #[test]
+    fn litestream_autostart_requires_binary_and_replica() {
+        std::env::set_var("LITESTREAM_BUCKET", "b");
+        std::env::set_var("PIT_LITESTREAM", "/bin/true"); // exists, so bin_found
+        assert!(litestream_autostart("x"));
+
+        std::env::set_var("PIT_LITESTREAM", "/nonexistent/pit-ls");
+        assert!(!litestream_autostart("x")); // binary missing -> LTX fallback
+
+        std::env::remove_var("LITESTREAM_BUCKET");
+        std::env::remove_var("PIT_LITESTREAM");
+        assert!(!litestream_autostart("x")); // no replica -> LTX fallback
     }
 }
