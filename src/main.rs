@@ -30,6 +30,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod backup;
+
 #[derive(Clone)]
 struct Profile {
     cmd: Vec<String>,
@@ -116,7 +118,7 @@ fn agentfs_bin() -> String {
 }
 
 /// ~/.agentfs/run — where sessions (and their delta DBs) persist
-fn run_dir() -> Result<PathBuf> {
+pub(crate) fn run_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home).join(".agentfs/run"))
 }
@@ -310,7 +312,8 @@ fn build_argv(
 }
 
 // ---- AgentFS SDK: open a persisted session delta DB --------------------------
-fn delta_db_path(sid: &str) -> Result<PathBuf> {
+/// ~/.agentfs/run/<sid>/delta.db — the session's persisted change log
+pub(crate) fn delta_db_path(sid: &str) -> Result<PathBuf> {
     Ok(run_dir()?.join(sid).join("delta.db"))
 }
 
@@ -621,6 +624,9 @@ fn usage() -> String {
      pit dump <profile> [args...] print the agentfs run argv\n  \
      pit inspect [session-id]     show diff + timeline for a session\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
+     pit backup [sid] [--from prev.ltx] [--out path] [-c]  LTX backup of a session's delta DB\n  \
+     pit restore <file.ltx> [--to db]  apply an LTX backup back into a session\n  \
+     pit ltx <file.ltx>         inspect/verify a backup file\n  \
      pit list                     list profiles\n  \
      pit selftest                 sanity check\n"
         .to_string()
@@ -658,6 +664,15 @@ fn main() -> Result<()> {
             };
             cmd_inspect(&sid)
         }
+        [c, rest @ ..] if c == "backup" => cmd_backup_args(rest),
+        [c, rest @ ..] if c == "restore" => cmd_restore_args(rest),
+        [c, rest @ ..] if c == "ltx" => {
+            let path = rest.first().context("pit ltx <file.ltx>")?;
+            if rest.len() > 1 {
+                bail!("unexpected argument '{}'", rest[1]);
+            }
+            backup::cmd_ltx_info(Path::new(path))
+        }
         [pname, passthrough @ ..] => {
             if profile(pname).is_none() {
                 bail!(
@@ -677,6 +692,83 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
     }
+}
+
+/// Consume `--flag <value>` at `rest[i]`, advancing `i` past both. The only
+/// flag form backup/restore need — kept inline rather than a generic parser,
+/// which would hide the small shape behind indirection.
+fn take_value(rest: &[String], i: &mut usize, flag: &str) -> Result<PathBuf> {
+    let v = rest.get(*i + 1).with_context(|| format!("{flag} needs a path"))?;
+    *i += 2;
+    Ok(PathBuf::from(v))
+}
+
+/// `pit backup [sid] [--from <prev.ltx>] [--out <path>] [-c]` — sid defaults
+/// to an interactive selection when `--select` is given or omitted with no
+/// positional argument (mirrors `pit inspect`).
+fn cmd_backup_args(rest: &[String]) -> Result<()> {
+    let mut from = None;
+    let mut out = None;
+    let mut sid = None;
+    let mut compress = false;
+    let mut select = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--from" => from = Some(take_value(rest, &mut i, "--from")?),
+            "--out" => out = Some(take_value(rest, &mut i, "--out")?),
+            "-c" | "--compress" => {
+                compress = true;
+                i += 1;
+            }
+            "--select" => {
+                select = true;
+                i += 1;
+            }
+            s => {
+                if sid.is_some() {
+                    bail!("unexpected argument '{s}'");
+                }
+                sid = Some(s.to_string());
+                i += 1;
+            }
+        }
+    }
+    if select && sid.is_some() {
+        bail!("cannot combine a session id with --select");
+    }
+    let sid = match sid {
+        Some(s) => s,
+        None => select_session()?,
+    };
+    let out = out.unwrap_or_else(|| PathBuf::from(format!("{sid}.ltx")));
+    backup::cmd_backup(&sid, from.as_deref(), &out, compress)
+}
+
+/// `pit restore <file.ltx> [--to <db>]` — target defaults to the session the
+/// file is named after (codex-foo.ltx -> ~/.agentfs/run/codex-foo/delta.db).
+fn cmd_restore_args(rest: &[String]) -> Result<()> {
+    let mut ltx = None;
+    let mut to = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--to" => to = Some(take_value(rest, &mut i, "--to")?),
+            s => {
+                if ltx.is_some() {
+                    bail!("unexpected argument '{s}'");
+                }
+                ltx = Some(PathBuf::from(s));
+                i += 1;
+            }
+        }
+    }
+    let ltx = ltx.context("pit restore <file.ltx> [--to <db>]")?;
+    let to = match to {
+        Some(t) => t,
+        None => backup::default_restore_target(&ltx)?,
+    };
+    backup::cmd_restore(&ltx, &to)
 }
 
 /// For `dump`: everything after `dump` is `<profile> [passthrough...]`.
