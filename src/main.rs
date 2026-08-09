@@ -960,6 +960,24 @@ fn cmd_sessions(select: bool) -> Result<()> {
     Ok(())
 }
 
+/// Delete a session dir: unmount any stale FUSE mount first, then remove
+/// the dir and its config stamp. Mirrors drop_stale_session's cleanup order.
+fn cmd_rm(sid: &str) -> Result<()> {
+    let run_dir = run_dir()?;
+    let dir = run_dir.join(sid);
+    if !dir.exists() {
+        bail!("no session {} at {}", sid, run_dir.display());
+    }
+    unmount_stale(&dir.join("mnt"));
+    std::fs::remove_dir_all(&dir).with_context(|| format!("rm session {sid}"))?;
+    let stamp = run_dir.join(".stamps").join(sid);
+    if stamp.exists() {
+        std::fs::remove_file(&stamp).with_context(|| format!("rm stamp {sid}"))?;
+    }
+    println!("pit: removed session {sid}");
+    Ok(())
+}
+
 fn cmd_selftest(rest: &[String]) -> Result<()> {
     if rest.iter().any(|a| a == "--sandbox") {
         selftest_sandbox()?;
@@ -1108,6 +1126,7 @@ fn usage() -> String {
      pit dump <profile> [args...] print the resolved sandbox plan (no exec)\n  \
      pit inspect [session-id]     show diff + timeline for a session\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
+     pit rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
      pit replicate [sid] [url]    stream a session's delta DB to S3 via litestream (daemon)
   \
      pit pull [sid] [url] [--force] [--to db]   restore a session from its litestream replica
@@ -1144,6 +1163,14 @@ fn main() -> Result<()> {
         [c, rest @ ..] if c == "dump" => {
             let (pname, passthrough) = split_profile(rest)?;
             cmd_dump(&pname, &passthrough)
+        }
+        [c, rest @ ..] if c == "rm" => {
+            let sid = match rest.first().map(String::as_str) {
+                Some("--select") => select_session()?,
+                Some(sid) => sid.to_string(),
+                None => bail!("pit rm <session-id> (or --select)"),
+            };
+            cmd_rm(&sid)
         }
         [c, rest @ ..] if c == "inspect" => {
             let sid = match rest.first().map(String::as_str) {
