@@ -26,6 +26,13 @@
 //!   PIT_LITESTREAM=<bin>  path to the litestream binary (default: litestream on PATH)
 //!   PIT_REPLICA=<url>    replica URL (default: LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET)
 //!   PIT_DETACHED=1  (internal) spawned detached by --autostart; survives Ctrl-C on the run
+//!   PIT_NET=proxy|none|full  network isolation (default proxy): slirp4netns netns +
+//!     nft egress policy + allowlist proxy (see PIT_PROXY_ALLOW); none = netns only,
+//!     full = host network (legacy)
+//!   PIT_PROXY_ALLOW=comma,list  extra egress allowlist entries for PIT_NET=proxy
+//!   PIT_HIDE=~/.a:~/.b  extra secrets to hide (colon-separated); PIT_NO_HIDE=~/.ssh restores
+//!   PIT_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
+//!   PIT_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)
 
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{anyhow, bail, Context, Result};
@@ -44,6 +51,8 @@ mod backup;
 mod fuse;
 #[cfg(target_os = "linux")]
 mod mount;
+#[cfg(target_os = "linux")]
+mod proxy;
 #[cfg(target_os = "linux")]
 mod sandbox;
 
@@ -1135,7 +1144,8 @@ fn usage() -> String {
      pit restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
      pit ltx <file.ltx>         inspect/verify a backup file\n  \
      pit list                     list profiles\n  \
-     pit selftest                 sanity check\n"
+     pit selftest                 sanity check\n\n\
+env: PIT_NET=proxy|none|full  PIT_PROXY_ALLOW  PIT_HIDE/PIT_NO_HIDE  PIT_LIMIT_*  PIT_SECCOMP\n"
         .to_string()
 }
 
@@ -1189,6 +1199,40 @@ fn main() -> Result<()> {
                 bail!("unexpected argument '{}'", rest[1]);
             }
             backup::cmd_ltx_info(Path::new(path))
+        }
+        // Internal: the sandbox proxy child (spawned by M with fd 3 as the
+        // listener). Not a user-facing command.
+        [c] if c == "proxy" => {
+            #[cfg(target_os = "linux")]
+            {
+                proxy::run(3)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("proxy is Linux-only")
+            }
+        }
+        // Internal: run an arbitrary command inside the sandbox (testing).
+        [c, rest @ ..] if c == "raw" => {
+            #[cfg(target_os = "linux")]
+            {
+                let (cmd, args) = rest
+                    .split_first()
+                    .context("pit raw <cmd> [args...]")?;
+                let sid = format!("raw-{}", std::process::id());
+                let code = block_on(sandbox::run_cmd(
+                    Vec::new(),
+                    sid.clone(),
+                    std::path::PathBuf::from(cmd),
+                    args.to_vec(),
+                ))
+                ??;
+                std::process::exit(code)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                bail!("sandbox is Linux-only")
+            }
         }
         [pname, passthrough @ ..] => {
             if profile(pname).is_none() {
