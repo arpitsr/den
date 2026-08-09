@@ -595,13 +595,20 @@ fn integrity_check(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Default restore target: codex-foo.ltx -> ~/.agentfs/run/codex-foo/delta.db
+/// Default restore target: codex-foo.ltx -> ~/.agentfs/run/codex-foo/delta.db.
+/// Chain deltas are numbered codex-foo.NNNN.ltx; strip the number so a
+/// numbered file still resolves to the session it belongs to (session ids
+/// never contain '.', so the suffix is unambiguous).
 pub fn default_restore_target(ltx: &Path) -> Result<PathBuf> {
-    let sid = ltx
+    let stem = ltx
         .file_stem()
         .context("backup file has no name")?
-        .to_string_lossy()
-        .to_string();
+        .to_string_lossy();
+    let sid = match stem.rsplit_once('.') {
+        Some((base, n)) if n.chars().all(|c| c.is_ascii_digit()) && n.len() >= 4 => base,
+        _ => &stem,
+    }
+    .to_string();
     let db = crate::delta_db_path(&sid)?;
     if !db.exists() {
         bail!(
