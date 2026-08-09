@@ -100,6 +100,7 @@ same dir **resumes** the same sandbox (changes persist across calls).
 pit sessions                  # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
 pit sessions --select         # number the list, prompt for a choice, print the selected id
 pit inspect [session-id]      # full diff +, deletions -, and tool-call timeline; omit id to select
+pit rm [session-id]           # delete a session dir (unmounts stale FUSE mounts first; --select to pick)
 ```
 
 The tool-call timeline is only populated if the agent *itself* records tool calls
