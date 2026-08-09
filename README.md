@@ -70,8 +70,8 @@ pit dump codex exec --json    # print the exact `agentfs run` argv (no exec)
 pit sessions                  # list persisted sessions with changed/deleted counts
 pit sessions --select         # show numbered sessions, choose one, print its id
 pit inspect [session-id]      # open a session's delta DB; omit id to choose interactively
-pit backup [sid] [--from prev.ltx] [--out path] [-c]   # LTX backup of a session's delta DB
-pit restore <file.ltx> [--to db]                      # apply an LTX backup back
+pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's delta DB
+pit restore <file.ltx> [--to db]                      # apply an LTX backup (and chain) back
 pit ltx <file.ltx>            # inspect/verify a backup file
 ```
 
@@ -124,15 +124,23 @@ checksum), the DB pages, and a trailer with post-apply + file checksums
 pit backup codex-myproj                # snapshot -> ./codex-myproj.ltx (txid 1)
 pit backup codex-myproj -c             # same, LZ4-compressed
 pit backup codex-myproj --from codex-myproj.ltx   # delta: only changed pages (txid 2)
+pit backup codex-myproj --watch        # stream: snapshot + chained deltas while it runs (Ctrl-C to stop)
 pit ltx codex-myproj.ltx               # inspect + verify checksums
-pit restore codex-myproj.ltx           # -> ~/.agentfs/run/codex-myproj/delta.db
+pit restore codex-myproj.ltx           # -> ~/.agentfs/run/codex-myproj/delta.db (replays the whole chain)
 pit restore codex-myproj.ltx --to /tmp/other.db
 ```
 
 * A **snapshot** (no `--from`) contains every page; a **delta** (`--from
-  prev.ltx`, which must be a snapshot) contains only pages whose checksum
-  changed, with the previous snapshot's checksum as `pre_apply` — so a delta
-  only applies on top of exactly that base.
+  prev.ltx`, the previous file in the chain) contains only pages whose checksum
+  changed since it, with its post-apply checksum as `pre_apply` — so a delta
+  only applies on top of exactly the preceding stream state.
+* `--watch` streams, Litestream-style: it writes the snapshot, then appends a
+  chained delta (`codex-myproj.0001.ltx`, `codex-myproj.0002.ltx`, ...)
+  whenever the session DB changes, until Ctrl-C. Like Litestream it polls the
+  DB + WAL (SQLite has no cross-process write hook); deltas are page-level
+  LTX files rather than WAL frames. Every file is written complete, so a
+  crash mid-session still leaves the chain restorable up to the last tick,
+  and restarting `--watch` resumes from the newest file.
 * Restore verifies the file checksum, then the post-apply checksum, then
   `PRAGMA integrity_check`; delta restores additionally verify the pre-apply
   checksum of the target before writing. A snapshot restore replaces the

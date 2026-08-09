@@ -624,8 +624,8 @@ fn usage() -> String {
      pit dump <profile> [args...] print the agentfs run argv\n  \
      pit inspect [session-id]     show diff + timeline for a session\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
-     pit backup [sid] [--from prev.ltx] [--out path] [-c]  LTX backup of a session's delta DB\n  \
-     pit restore <file.ltx> [--to db]  apply an LTX backup back into a session\n  \
+     pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  LTX backup of a session's delta DB\n  \
+     pit restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
      pit ltx <file.ltx>         inspect/verify a backup file\n  \
      pit list                     list profiles\n  \
      pit selftest                 sanity check\n"
@@ -703,15 +703,17 @@ fn take_value(rest: &[String], i: &mut usize, flag: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(v))
 }
 
-/// `pit backup [sid] [--from <prev.ltx>] [--out <path>] [-c]` — sid defaults
-/// to an interactive selection when `--select` is given or omitted with no
-/// positional argument (mirrors `pit inspect`).
+/// `pit backup [sid] [--from <prev.ltx>] [--out <path>] [-c] [--watch]` — sid
+/// defaults to an interactive selection when `--select` is given or omitted
+/// with no positional argument (mirrors `pit inspect`). `--watch` streams
+/// chained deltas until interrupted instead of writing one file.
 fn cmd_backup_args(rest: &[String]) -> Result<()> {
     let mut from = None;
     let mut out = None;
     let mut sid = None;
     let mut compress = false;
     let mut select = false;
+    let mut watch = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -723,6 +725,10 @@ fn cmd_backup_args(rest: &[String]) -> Result<()> {
             }
             "--select" => {
                 select = true;
+                i += 1;
+            }
+            "--watch" => {
+                watch = true;
                 i += 1;
             }
             s => {
@@ -737,12 +743,19 @@ fn cmd_backup_args(rest: &[String]) -> Result<()> {
     if select && sid.is_some() {
         bail!("cannot combine a session id with --select");
     }
+    if watch && from.is_some() {
+        bail!("--from is not used with --watch (the chain resumes from --out)");
+    }
     let sid = match sid {
         Some(s) => s,
         None => select_session()?,
     };
     let out = out.unwrap_or_else(|| PathBuf::from(format!("{sid}.ltx")));
-    backup::cmd_backup(&sid, from.as_deref(), &out, compress)
+    if watch {
+        backup::cmd_backup_watch(&sid, &out, compress)
+    } else {
+        backup::cmd_backup(&sid, from.as_deref(), &out, compress)
+    }
 }
 
 /// `pit restore <file.ltx> [--to <db>]` — target defaults to the session the
@@ -768,7 +781,22 @@ fn cmd_restore_args(rest: &[String]) -> Result<()> {
         Some(t) => t,
         None => backup::default_restore_target(&ltx)?,
     };
-    backup::cmd_restore(&ltx, &to)
+    backup::cmd_restore(&ltx, &to)?;
+    // a --watch chain (base.ltx + base.NNNN.ltx) restores as a stream:
+    // replay the numbered siblings so it comes back at its newest state
+    let mut n = 1;
+    loop {
+        let next = backup::chain_path(&ltx, n);
+        if !next.exists() {
+            break;
+        }
+        backup::cmd_restore(&next, &to)?;
+        n += 1;
+    }
+    if n > 1 {
+        println!("pit: replayed {} chain delta(s) onto {}", n - 1, to.display());
+    }
+    Ok(())
 }
 
 /// For `dump`: everything after `dump` is `<profile> [passthrough...]`.

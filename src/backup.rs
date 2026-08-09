@@ -2,10 +2,12 @@
 //! port of https://github.com/superfly/ltx-rs — the Lite Transaction File
 //! format for SQLite backup).
 //!
-//!   pit backup <sid> [--from <prev.ltx>] [--out <path>] [-c]
-//!     snapshot (or delta from a previous snapshot) of ~/.agentfs/run/<sid>/delta.db
+//!   pit backup <sid> [--from <prev.ltx>] [--out <path>] [-c] [--watch]
+//!     snapshot (or delta from the previous file in the chain) of
+//!     ~/.agentfs/run/<sid>/delta.db; --watch keeps appending chained deltas
+//!     while the session is written (Litestream-style streaming)
 //!   pit restore <file.ltx> [--to <db>]
-//!     apply an LTX file back into a session delta DB
+//!     apply an LTX file (and any chain siblings) back into a session delta DB
 //!   pit ltx <file.ltx>
 //!     inspect a backup file: header, page count, checksums (verifies them)
 //!
@@ -26,7 +28,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// litetx's Header::is_snapshot is crate-private; a snapshot is min_txid == 1.
 fn is_snapshot(h: &Header) -> bool {
@@ -51,17 +53,23 @@ fn sqlite_header(path: &Path) -> Result<(u32, u32)> {
     Ok((ps, count))
 }
 
-/// Make the main DB file a complete snapshot of committed state before we
-/// read it page-by-page.
-fn prepare_db(db: &Path) -> Result<()> {
+/// Fold the WAL into the main file so it's a complete snapshot of committed
+/// state, and refuse a torn DB. `strict` is for on-demand backup: a mid-write
+/// DB is an error. The watch loop passes false and gets `Ok(false)` to skip
+/// the round — the frames are still safe in the WAL, and the writer's own
+/// auto-checkpoint flushes them soon.
+fn prepare_db(db: &Path, strict: bool) -> Result<bool> {
     // a -journal sibling means a rollback-journal commit is mid-write —
     // refuse rather than read a torn DB
     let journal = PathBuf::from(format!("{}-journal", db.display()));
     if journal.exists() {
-        bail!(
-            "{} present — session appears mid-write; run backup after the agent exits",
-            journal.display()
-        );
+        if strict {
+            bail!(
+                "{} present — session appears mid-write; run backup after the agent exits",
+                journal.display()
+            );
+        }
+        return Ok(false);
     }
     // the SDK leaves its DBs in WAL mode (a -wal sibling persists after a
     // clean close, usually empty) — fold any frames into the main file
@@ -73,14 +81,17 @@ fn prepare_db(db: &Path) -> Result<()> {
         })?;
         drop(conn);
         if res.0 != 0 {
-            bail!(
-                "wal_checkpoint on {} failed (result {}): DB may be mid-write",
-                db.display(),
-                res.0
-            );
+            if strict {
+                bail!(
+                    "wal_checkpoint on {} failed (result {}): DB may be mid-write",
+                    db.display(),
+                    res.0
+                );
+            }
+            return Ok(false);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn read_page(f: &mut File, pgno: u32, ps: u32) -> Result<Vec<u8>> {
@@ -119,13 +130,24 @@ fn read_ltx(path: &Path) -> Result<(Header, HashMap<u32, Vec<u8>>, Trailer)> {
     Ok((header, pages, trailer))
 }
 
-/// `pit backup <sid> [--from <prev.ltx>] [--out <path>] [-c]`
-pub fn cmd_backup(sid: &str, from: Option<&Path>, out: &Path, compress: bool) -> Result<()> {
+/// Write one LTX file for the session: a snapshot, or a delta against `from`
+/// (the previous file in the chain). `strict` is the on-demand mode: a
+/// mid-write DB is an error. The watch loop passes false and gets `Ok(false)`
+/// to skip the round and retry. Returns whether a file was written.
+fn cmd_backup_inner(
+    sid: &str,
+    from: Option<&Path>,
+    out: &Path,
+    compress: bool,
+    strict: bool,
+) -> Result<bool> {
     let db = crate::delta_db_path(sid)?;
     if !db.exists() {
         bail!("no delta DB for session {sid} at {}", db.display());
     }
-    prepare_db(&db)?;
+    if !prepare_db(&db, strict)? {
+        return Ok(false); // writer mid-commit; the watch loop retries next round
+    }
     let (ps, commit) = sqlite_header(&db)?;
     let lock = PageNum::lock_page(PageSize::new(ps)?).into_inner();
     if commit >= lock {
@@ -152,7 +174,123 @@ pub fn cmd_backup(sid: &str, from: Option<&Path>, out: &Path, compress: bool) ->
         Some(pre) => println!("  pre-apply {pre}, post-apply {post_apply}"),
         None => println!("  post-apply checksum {post_apply}"),
     }
+    Ok(true)
+}
+
+/// `pit backup <sid> [--from <prev.ltx>] [--out <path>] [-c]`
+pub fn cmd_backup(sid: &str, from: Option<&Path>, out: &Path, compress: bool) -> Result<()> {
+    cmd_backup_inner(sid, from, out, compress, true)?;
     Ok(())
+}
+
+/// The k-th file of a watch chain: k=0 is the snapshot, k≥1 the deltas
+/// (out.ltx, out.0001.ltx, out.0002.ltx, ...).
+pub(crate) fn chain_path(base: &Path, k: u32) -> PathBuf {
+    if k == 0 {
+        return base.to_path_buf();
+    }
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let ext = base
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    base.with_file_name(format!("{stem}.{k:04}{ext}"))
+}
+
+/// (len, mtime) of the DB file and its -wal sibling (if any) — a cheap
+/// change detector for the watch loop.
+type DbState = (u64, SystemTime, Option<(u64, SystemTime)>);
+
+fn db_state(db: &Path) -> Result<DbState> {
+    let m = std::fs::metadata(db)?;
+    let wal = PathBuf::from(format!("{}-wal", db.display()));
+    let w = match wal.metadata() {
+        Ok(w) => Some((w.len(), w.modified()?)),
+        Err(_) => None,
+    };
+    Ok((m.len(), m.modified()?, w))
+}
+
+/// Poll interval for --watch. Like Litestream (which also polls the WAL —
+/// SQLite has no cross-process write notification), we re-check the DB and
+/// its -wal sibling every couple of seconds.
+const WATCH_POLL: Duration = Duration::from_secs(2);
+
+/// Streaming watch state: chain position + last-seen DB state.
+struct Watch {
+    sid: String,
+    out: PathBuf,
+    compress: bool,
+    n: u32, // files written so far: chain_path(out, 0..=n) all exist
+    state: DbState,
+}
+
+impl Watch {
+    /// One round: if the DB changed since the last write, append the next
+    /// chain file (a delta against the newest one). Skipped while the writer
+    /// is mid-commit — the frames stay safe in the WAL and the next round
+    /// catches them.
+    fn tick(&mut self) -> Result<()> {
+        let db = crate::delta_db_path(&self.sid)?;
+        let now = db_state(&db)?;
+        if now == self.state {
+            return Ok(());
+        }
+        let next = chain_path(&self.out, self.n + 1);
+        let prev = chain_path(&self.out, self.n);
+        if !cmd_backup_inner(&self.sid, Some(&prev), &next, self.compress, false)? {
+            return Ok(());
+        }
+        self.n += 1;
+        self.state = db_state(&db)?; // re-stat: the writer may have moved on
+        Ok(())
+    }
+}
+
+/// `pit backup --watch <sid> [--out <base>.ltx]` — Litestream-style
+/// streaming: write a snapshot, then keep appending chained deltas while the
+/// session's DB changes, until interrupted. Every file is written complete,
+/// so Ctrl-C (or a crash) always leaves the chain restorable up to the last
+/// tick, and restarting resumes from the newest file. `pit restore <base>.ltx`
+/// replays the whole chain.
+pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
+    let db = crate::delta_db_path(sid)?;
+    if !db.exists() {
+        bail!("no delta DB for session {sid} at {}", db.display());
+    }
+    let mut watch = Watch {
+        sid: sid.to_string(),
+        out: out.to_path_buf(),
+        compress,
+        n: 0,
+        state: db_state(&db)?,
+    };
+    // resume an existing chain from its newest file
+    while chain_path(out, watch.n + 1).exists() {
+        watch.n += 1;
+    }
+    if watch.n == 0 {
+        // fresh chain: initial snapshot (retry while the writer is mid-commit)
+        loop {
+            if cmd_backup_inner(sid, None, out, compress, false)? {
+                break;
+            }
+            std::thread::sleep(WATCH_POLL);
+        }
+    } else {
+        eprintln!(
+            "pit: resuming chain at {}",
+            chain_path(out, watch.n).display()
+        );
+    }
+    watch.state = db_state(&db)?;
+    loop {
+        std::thread::sleep(WATCH_POLL);
+        watch.tick()?;
+    }
 }
 
 /// Full snapshot (txid 1): every page 1..=commit, nothing else.
@@ -192,9 +330,10 @@ fn write_snapshot(
     Ok((header, n_pages, post_apply))
 }
 
-/// Delta (txid prev+1): only pages whose checksum changed since the base
-/// snapshot, with the base's post-apply checksum as pre-apply — so the delta
-/// only applies on top of exactly that base.
+/// Delta (txid prev+1): only pages whose checksum changed since the previous
+/// file in the chain — a snapshot or another delta — with that file's
+/// post-apply checksum as pre-apply, so a delta only applies on top of exactly
+/// the preceding stream state.
 fn write_delta(
     f: &mut File,
     out: &Path,
@@ -204,13 +343,6 @@ fn write_delta(
     prev_path: &Path,
 ) -> Result<(Header, u32, Checksum)> {
     let (ph, ppages, ptrailer) = read_ltx(prev_path)?;
-    if !is_snapshot(&ph) {
-        bail!(
-            "--from file {} must be a snapshot (min_txid 1), got min_txid {}",
-            prev_path.display(),
-            ph.min_txid
-        );
-    }
     let prev_checksums: HashMap<u32, Checksum> = ppages
         .iter()
         .map(|(pgno, data)| {
@@ -282,7 +414,7 @@ fn restore_snapshot(
 ) -> Result<()> {
     let ps = header.page_size.into_inner();
     let commit = header.commit.into_inner();
-    prepare_db(to)?;
+    prepare_db(to, true)?; // may be a live DB — strict is right before we destroy it
     for side in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{side}", to.display()));
     }
@@ -327,7 +459,7 @@ fn restore_delta(
             to.display()
         );
     }
-    prepare_db(to)?;
+    prepare_db(to, true)?;
     let (tps, tcount) = sqlite_header(to)?;
     if tps != ps {
         bail!(
@@ -650,5 +782,77 @@ mod tests {
         let err = cmd_backup(sid, None, &out, false).unwrap_err().to_string();
         assert!(err.contains("lock-byte"), "unexpected error: {err}");
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn chained_deltas_restore_in_order() {
+        let home = with_home();
+        let sid = "test-proj";
+        let base = home.dir.0.join("base");
+        build_session(sid, base.to_str().unwrap());
+
+        let snap = home.dir.0.join("s.ltx");
+        cmd_backup(sid, None, &snap, false).unwrap();
+
+        mutate_session(sid, base.to_str().unwrap(), "/a.txt");
+        let d1 = chain_path(&snap, 1);
+        cmd_backup(sid, Some(&snap), &d1, false).unwrap();
+
+        mutate_session(sid, base.to_str().unwrap(), "/b.txt");
+        let d2 = chain_path(&snap, 2);
+        cmd_backup(sid, Some(&d1), &d2, false).unwrap();
+
+        // delta-on-delta: d2's pre-apply is d1's post-apply, txid 3
+        let (h2, _, _) = read_ltx(&d2).unwrap();
+        let (_, _, t1) = read_ltx(&d1).unwrap();
+        assert_eq!(h2.min_txid.into_inner(), 3);
+        assert_eq!(h2.pre_apply_checksum.unwrap(), t1.post_apply_checksum);
+
+        // snapshot + deltas replay to the final DB, byte for byte
+        let restored = home.dir.0.join("restored.db");
+        cmd_restore(&snap, &restored).unwrap();
+        cmd_restore(&d1, &restored).unwrap();
+        cmd_restore(&d2, &restored).unwrap();
+        let final_db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+        assert_eq!(db_bytes(&restored), db_bytes(&final_db));
+    }
+
+    #[test]
+    fn watch_appends_deltas_on_change() {
+        let home = with_home();
+        let sid = "test-proj";
+        let base = home.dir.0.join("base");
+        build_session(sid, base.to_str().unwrap());
+        let db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+
+        let out = home.dir.0.join("w.ltx");
+        cmd_backup(sid, None, &out, false).unwrap(); // initial snapshot
+        let mut watch = Watch {
+            sid: sid.into(),
+            out: out.clone(),
+            compress: false,
+            n: 0,
+            state: db_state(&db).unwrap(),
+        };
+
+        // no change -> no new file
+        watch.tick().unwrap();
+        assert!(!chain_path(&out, 1).exists());
+
+        // one mutation -> one delta; another -> a second, chained delta
+        mutate_session(sid, base.to_str().unwrap(), "/c.txt");
+        watch.tick().unwrap();
+        assert!(chain_path(&out, 1).exists());
+        mutate_session(sid, base.to_str().unwrap(), "/d.txt");
+        watch.tick().unwrap();
+        assert!(chain_path(&out, 2).exists());
+
+        // the chain replays to the final state, byte for byte
+        let restored = home.dir.0.join("restored.db");
+        cmd_restore(&out, &restored).unwrap();
+        cmd_restore(&chain_path(&out, 1), &restored).unwrap();
+        cmd_restore(&chain_path(&out, 2), &restored).unwrap();
+        let final_db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+        assert_eq!(db_bytes(&restored), db_bytes(&final_db));
     }
 }
