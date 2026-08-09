@@ -27,6 +27,7 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -256,11 +257,53 @@ impl Watch {
 /// so Ctrl-C (or a crash) always leaves the chain restorable up to the last
 /// tick, and restarting resumes from the newest file. `pit restore <base>.ltx`
 /// replays the whole chain.
+/// One watcher per session: hold an exclusive flock on a lock file next to
+/// the delta DB for the process lifetime, so a second `--watch` on the same
+/// session (e.g. a duplicate `pit <profile> --autostart`) refuses instead of
+/// racing on the chain files. The lock dies with the process — no stale-pid
+/// bookkeeping.
+fn lock_watch(sid: &str) -> Result<File> {
+    let path = crate::run_dir()?.join(sid).join("backup-watch.lock");
+    let f = File::create(&path)?;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        bail!(
+            "another backup watch is already streaming session {sid} ({})",
+            path.display()
+        );
+    }
+    Ok(f)
+}
+
+/// `pit backup --watch <sid> [--out <base>.ltx]` — Litestream-style
+/// streaming: write a snapshot, then keep appending chained deltas while the
+/// session's DB changes, until interrupted. Every file is written complete,
+/// so Ctrl-C (or a crash) always leaves the chain restorable up to the last
+/// tick, and restarting resumes from the newest file. `pit restore <base>.ltx`
+/// replays the whole chain. Waits up to 30s for the session DB to appear, so
+/// `pit <profile> --autostart` works on the very first run of a profile.
 pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
     let db = crate::delta_db_path(sid)?;
-    if !db.exists() {
-        bail!("no delta DB for session {sid} at {}", db.display());
+    let mut waited = 0;
+    while !db.exists() {
+        if waited >= 15 {
+            bail!(
+                "no delta DB for session {sid} at {} (waited 30s)",
+                db.display()
+            );
+        }
+        std::thread::sleep(WATCH_POLL);
+        waited += 1;
     }
+    // Spawned from `pit <profile> --autostart`, SIGINT/SIGTERM arrive
+    // SIG_IGN (inherited from `pit run`): keep the INT-ignore so the stream
+    // survives Ctrl-C on the run, but restore TERM so `kill` can stop us.
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = libc::SIG_DFL;
+    unsafe {
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+    }
+    let _lock = lock_watch(sid)?;
     let mut watch = Watch {
         sid: sid.to_string(),
         out: out.to_path_buf(),
@@ -854,5 +897,18 @@ mod tests {
         cmd_restore(&chain_path(&out, 2), &restored).unwrap();
         let final_db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
         assert_eq!(db_bytes(&restored), db_bytes(&final_db));
+    }
+
+    #[test]
+    fn watch_lock_excludes_duplicate() {
+        let home = with_home();
+        let sid = "test-proj";
+        build_session(sid, home.dir.0.join("base").to_str().unwrap());
+
+        let l1 = lock_watch(sid).unwrap();
+        let err = lock_watch(sid).unwrap_err().to_string();
+        assert!(err.contains("already streaming"), "unexpected error: {err}");
+        drop(l1);
+        lock_watch(sid).unwrap(); // released with the process -> reacquirable
     }
 }
