@@ -70,6 +70,9 @@ pit dump codex exec --json    # print the exact `agentfs run` argv (no exec)
 pit sessions                  # list persisted sessions with changed/deleted counts
 pit sessions --select         # show numbered sessions, choose one, print its id
 pit inspect [session-id]      # open a session's delta DB; omit id to choose interactively
+pit backup [sid] [--from prev.ltx] [--out path] [-c]   # LTX backup of a session's delta DB
+pit restore <file.ltx> [--to db]                      # apply an LTX backup back
+pit ltx <file.ltx>            # inspect/verify a backup file
 ```
 
 The wrapped agent runs normally and sees its own working tree; writes land in the
@@ -109,6 +112,37 @@ leave it empty — for those, the useful SDK surface is the delta diff (what fil
 the agent created/modified/deleted), which is exactly `agentfs diff` but typed and
 in-process.
 
+### LTX backups
+
+Sessions persist in `~/.agentfs/run/<sid>/delta.db` — a SQLite file. `pit backup`
+writes it in the [LTX format](https://github.com/superfly/ltx-rs) (via the
+`litetx` crate): a header (page size, page count, txid range, pre-apply
+checksum), the DB pages, and a trailer with post-apply + file checksums
+(CRC-64/GO-ISO).
+
+```bash
+pit backup codex-myproj                # snapshot -> ./codex-myproj.ltx (txid 1)
+pit backup codex-myproj -c             # same, LZ4-compressed
+pit backup codex-myproj --from codex-myproj.ltx   # delta: only changed pages (txid 2)
+pit ltx codex-myproj.ltx               # inspect + verify checksums
+pit restore codex-myproj.ltx           # -> ~/.agentfs/run/codex-myproj/delta.db
+pit restore codex-myproj.ltx --to /tmp/other.db
+```
+
+* A **snapshot** (no `--from`) contains every page; a **delta** (`--from
+  prev.ltx`, which must be a snapshot) contains only pages whose checksum
+  changed, with the previous snapshot's checksum as `pre_apply` — so a delta
+  only applies on top of exactly that base.
+* Restore verifies the file checksum, then the post-apply checksum, then
+  `PRAGMA integrity_check`; delta restores additionally verify the pre-apply
+  checksum of the target before writing. A snapshot restore replaces the
+  target wholesale; a delta restore applies onto an existing DB.
+* The agentfs SDK leaves its DBs in WAL mode, so `pit` folds any `-wal` frames
+  into the main file (`PRAGMA wal_checkpoint(TRUNCATE)`) before reading pages.
+  A `-journal` sibling (mid-commit) is refused — back up after the agent exits.
+  A DB large enough to contain SQLite's lock-byte page (≥1 GiB at 4 KiB pages)
+  is refused — LTX cannot store that page.
+
 ## Profiles
 
 Built into `src/main.rs` (`fn profile`): `claude`, `codex`, `gemini`, `opencode`,
@@ -122,10 +156,11 @@ than a couple of custom agents, bring in a TOML config (`~/.config/pit/agents.to
 
 ```
 pit/
-  Cargo.toml            agentfs-sdk 0.6.4, tokio, anyhow
+  Cargo.toml            agentfs-sdk 0.6.4, tokio, anyhow, litetx (LTX backup), rusqlite
   src/main.rs           the binary: profiles, argv assembly, run/inspect/sessions/dump/selftest
+  src/backup.rs         LTX backup/restore/inspect of session delta DBs (litetx + rusqlite)
   examples/mkdelta.rs   throwaway: builds a fake session delta DB via the SDK (used to test
-                        inspect/sessions + the post-run summary without the real agentfs CLI)
+                        inspect/sessions + backups without the real agentfs CLI)
 ```
 
 ## When to grow it
@@ -138,6 +173,9 @@ pit/
 - **Reimplement the OS sandbox in Rust** → only if you can't tolerate the
   `agentfs` CLI dependency. You'd port `cli/src/sandbox/linux.rs` (and the NFS
   path for macOS). ~400 lines of unsafe libc with a second platform branch.
+- **Backup to an off-host sink** → `pit backup` writes a local `.ltx`; wire it
+  to `rclone`/`scp`/object storage plus a retention policy (the checksummed,
+  append-only LTX format is made for that).
 - **TOML config + a TUI** → once there are several custom agents or you want a
   session browser over the delta DBs.
 
