@@ -26,9 +26,10 @@
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 mod backup;
 
@@ -393,13 +394,22 @@ async fn print_run_summary(sid: &str) {
 
 // ---- subcommands -------------------------------------------------------------
 
-fn cmd_run(profile_name: &str, sid: &str, passthrough: &[String]) -> Result<i32> {
+fn cmd_run(
+    profile_name: &str,
+    sid: &str,
+    passthrough: &[String],
+    autostart: bool,
+    auto_out: Option<PathBuf>,
+) -> Result<i32> {
     let bin = agentfs_bin();
     let argv = build_argv(&bin, profile_name, sid, passthrough)?;
     // spawn + wait (not exec) so we can print the SDK delta summary afterwards
     // signal handlers so SIGINT goes to the sandboxed agent (same pgrp) and
     // not to `pit`.
     ignore_stdin_signals();
+    if autostart {
+        spawn_watch(sid, auto_out.as_deref())?;
+    }
     let status = match Command::new(&argv[0]).args(&argv[1..]).status() {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -415,6 +425,64 @@ fn cmd_run(profile_name: &str, sid: &str, passthrough: &[String]) -> Result<i32>
     // persisted — the point where we bind the SDK.
     block_on(print_run_summary(sid))?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Strip pit's own `--autostart [--out <base.ltx>]` from a run's passthrough
+/// args (the rest go to agentfs). Nothing is stripped unless --autostart is
+/// present, so plain agent args are never eaten.
+fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Vec<String>) {
+    let autostart = rest.iter().any(|a| a == "--autostart");
+    if !autostart {
+        return (false, None, rest.to_vec());
+    }
+    let mut out = None;
+    let mut pass = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--autostart" => {}
+            "--out" if rest.get(i + 1).is_some() => {
+                out = Some(PathBuf::from(&rest[i + 1]));
+                i += 1;
+            }
+            a => pass.push(a.to_string()),
+        }
+        i += 1;
+    }
+    (true, out, pass)
+}
+
+/// `pit <profile> --autostart`: spawn a detached `pit backup <sid> --watch`
+/// for the session about to run, so the delta DB streams to `<sid>.ltx` (or
+/// `--out`) while the agent works. The child inherits `pit run`'s SIG_IGN for
+/// SIGINT/SIGTERM, so it survives Ctrl-C; `pit backup --watch` restores the
+/// TERM default itself so `kill` can stop it, and exits on its own when the
+/// session DB is deleted. A second autostart on the same session is refused
+/// by the watcher's flock.
+fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
+    let out = out
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(format!("{sid}.ltx")));
+    let log = crate::run_dir()?.join(sid).join("backup-watch.log");
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log_file = OpenOptions::new().create(true).append(true).open(&log)?;
+    let child = Command::new(std::env::current_exe()?)
+        .args(["backup", sid, "--watch", "--out"])
+        .arg(&out)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file.try_clone()?))
+        .stderr(Stdio::from(log_file))
+        .spawn()
+        .with_context(|| format!("spawn backup watch for session {sid}"))?;
+    drop(child); // detached: the watcher outlives this run
+    eprintln!(
+        "pit: autostarted backup watch for {sid} -> {} (log: {})",
+        out.display(),
+        log.display()
+    );
+    Ok(())
 }
 
 fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
@@ -620,7 +688,7 @@ fn cmd_selftest() -> Result<()> {
 
 fn usage() -> String {
     "usage:\n  \
-     pit <profile> [args...]      run agent in the sandbox\n  \
+     pit <profile> [args...]      run agent in the sandbox; --autostart streams a backup watch\n  \
      pit dump <profile> [args...] print the agentfs run argv\n  \
      pit inspect [session-id]     show diff + timeline for a session\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
@@ -685,10 +753,11 @@ fn main() -> Result<()> {
                     }
                 );
             }
+            let (autostart, auto_out, passthrough) = split_run_args(passthrough);
             let sid = session_id(pname);
             let allows = effective_allows(&profile(pname).expect("profile checked above"));
             drop_stale_session(&sid, &allows)?;
-            let code = cmd_run(pname, &sid, passthrough)?;
+            let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out)?;
             std::process::exit(code);
         }
     }
@@ -872,5 +941,25 @@ mod tests {
 
         assert!(parse_session_selection("0", &rows).is_err());
         assert!(parse_session_selection("missing", &rows).is_err());
+    }
+
+    #[test]
+    fn split_run_args_extracts_autostart() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        let (auto, out, pass) = split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
+        assert!(auto);
+        assert_eq!(out.unwrap().to_str().unwrap(), "s.ltx");
+        assert_eq!(pass, v(&["-y"]));
+
+        // without --autostart, nothing is stripped
+        let (auto, out, pass) = split_run_args(&v(&["--out", "s.ltx"]));
+        assert!(!auto && out.is_none());
+        assert_eq!(pass, v(&["--out", "s.ltx"]));
+
+        // flags may come after positional args
+        let (auto, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
+        assert!(auto);
+        assert_eq!(pass, v(&["-y"]));
     }
 }

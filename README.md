@@ -141,6 +141,12 @@ pit restore codex-myproj.ltx --to /tmp/other.db
   LTX files rather than WAL frames. Every file is written complete, so a
   crash mid-session still leaves the chain restorable up to the last tick,
   and restarting `--watch` resumes from the newest file.
+* `pit <profile> --autostart` starts the watch automatically when the agent
+  runs: a detached `pit backup <sid> --watch` streams the session to
+  `<sid>.ltx` (or `--out <base.ltx>`) while the sandbox works. It survives
+  Ctrl-C on the run (log: `~/.agentfs/run/<sid>/backup-watch.log`), stops on
+  its own when the session is deleted, and refuses to double-run on the same
+  session — stop it with `kill $(pgrep -f "pit backup <sid> --watch")`.
 * Restore verifies the file checksum, then the post-apply checksum, then
   `PRAGMA integrity_check`; delta restores additionally verify the pre-apply
   checksum of the target before writing. A snapshot restore replaces the
