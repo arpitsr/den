@@ -1336,6 +1336,11 @@ fn split_profile(rest: &[String]) -> Result<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// env vars are process-global; serialize the tests that swap them
+    /// (mirrors backup.rs's HOME_LOCK).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn session_rows_include_numbered_choices() {
@@ -1414,6 +1419,7 @@ mod tests {
 
     #[test]
     fn replica_url_resolution_precedence() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("LITESTREAM_BUCKET", "mybucket");
         std::env::remove_var("PIT_REPLICA");
         std::env::remove_var("LITESTREAM_REPLICA_URL");
@@ -1448,6 +1454,7 @@ mod tests {
 
     #[test]
     fn litestream_autostart_requires_binary_and_replica() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("LITESTREAM_BUCKET", "b");
         std::env::set_var("PIT_LITESTREAM", "/bin/true"); // exists, so bin_found
         assert!(litestream_autostart("x"));
