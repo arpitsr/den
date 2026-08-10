@@ -12,6 +12,21 @@ The sandbox layer is **in this binary** — no `agentfs` CLI dependency:
 - `src/sandbox.rs` — `fork`/`unshare` user+mount namespaces, uid/gid mapping,
   `MS_REC|MS_PRIVATE`, bind-mount of the overlay onto the cwd, read-only
   remount of everything else (small allowlist), exec, signal forwarding.
+- `src/proxy.rs` — egress allowlist proxy: the sandbox's only network path
+  (via slirp4netns), CONNECT + absolute-form HTTP, chains to the host's own
+  proxy (`HTTPS_PROXY` etc.) when set, 403 on blocked hosts.
+
+The sandbox chain is M→N→U→A: M (CLI) forks N (user-ns holder), which forks
+U (mount/pid/ipc/uts ns), which forks A — a tiny init (pid 1 of the sandbox
+pidns) that catches INT/TERM/USR1 and forwards them to the agent (pid 2).
+pidns init only receives signals it catches (`SIGNAL_UNKILLABLE`), so a
+bare-agent-as-init would silently drop Ctrl-C; the init wrapper is what makes
+signal escalation work (first signal forwards as-is, second → SIGKILL).
+Secret dirs (`~/.ssh`, `~/.aws`, …) are hidden by mounting empty tmpfs over
+them — including alias paths that expose the same inode through other
+mountpoints. The network is a fresh netns (slirp4netns → tap), nft policy
+(allowlist via the proxy, DNS to 10.0.2.3, everything else dropped), and a
+fresh `/dev`, `/tmp`, `/run`, `/var/tmp`.
 - `src/fuse.rs` + `src/mount.rs` — the FUSE filesystem (published `fuser`
   crate) that serves the copy-on-write overlay. The current working directory
   is the sandbox base: host files are read-only, every write is captured to a
@@ -93,6 +108,17 @@ same dir **resumes** the same sandbox (changes persist across calls).
 | `PIT_QUIET=1`   | don't print the post-run delta summary                          |
 | `PIT_LITESTREAM`| path to the `litestream` binary (default: from `PATH`)          |
 | `PIT_REPLICA`   | replica URL for `pit replicate`/`pit pull` (default: `LITESTREAM_REPLICA_URL`, then `LITESTREAM_BUCKET`) |
+
+### Sandbox env
+
+| env            | effect                                                          |
+|----------------|----------------------------------------------------------------|
+| `PIT_NET`      | `proxy` (default: slirp4netns + allowlist proxy), `none` (no netns), `full` (host netns, no proxy) |
+| `PIT_PROXY_ALLOW` | comma-separated extra egress hosts for the proxy (default list: anthropic/openai/google/opencode/archlinux.org + more in `src/proxy.rs`) |
+| `PIT_HIDE` / `PIT_NO_HIDE` | colon-separated extra secret paths to hide / paths to un-hide (`~/.ssh` etc. are hidden by default) |
+| `PIT_SECCOMP=0` | disable the seccomp filter (unshare/mount/ptrace/bpf/… get EPERM by default) |
+| `PIT_PROXY_LISTEN_PORT` | debug: run `pit proxy` standalone on a TCP port instead of the in-band fd 3 |
+| `PIT_LIMIT_*`   | rlimits applied to the agent (see `apply_rlimits` in `src/sandbox.rs`) |
 
 ### Inspecting sessions
 
@@ -210,6 +236,7 @@ pit/
   Cargo.toml            agentfs-sdk 0.6.4, fuser (FUSE), tokio, anyhow, litetx, rusqlite
   src/main.rs           profiles, argv assembly, run/inspect/sessions/dump/selftest
   src/sandbox.rs        fork/unshare namespaces, read-only remount, exec, signals
+  src/proxy.rs          egress allowlist proxy (CONNECT + absolute-form HTTP)
   src/fuse.rs           FUSE filesystem serving the COW overlay (fuser)
   src/mount.rs          mount lifecycle (fusermount), MountHandle, helpers
   src/backup.rs         LTX backup/restore/inspect of session delta DBs (litetx + rusqlite)
