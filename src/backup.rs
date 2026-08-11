@@ -203,6 +203,48 @@ pub(crate) fn chain_path(base: &Path, k: u32) -> PathBuf {
 
 /// (len, mtime) of the DB file and its -wal sibling (if any) — a cheap
 /// change detector for the watch loop.
+/// Chain files present next to `base` (`base.0001.ltx`, ...), in order.
+/// The chain must be contiguous — a gap means newer deltas sit beyond a
+/// missing link, and replaying only the prefix would silently restore a
+/// stale state, so refuse.
+pub(crate) fn existing_chain_indices(base: &Path) -> Result<Vec<u32>> {
+    let dir = match base.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    let ext = base
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let prefix = format!("{stem}.");
+    let mut idxs: Vec<u32> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        let Some(num) = rest.strip_suffix(&ext) else { continue };
+        if num.len() >= 4 && num.chars().all(|c| c.is_ascii_digit()) {
+            idxs.push(num.parse().unwrap_or(0));
+        }
+    }
+    idxs.sort_unstable();
+    for (i, &idx) in idxs.iter().enumerate() {
+        let expected = i as u32 + 1;
+        if idx != expected {
+            bail!(
+                "chain gap: missing {} before {} — restore the newest surviving prefix by hand",
+                chain_path(base, expected).display(),
+                chain_path(base, idx).display()
+            );
+        }
+    }
+    Ok(idxs)
+}
+
 type DbState = (u64, SystemTime, Option<(u64, SystemTime)>);
 
 fn db_state(db: &Path) -> Result<DbState> {
@@ -904,6 +946,25 @@ mod tests {
         cmd_restore(&chain_path(&out, 2), &restored).unwrap();
         let final_db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
         assert_eq!(db_bytes(&restored), db_bytes(&final_db));
+    }
+
+    #[test]
+    fn chain_indices_detect_gaps() {
+        let dir = TempDir::new();
+        let base = dir.0.join("s.ltx");
+        std::fs::write(&base, "x").unwrap();
+        std::fs::write(dir.0.join("s.0001.ltx"), "x").unwrap();
+        std::fs::write(dir.0.join("s.0002.ltx"), "x").unwrap();
+        std::fs::write(dir.0.join("s.0003.ltx"), "x").unwrap();
+        // different base or extension: ignored
+        std::fs::write(dir.0.join("other.0001.ltx"), "x").unwrap();
+        std::fs::write(dir.0.join("s.0001.txt"), "x").unwrap();
+        assert_eq!(existing_chain_indices(&base).unwrap(), vec![1, 2, 3]);
+
+        // a missing middle link is a gap, not an end of chain
+        std::fs::remove_file(dir.0.join("s.0002.ltx")).unwrap();
+        let err = existing_chain_indices(&base).unwrap_err().to_string();
+        assert!(err.contains("gap"), "unexpected error: {err}");
     }
 
     #[test]

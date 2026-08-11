@@ -1636,6 +1636,11 @@ fn setup_env_vars(session_id: &str) {
     std::env::set_var("AGENTFS_SESSION", session_id);
     std::env::set_var("PS1", "🤖 \\u@\\h:\\w\\$ ");
 
+    // PIT_PROXY_UPSTREAM holds the host's own proxy URL (possibly with
+    // credentials) — the pit proxy's secret, not the agent's. The proxy
+    // child gets it explicitly via env in spawn_proxy, so drop it here.
+    std::env::remove_var("PIT_PROXY_UPSTREAM");
+
     // Proxy mode: route everything through the sandbox proxy at 10.0.2.2
     // (PIT_PROXY_URL is set by M before the fork; inherited down the chain).
     if let Ok(proxy_url) = std::env::var("PIT_PROXY_URL") {
