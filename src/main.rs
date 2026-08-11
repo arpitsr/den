@@ -659,6 +659,7 @@ fn cmd_replicate_args(rest: &[String]) -> Result<()> {
         Some(s) => s,
         None => select_session()?,
     };
+    valid_sid(&sid)?;
     cmd_replicate(&sid, url.as_deref())
 }
 
@@ -762,6 +763,7 @@ fn cmd_pull_args(rest: &[String]) -> Result<()> {
         Some(s) => s,
         None => select_session()?,
     };
+    valid_sid(&sid)?;
     cmd_pull(&sid, url.as_deref(), force, to)
 }
 
@@ -815,6 +817,7 @@ fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
 }
 
 fn cmd_inspect(sid: &str) -> Result<()> {
+    valid_sid(sid)?;
     block_on(async move {
         let db_path = delta_db_path(sid)?;
         let agent = match open_session(sid).await? {
@@ -969,9 +972,20 @@ fn cmd_sessions(select: bool) -> Result<()> {
     Ok(())
 }
 
+/// Session ids are directory names under ~/.agentfs/run (slug, PIT_SESSION,
+/// or a listed session) — refuse anything that could escape the tree: a
+/// stray `pit rm ..` must not delete ~/.agentfs itself.
+fn valid_sid(sid: &str) -> Result<()> {
+    if sid.is_empty() || sid == "." || sid == ".." || sid.contains('/') || sid.contains('\\') {
+        bail!("invalid session id '{sid}'");
+    }
+    Ok(())
+}
+
 /// Delete a session dir: unmount any stale FUSE mount first, then remove
 /// the dir and its config stamp. Mirrors drop_stale_session's cleanup order.
 fn cmd_rm(sid: &str) -> Result<()> {
+    valid_sid(sid)?;
     let run_dir = run_dir()?;
     let dir = run_dir.join(sid);
     if !dir.exists() {
@@ -1312,6 +1326,7 @@ fn cmd_backup_args(rest: &[String]) -> Result<()> {
         Some(s) => s,
         None => select_session()?,
     };
+    valid_sid(&sid)?;
     let out = out.unwrap_or_else(|| PathBuf::from(format!("{sid}.ltx")));
     if watch {
         backup::cmd_backup_watch(&sid, &out, compress)
@@ -1345,18 +1360,20 @@ fn cmd_restore_args(rest: &[String]) -> Result<()> {
     };
     backup::cmd_restore(&ltx, &to)?;
     // a --watch chain (base.ltx + base.NNNN.ltx) restores as a stream:
-    // replay the numbered siblings so it comes back at its newest state
-    let mut n = 1;
-    loop {
-        let next = backup::chain_path(&ltx, n);
-        if !next.exists() {
-            break;
-        }
-        backup::cmd_restore(&next, &to)?;
-        n += 1;
+    // replay the numbered siblings so it comes back at its newest state.
+    // existing_chain_indices refuses gaps — a missing middle link means
+    // newer deltas sit beyond it, and replaying only the prefix would
+    // silently restore a stale state.
+    let chain = backup::existing_chain_indices(&ltx)?;
+    for k in &chain {
+        backup::cmd_restore(&backup::chain_path(&ltx, *k), &to)?;
     }
-    if n > 1 {
-        println!("pit: replayed {} chain delta(s) onto {}", n - 1, to.display());
+    if !chain.is_empty() {
+        println!(
+            "pit: replayed {} chain delta(s) onto {}",
+            chain.len(),
+            to.display()
+        );
     }
     Ok(())
 }

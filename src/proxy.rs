@@ -154,10 +154,15 @@ fn handle_connect(
         bail!("{}", e);
     }
 
-    let mut upstream_conn = if let Some(up) = upstream {
+    // (reader, writer) over the upstream socket; the chained path's reader
+    // may hold bytes buffered past the CONNECT response head, so the relay
+    // below must copy FROM it, not from a fresh socket clone.
+    let (mut upstream_r, upstream_w) = if let Some(up) = upstream {
         let mut u = TcpStream::connect(upstream_hostport(up))
             .with_context(|| format!("upstream {}", up))?;
-        u.write_all(format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target).as_bytes())?;
+        u.write_all(
+            format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target).as_bytes(),
+        )?;
         let mut ureader = BufReader::new(u.try_clone()?);
         let resp = read_head(&mut ureader)?;
         let ok = resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200");
@@ -168,22 +173,24 @@ fn handle_connect(
                 resp.lines().next().unwrap_or("")
             );
         }
-        u
+        (ureader, u)
     } else {
-        TcpStream::connect((host.as_str(), port)).with_context(|| format!("connect {}", target))?
+        let u = TcpStream::connect((host.as_str(), port))
+            .with_context(|| format!("connect {}", target))?;
+        (BufReader::new(u.try_clone()?), u)
     };
 
     // 200 to the client, then blind relay both ways.
     client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
     let mut client2 = client.try_clone()?;
-    let mut up2 = upstream_conn.try_clone()?;
+    let mut upstream_w2 = upstream_w.try_clone()?;
     // SAFETY: threads own disjoint halves (clones share the socket; each
     // direction uses its own pair — the kernel arbitrates).
     let t1 = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut reader, &mut upstream_conn);
+        let _ = std::io::copy(&mut reader, &mut upstream_w2);
     });
     let t2 = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut up2, &mut client2);
+        let _ = std::io::copy(&mut upstream_r, &mut client2);
     });
     let _ = t1.join();
     let _ = t2.join();
