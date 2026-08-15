@@ -21,7 +21,7 @@
 //!
 //! Env:
 //!   PIT_SESSION=<id>  reuse/resume this session id (default <profile>-<cwd-slug>)
-//!   PIT_NEW=1         start a fresh unique session instead of the default id
+//!   PIT_NEW=1         start a fresh unique session id like <profile>-<cwd-slug>-<5 chars>
 //!   PIT_QUIET=1       don't print the post-run delta summary
 //!   PIT_LITESTREAM=<bin>  path to the litestream binary (default: litestream on PATH)
 //!   PIT_REPLICA=<url>    replica URL (default: LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET)
@@ -38,7 +38,7 @@ use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -124,7 +124,22 @@ fn new_uuid() -> String {
     format!("sid-{nanos:x}")
 }
 
-/// session id: PIT_SESSION wins, else PIT_NEW=1 -> fresh uuid, else <profile>-<cwd-slug>
+/// Random lowercase-alphanumeric suffix (like a k8s pod suffix). 5 chars
+/// gives ~60M combinations, which is plenty for a session id.
+fn random_suffix(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut buf = vec![0u8; len];
+    if File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_err() {
+        // fallback: reuse the UUID hex (very unlikely on Linux)
+        let hex = new_uuid().replace('-', "");
+        return hex.chars().take(len).collect();
+    }
+    buf.iter()
+        .map(|b| CHARSET[(*b as usize) % CHARSET.len()] as char)
+        .collect()
+}
+
+/// session id: PIT_SESSION wins, else PIT_NEW=1 -> fresh k8s-style id, else <profile>-<cwd-slug>
 fn session_id(profile: &str) -> String {
     if let Ok(s) = std::env::var("PIT_SESSION") {
         if !s.is_empty() {
@@ -132,7 +147,7 @@ fn session_id(profile: &str) -> String {
         }
     }
     if std::env::var("PIT_NEW").as_deref() == Ok("1") {
-        return new_uuid();
+        return format!("{}-{}-{}", profile, slug(&cwd_string()), random_suffix(5));
     }
     format!("{}-{}", profile, slug(&cwd_string()))
 }
