@@ -1092,17 +1092,29 @@ fn run_agent_exec(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
     exec_command(command, args, session_id);
 }
 
-/// Fresh /dev: tmpfs with an mknod whitelist, host pts and /dev/net/tun
-/// bind-mounted in, /dev/shm as tmpfs. Sources are opened BEFORE the tmpfs
-/// shadows them (via /proc/self/fd).
+/// Fresh /dev: tmpfs with host char devices bind-mounted in, host pts and
+/// /dev/net/tun bind-mounted in, /dev/shm as tmpfs. Sources are opened BEFORE
+/// the tmpfs shadows them (via /proc/self/fd).
 fn setup_dev() {
-    // SAFETY: opening paths that exist on any Linux host.
-    let pts_fd = fs::File::open("/dev/pts");
+    // Open the host char devices before the tmpfs mount on /dev hides them.
+    // mknod in a user namespace is unreliable on newer kernels (the tmpfs
+    // mount ends up nodev and the kernel rejects/creates regular files),
+    // so bind-mounting the host devices is the robust path.
+    let devices: &[(&str, u32, u32)] = &[
+        ("/dev/null", 1, 3),
+        ("/dev/zero", 1, 5),
+        ("/dev/full", 1, 7),
+        ("/dev/random", 1, 8),
+        ("/dev/urandom", 1, 9),
+        ("/dev/tty", 5, 0),
+    ];
+    let mut dev_fds: Vec<(&str, Option<fs::File>)> = Vec::new();
+    for (path, major, minor) in devices {
+        dev_fds.push((path, fs::File::open(path).ok()));
+        let _ = (major, minor); // keep the original major/minor as documentation
+    }
+    let pts_fd = fs::File::open("/dev/pts").ok();
     let tun_fd = fs::File::open("/dev/net/tun").ok();
-    let pts_fd = match pts_fd {
-        Ok(f) => Some(f),
-        Err(_) => None,
-    };
 
     // SAFETY: mount tmpfs over /dev.
     let dev_cstr = CString::new("/dev").unwrap();
@@ -1124,35 +1136,19 @@ fn setup_dev() {
         let _ = fs::create_dir_all(dir);
     }
 
+    // Bind the host char devices in, through the pre-opened fds.
+    for (path, fd) in &dev_fds {
+        if let Some(f) = fd {
+            bind_mount_fd(f.as_raw_fd(), path);
+        }
+    }
     // Bind the host's pts (terminal devices) in, through the pre-opened fd.
     if let Some(f) = &pts_fd {
-        let src = CString::new(format!("/proc/self/fd/{}", f.as_raw_fd())).unwrap();
-        let dst = CString::new("/dev/pts").unwrap();
-        // SAFETY: bind-mount a directory.
-        unsafe {
-            libc::mount(
-                src.as_ptr(),
-                dst.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            );
-        }
+        bind_mount_fd(f.as_raw_fd(), "/dev/pts");
     }
     // Same for /dev/net/tun if the host has it.
     if let Some(f) = &tun_fd {
-        let src = CString::new(format!("/proc/self/fd/{}", f.as_raw_fd())).unwrap();
-        let dst = CString::new("/dev/net/tun").unwrap();
-        // SAFETY: bind-mount a device file.
-        unsafe {
-            libc::mount(
-                src.as_ptr(),
-                dst.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND,
-                std::ptr::null(),
-            );
-        }
+        bind_mount_fd(f.as_raw_fd(), "/dev/net/tun");
     }
 
     // /dev/shm as tmpfs.
@@ -1166,26 +1162,6 @@ fn setup_dev() {
             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
             CString::new("mode=1777").unwrap().as_ptr() as *const libc::c_void,
         );
-    }
-
-    // mknod whitelist (char devices).
-    let devices: &[(&str, u32, u32)] = &[
-        ("/dev/null", 1, 3),
-        ("/dev/zero", 1, 5),
-        ("/dev/full", 1, 7),
-        ("/dev/random", 1, 8),
-        ("/dev/urandom", 1, 9),
-        ("/dev/tty", 5, 0),
-    ];
-    for (path, major, minor) in devices {
-        // SAFETY: mknod with a valid path and makedev.
-        unsafe {
-            libc::mknod(
-                CString::new(*path).unwrap().as_ptr(),
-                libc::S_IFCHR | 0o666,
-                libc::makedev(*major, *minor),
-            );
-        }
     }
 
     // Symlinks.
@@ -1204,6 +1180,25 @@ fn setup_dev() {
                 CString::new(*link).unwrap().as_ptr(),
             );
         }
+    }
+}
+
+/// Bind-mount the file referenced by `fd` onto `dst`. The destination is a
+/// regular file; the bind mount replaces it with the fd's underlying device.
+fn bind_mount_fd(fd: libc::c_int, dst: &str) {
+    let src = CString::new(format!("/proc/self/fd/{}", fd)).unwrap();
+    let dst_cstr = CString::new(dst).unwrap();
+    // Create a placeholder file so the bind mount has a target.
+    let _ = fs::File::create(dst);
+    // SAFETY: bind-mount with valid fd path and destination path.
+    unsafe {
+        let _ = libc::mount(
+            src.as_ptr(),
+            dst_cstr.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        );
     }
 }
 
