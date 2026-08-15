@@ -166,6 +166,23 @@ fn bin_found(bin: &str) -> bool {
     })
 }
 
+/// Resolve a bare command name to the first executable found on PATH.
+/// Absolute/relative paths are returned unchanged.
+fn resolve_bin(bin: &str) -> PathBuf {
+    if bin.contains('/') {
+        return PathBuf::from(bin);
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(bin);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from(bin)
+}
+
 /// Replica URL for a session's delta.db: explicit arg wins, then
 /// PIT_REPLICA, then LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET with a
 /// per-session path. Credentials are litestream's business (AWS_*/LITESTREAM_*
@@ -445,7 +462,11 @@ fn cmd_run(
     autostart: bool,
     auto_out: Option<PathBuf>,
 ) -> Result<i32> {
-    let argv = build_argv(profile_name, passthrough)?;
+    let mut argv = build_argv(profile_name, passthrough)?;
+    // Resolve the command on the host PATH before entering the sandbox, so a
+    // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
+    // shadow the real agent binary via PATH ordering inside the sandbox.
+    argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
     let allows = effective_allows(&profile(profile_name).expect("profile checked by caller"));
     if autostart {
         spawn_watch(sid, auto_out.as_deref())?;
@@ -818,7 +839,8 @@ fn cmd_pull(sid: &str, url_opt: Option<&str>, force: bool, to: Option<PathBuf>) 
 
 fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
     let sid = session_id(profile_name);
-    let argv = build_argv(profile_name, passthrough)?;
+    let mut argv = build_argv(profile_name, passthrough)?;
+    argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
     let allows = effective_allows(&profile(profile_name).expect("profile checked by caller"));
     println!("session: {sid}");
     println!("delta db: {}", delta_db_path(&sid)?.display());
