@@ -43,7 +43,7 @@ pub trait PolicySource: Send + Sync {
     fn policy(&self) -> Result<EgressPolicy>;
 }
 
-/// YAML allow/deny file (PIT_PROXY_POLICY):
+/// YAML allow/deny file (PIT_PROXY_POLICY, else ./pit-egress.yaml in the project):
 ///
 /// ```yaml
 /// allow: [example.com]
@@ -59,8 +59,11 @@ impl PolicySource for FilePolicy {
     }
 }
 
-/// Local policy resolution: built-in defaults + PIT_PROXY_POLICY file +
-/// PIT_PROXY_ALLOW (comma-separated). Base that a cloud source merges over.
+/// Local policy resolution: built-in defaults + policy file +
+/// PIT_PROXY_ALLOW (comma-separated). File: PIT_PROXY_POLICY if set
+/// (explicit — unreadable fails closed), else pit-egress.yaml in the
+/// project dir if present (the proxy inherits pit's cwd). Base that a
+/// cloud source merges over.
 pub fn local() -> Arc<dyn PolicySource> {
     struct Local;
     impl PolicySource for Local {
@@ -70,6 +73,11 @@ pub fn local() -> Arc<dyn PolicySource> {
                 serde_yaml::from_str(DEFAULT_YAML).expect("default-egress.yaml");
             if let Ok(f) = std::env::var("PIT_PROXY_POLICY") {
                 p.merge(FilePolicy(f.into()).policy()?);
+            } else {
+                let f = std::env::current_dir()?.join("pit-egress.yaml");
+                if f.exists() {
+                    p.merge(FilePolicy(f).policy()?);
+                }
             }
             if let Ok(extra) = std::env::var("PIT_PROXY_ALLOW") {
                 p.allow.extend(
