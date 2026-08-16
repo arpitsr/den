@@ -114,7 +114,8 @@ same dir **resumes** the same sandbox (changes persist across calls).
 | env            | effect                                                          |
 |----------------|----------------------------------------------------------------|
 | `PIT_NET`      | `proxy` (default: slirp4netns + allowlist proxy), `none` (no netns), `full` (host netns, no proxy) |
-| `PIT_PROXY_ALLOW` | comma-separated extra egress hosts for the proxy (default list: anthropic/openai/google/opencode/archlinux.org + more in `src/proxy.rs`) |
+| `PIT_PROXY_ALLOW` | comma-separated extra egress hosts for the proxy (default list is minimal — agent API endpoints only, see `src/default-egress.yaml`) |
+| `PIT_PROXY_POLICY` | YAML egress policy file (else `./pit-egress.yaml` in the project dir if present). `allow:`/`deny:` host lists, exact or subdomain, deny wins; merged over the defaults, re-read live. Schema example: `src/default-egress.yaml` |
 | `PIT_HIDE` / `PIT_NO_HIDE` | colon-separated extra secret paths to hide / paths to un-hide (`~/.ssh` etc. are hidden by default) |
 | `PIT_SECCOMP=0` | disable the seccomp filter (unshare/mount/ptrace/bpf/… get EPERM by default) |
 | `PIT_PROXY_LISTEN_PORT` | debug: run `pit proxy` standalone on a TCP port instead of the in-band fd 3 |
