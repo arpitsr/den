@@ -30,7 +30,7 @@
 //!     nft egress policy + allowlist proxy (see PIT_PROXY_ALLOW); none = netns only,
 //!     full = host network (legacy)
 //!   PIT_PROXY_ALLOW=comma,list  extra egress allowlist entries for PIT_NET=proxy
-//!   PIT_PROXY_POLICY=path.yaml  egress allow/deny lists (see src/policy.rs); deny wins
+//!   PIT_PROXY_POLICY=path.yaml  egress allow/deny lists (schema: src/default-egress.yaml); deny wins
 //!   PIT_HIDE=~/.a:~/.b  extra secrets to hide (colon-separated); PIT_NO_HIDE=~/.ssh restores
 //!   PIT_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
 //!   PIT_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)

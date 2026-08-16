@@ -1,5 +1,18 @@
 # Built-in default egress policy, embedded via include_str! (policy.rs).
-# Same schema as PIT_PROXY_POLICY files; user config merges over this.
+#
+# Deliberately minimal: just the agent API endpoints a sandboxed coding
+# agent needs to function. Everything else (github, package registries,
+# docker, OS mirrors, ...) depends on your network and work setup — add it
+# via PIT_PROXY_POLICY=path/to/your.yaml or PIT_PROXY_ALLOW=host,host.
+#
+# This file doubles as the schema example for your own policy files:
+#
+#   allow:                # host matches exactly or any subdomain
+#     - github.com
+#   deny:                 # deny wins over allow (carve out subdomains)
+#     - gist.github.com
+#
+# A PIT_PROXY_POLICY file is merged over this list and re-read live.
 allow:
   - anthropic.com
   - claude.ai
@@ -9,30 +22,6 @@ allow:
   - oaistatic.com
   - googleapis.com
   - accounts.google.com
-  - opencode.ai
   - gstatic.com
-  - github.com
-  - githubusercontent.com
-  - githubassets.com
-  - github.io
-  - gitlab.com
-  - bitbucket.org
-  - npmjs.org
-  - yarnpkg.com
-  - nodejs.org
-  - pypi.org
-  - pythonhosted.org
-  - crates.io
-  - rust-lang.org
-  - static.crates.io
-  - index.crates.io
-  - proxy.golang.org
-  - golang.org
-  - huggingface.co
-  - docker.io
-  - docker.com
-  - registry-1.docker.io
-  - archlinux.org
-  - debian.org
-  - ubuntu.com
+  - opencode.ai
 deny: []
