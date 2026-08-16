@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn embedded_default_parses() {
         let p: EgressPolicy = serde_yaml::from_str(DEFAULT_YAML).unwrap();
-        assert!(p.allows("api.github.com"));
+        assert!(p.allows("api.anthropic.com"));
         assert!(!p.allows("example.com"));
     }
 
