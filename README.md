@@ -5,7 +5,7 @@ A Rust binary that launches any local coding-agent CLI (`claude`, `codex`,
 filesystem + user/mount namespaces), and binds the `agentfs-sdk` crate for
 typed, in-process access to what the sandboxed agent did.
 
-The agent's whole filesystem is one SQLite file (`delta.db`). New sessions
+The agent's whole filesystem is one SQLite file (`fs.db`). New sessions
 start empty — or seeded from a directory (`--seed`) — and resumed sessions
 open the DB and nothing else: the host tree is hidden behind the mount and
 irrelevant. Every session is self-contained and shippable to another machine
@@ -40,13 +40,11 @@ fresh `/dev`, `/tmp`, `/run`, `/var/tmp`.
   underneath is hidden and untouched.
 - The storage layer is `agentfs-sdk` (`AgentFS { kv, fs, tools }`): a
   POSIX-like filesystem, a key-value store, and a tool-call audit trail in
-  one SQLite file at `~/.agentfs/run/<sid>/delta.db`.
+  one SQLite file at `~/.pit/sessions/<sid>/fs.db`.
 
 pit snapshots the virtual FS before and after each run and reports what the
 run touched (added/modified/removed), plus the tool-call timeline
-(`tools.recent`) in `pit inspect`. The session layout is identical to
-agentfs's, so existing agentfs sessions interoperate (as plain trees, without
-their host base).
+(`tools.recent`) in `pit inspect`.
 
 If you want the SDK to *be* the sandbox (drop FUSE/namespaces, build an agent
 loop whose tools call `agent.fs.*` / `agent.kv.*` directly), that's a
@@ -86,11 +84,11 @@ pit selftest --sandbox        # full round-trip: seed, mount, vfs writes, ro-enf
 pit dump codex exec --json    # print the exact run argv (no exec)
 pit sessions                  # list persisted sessions with entry counts
 pit sessions --select         # show numbered sessions, choose one, print its id
-pit inspect [session-id]      # open a session's delta DB; omit id to choose interactively
-pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's delta DB
+pit inspect [session-id]      # open a session's fs.db; omit id to choose interactively
+pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's fs.db
 pit restore <file.ltx> [--to db]                      # apply an LTX backup (and chain) back
 pit ltx <file.ltx>            # inspect/verify a backup file
-pit replicate [sid] [url]     # litestream daemon: stream the session's delta DB to S3
+pit replicate [sid] [url]     # litestream daemon: stream the session's fs.db to S3
 pit pull [sid] [url] [--force] [--to db]              # restore the session from its S3 replica
 ```
 
@@ -105,7 +103,7 @@ pit: session codex-myproject — 2 added, 1 modified, 1 removed this run
   - README.md
 ```
 
-Sessions are born portable: `delta.db` always contains the complete tree, so
+Sessions are born portable: `fs.db` always contains the complete tree, so
 `pit backup`/`replicate` + `pit pull` (or just copying the file) reproduces
 the exact environment on another machine or VM — no host checkout needed.
 
@@ -141,7 +139,7 @@ same dir **resumes** the same sandbox (changes persist across calls).
 ### Inspecting sessions
 
 ```bash
-pit sessions                  # list ~/.agentfs/run/* with virtual-FS entry counts (via SDK)
+pit sessions                  # list ~/.pit/sessions/* with virtual-FS entry counts (via SDK)
 pit sessions --select         # number the list, prompt for a choice, print the selected id
 pit inspect [session-id]      # list the session's virtual FS + tool-call timeline; omit id to select
 pit rm [session-id]           # delete a session dir (unmounts stale FUSE mounts first; --select to pick)
@@ -154,7 +152,7 @@ and the virtual FS listing, which is typed and in-process.
 
 ### LTX backups
 
-Sessions persist in `~/.agentfs/run/<sid>/delta.db` — a SQLite file. `pit backup`
+Sessions persist in `~/.pit/sessions/<sid>/fs.db` — a SQLite file. `pit backup`
 writes it in the [LTX format](https://github.com/superfly/ltx-rs) (via the
 `litetx` crate): a header (page size, page count, txid range, pre-apply
 checksum), the DB pages, and a trailer with post-apply + file checksums
@@ -166,7 +164,7 @@ pit backup codex-myproj -c             # same, LZ4-compressed
 pit backup codex-myproj --from codex-myproj.ltx   # delta: only changed pages (txid 2)
 pit backup codex-myproj --watch        # stream: snapshot + chained deltas while it runs (Ctrl-C to stop)
 pit ltx codex-myproj.ltx               # inspect + verify checksums
-pit restore codex-myproj.ltx           # -> ~/.agentfs/run/codex-myproj/delta.db (replays the whole chain)
+pit restore codex-myproj.ltx           # -> ~/.pit/sessions/codex-myproj/fs.db (replays the whole chain)
 pit restore codex-myproj.ltx --to /tmp/other.db
 ```
 
@@ -184,7 +182,7 @@ pit restore codex-myproj.ltx --to /tmp/other.db
 * `pit <profile> --autostart` starts the watch automatically when the agent
   runs: a detached `pit backup <sid> --watch` streams the session to
   `<sid>.ltx` (or `--out <base.ltx>`) while the sandbox works. It survives
-  Ctrl-C on the run (log: `~/.agentfs/run/<sid>/backup-watch.log`), stops on
+  Ctrl-C on the run (log: `~/.pit/sessions/<sid>/backup-watch.log`), stops on
   its own when the session is deleted, and refuses to double-run on the same
   session — stop it with `kill $(pgrep -f "pit backup <sid> --watch")`.
 * Restore verifies the file checksum, then the post-apply checksum, then
@@ -222,9 +220,9 @@ pit pull codex-myproject --force --to /tmp/db  # overwrite / restore elsewhere
 * `pit <profile> --autostart` prefers litestream when a replica is configured
   **and** the binary is installed; otherwise it falls back to the local LTX
   watch above. A detached `pit replicate <sid>` streams
-  `~/.agentfs/run/<sid>/delta.db` to `s3://<bucket>/<sid>/db` continuously
+  `~/.pit/sessions/<sid>/fs.db` to `s3://<bucket>/<sid>/db` continuously
   (litestream's ~1s sync), survives Ctrl-C on the run (log:
-  `~/.agentfs/run/<sid>/replicate.log`), exits on its own when the session is
+  `~/.pit/sessions/<sid>/replicate.log`), exits on its own when the session is
   deleted, and refuses a second daemon on the same session (flock). Stop it
   with `kill $(pgrep -f "pit replicate <sid>")`.
 * Replica URL resolution: explicit arg `pit replicate <sid> s3://...` >
@@ -257,8 +255,8 @@ pit/
   src/proxy.rs          egress allowlist proxy (CONNECT + absolute-form HTTP)
   src/fuse.rs           FUSE filesystem serving the session's SQLite virtual FS (fuser)
   src/mount.rs          mount lifecycle (fusermount), MountHandle, helpers
-  src/backup.rs         LTX backup/restore/inspect of session delta DBs (litetx + rusqlite)
-  examples/mkdelta.rs   throwaway: builds a fake session delta DB via the SDK (used to test
+  src/backup.rs         LTX backup/restore/inspect of session fs.db files (litetx + rusqlite)
+  examples/mkdelta.rs   throwaway: builds a fake session fs.db via the SDK (used to test
                         inspect/sessions + backups without the real agentfs CLI)
 ```
 
@@ -272,13 +270,13 @@ pit/
 - **macOS support** → the port covers Linux only. The original agentfs CLI has an
   NFS-based macOS path; bring that in if macOS matters.
 - **Off-host backup** → already wired: `pit replicate`/`pit pull` wrap
-  litestream (continuous S3 replication of the delta DB; see above). If you
+  litestream (continuous S3 replication of the fs.db; see above). If you
   want retention tuning, snapshots on a schedule, or a control socket, point
   litestream at a config file instead of env vars (`pit replicate` uses
   command-line mode; a hand-written `litestream.yml` still works — it's just
   a binary litestream is exec'd with either way).
 - **TOML config + a TUI** → once there are several custom agents or you want a
-  session browser over the delta DBs.
+  session browser over the fs.db files.
 
 The bash `./pit` at the repo root (the original prototype) can be deleted once this
 Rust binary is installed; it's kept only as a reference for the same behaviour.

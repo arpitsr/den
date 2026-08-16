@@ -4,7 +4,7 @@
 //! The sandbox is in-process (src/sandbox.rs, ported from the agentfs CLI,
 //! MIT): a FUSE mount (src/fuse.rs, via the published `fuser` crate) serves
 //! the session's virtual filesystem — a SQLite DB at
-//! ~/.agentfs/run/<sid>/delta.db that IS the whole filesystem (no host base,
+//! ~/.pit/sessions/<sid>/fs.db that IS the whole filesystem (no host base,
 //! no overlay). New sessions start empty or seeded from a dir (`--seed`);
 //! resumed sessions open the DB and nothing else. A fork+unshare child gets
 //! a fresh user+mount namespace with the rest of the filesystem read-only.
@@ -14,10 +14,10 @@
 //! Usage:
 //!   pit <profile> [args...]      run the agent in the sandbox; print delta after
 //!   pit dump <profile> [args...] print the resolved sandbox plan (no exec)
-//!   pit inspect <session-id>     open a session's delta DB and show diff+timeline
-//!   pit sessions                 list persisted sessions under ~/.agentfs/run
-//!   pit replicate [sid] [url]    litestream daemon: stream the delta DB to S3 continuously
-//!   pit pull [sid] [url]         restore a session's delta DB from the litestream replica
+//!   pit inspect <session-id>     open a session's fs.db and show diff+timeline
+//!   pit sessions                 list persisted sessions under ~/.pit/sessions
+//!   pit replicate [sid] [url]    litestream daemon: stream the fs.db to S3 continuously
+//!   pit pull [sid] [url]         restore a session's fs.db from the litestream replica
 //!   pit list                     list configured profiles
 //!   pit selftest                 sanity-check argv assembly
 //!
@@ -189,7 +189,7 @@ fn resolve_bin(bin: &str) -> PathBuf {
     PathBuf::from(bin)
 }
 
-/// Replica URL for a session's delta.db: explicit arg wins, then
+/// Replica URL for a session's fs.db: explicit arg wins, then
 /// PIT_REPLICA, then LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET with a
 /// per-session path. Credentials are litestream's business (AWS_*/LITESTREAM_*
 /// env vars — command-line mode, see https://litestream.io/reference/replicate/).
@@ -220,10 +220,10 @@ fn litestream_autostart(sid: &str) -> bool {
     bin_found(&litestream_bin()) && replica_url(sid, None).is_ok()
 }
 
-/// ~/.agentfs/run — where sessions (and their delta DBs) persist
+/// ~/.pit/sessions — where sessions (and their fs.db files) persist
 pub(crate) fn run_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".agentfs/run"))
+    Ok(PathBuf::from(home).join(".pit/sessions"))
 }
 
 fn cwd_string() -> String {
@@ -244,12 +244,12 @@ fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
 /// the --allow flags we pass, so a session created with a different config
 /// (e.g. before we added ~/.pi to the allowlist) must be recreated — else the
 /// agent hits EROFS on the missing path. But the session dir also holds the
-/// delta DB, i.e. every change the agent made; deleting it unconditionally
+/// fs.db, i.e. every change the agent made; deleting it unconditionally
 /// throws that work away. So:
 ///
-///   config unchanged               -> join the session, delta survives
-///   config changed, delta empty    -> delete, start fresh
-///   config changed, delta has work -> archive (rename aside), never delete
+///   config unchanged               -> join the session, data survives
+///   config changed, fs.db empty    -> delete, start fresh
+///   config changed, fs.db has work -> archive (rename aside), never delete
 ///
 /// "Config" = cwd + effective --allow list, stamped to .stamps/<sid>.
 /// PIT_NO_DROP=1 keeps the old join-blind behaviour.
@@ -264,11 +264,11 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
 
     if dir.exists() {
         if std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
-            return Ok(()); // same config — join, keeping the previous delta
+            return Ok(()); // same config — join, keeping the previous fs.db
         }
         unmount_stale(&dir.join("mnt"));
         if session_has_changes(&dir) {
-            // ponytail: archives are never GC'd — rm ~/.agentfs/run/*.archived-* by hand
+            // ponytail: archives are never GC'd — rm ~/.pit/sessions/*.archived-* by hand
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -314,7 +314,7 @@ fn unmount_stale(mnt: &Path) {
 /// True if the session's DB holds anything (an empty virtual FS is worthless).
 /// Fails closed (true) so an unreadable DB gets archived, not deleted.
 fn session_has_changes(dir: &Path) -> bool {
-    let db = dir.join("delta.db");
+    let db = dir.join("fs.db");
     if !db.exists() {
         return false;
     }
@@ -379,23 +379,23 @@ fn build_argv(profile_name: &str, passthrough: &[String]) -> Result<Vec<String>>
     Ok(v)
 }
 
-// ---- AgentFS SDK: open a persisted session delta DB --------------------------
-/// ~/.agentfs/run/<sid>/delta.db — the session's persisted change log
-pub(crate) fn delta_db_path(sid: &str) -> Result<PathBuf> {
-    Ok(run_dir()?.join(sid).join("delta.db"))
+// ---- AgentFS SDK: open a persisted session fs.db --------------------------
+/// ~/.pit/sessions/<sid>/fs.db — the session's persisted virtual filesystem
+pub(crate) fn session_db_path(sid: &str) -> Result<PathBuf> {
+    Ok(run_dir()?.join(sid).join("fs.db"))
 }
 
-/// Open the session's delta layer via the SDK. Returns None if the DB isn't
-/// there (e.g. the run never happened or agentfs failed before writing it).
+/// Open the session's virtual filesystem via the SDK. Returns None if the DB
+/// isn't there (e.g. the run never happened or the SDK failed before writing it).
 async fn open_session(sid: &str) -> Result<Option<AgentFS>> {
-    let p = delta_db_path(sid)?;
+    let p = session_db_path(sid)?;
     if !p.exists() {
         return Ok(None);
     }
     let opts = AgentFSOptions::with_path(p.to_string_lossy().to_string());
     match AgentFS::open(opts).await {
         Ok(a) => Ok(Some(a)),
-        Err(e) => bail!("open delta DB for session {sid}: {e}"),
+        Err(e) => bail!("open fs.db for session {sid}: {e}"),
     }
 }
 
@@ -515,7 +515,7 @@ fn cmd_run(
     // full-vfs: the session DB is the whole filesystem. First run creates it
     // (optionally seeded from a dir); later runs use the DB alone — the host
     // tree is irrelevant. Snapshot before/after for the touched-this-run diff.
-    let db = delta_db_path(sid)?;
+    let db = session_db_path(sid)?;
     let before = block_on(async {
         let fresh = !db.exists();
         if fresh {
@@ -630,7 +630,7 @@ fn spawn_detached(sid: &str, args: &[&str], log_name: &str) -> Result<u32> {
 
 /// `pit <profile> --autostart`: stream the session's changes while the agent
 /// works. Preferred: a detached litestream daemon continuously replicating
-/// the delta DB to S3 (`pit replicate <sid>`), when a replica is configured
+/// the fs.db to S3 (`pit replicate <sid>`), when a replica is configured
 /// (PIT_REPLICA / LITESTREAM_REPLICA_URL / LITESTREAM_BUCKET) and the
 /// binary is installed. Fallback: the local LTX chain watch (`pit backup
 /// <sid> --watch` -> `<sid>.ltx`). Both survive Ctrl-C on the run, refuse a
@@ -741,7 +741,7 @@ fn install_forwarder(sig: i32) {
 const REAP_POLL: Duration = Duration::from_secs(5);
 
 /// `pit replicate [sid] [replica-url]` — run a litestream daemon that
-/// continuously replicates the session's delta.db to S3. Command-line mode
+/// continuously replicates the session's fs.db to S3. Command-line mode
 /// (`litestream replicate <db> <url>`, flags before positionals); credentials
 /// come from AWS_*/LITESTREAM_* env vars, so no config file is generated.
 /// `-restore-if-db-not-exists` pulls the session back from the replica on a
@@ -784,7 +784,7 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
     }
     let session_dir = run_dir()?.join(sid);
     std::fs::create_dir_all(&session_dir)?;
-    let db = session_dir.join("delta.db");
+    let db = session_dir.join("fs.db");
     let _lock = replicate_lock(sid)?;
     // Manual runs: Ctrl-C must stop litestream. Detached runs keep the
     // inherited SIG_IGN for SIGINT so they survive Ctrl-C on `pit run`;
@@ -836,7 +836,7 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
 }
 
 /// `pit pull [sid] [replica-url] [--force] [--to <db>]` — restore the
-/// session's delta.db from the litestream replica (newest state), defaulting
+/// session's fs.db from the litestream replica (newest state), defaulting
 /// back into the session dir. Refuses to overwrite an existing db unless
 /// --force; `-if-replica-exists` makes a never-backed-up session a no-op.
 fn cmd_pull_args(rest: &[String]) -> Result<()> {
@@ -886,7 +886,7 @@ fn cmd_pull(sid: &str, url_opt: Option<&str>, force: bool, to: Option<PathBuf>) 
              (or set PIT_LITESTREAM=/path/to/litestream)"
         );
     }
-    let to = to.unwrap_or(delta_db_path(sid)?);
+    let to = to.unwrap_or(session_db_path(sid)?);
     let mut args = vec![
         "restore".to_string(),
         "-if-replica-exists".to_string(),
@@ -916,7 +916,7 @@ fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
     let allows = effective_allows(&profile(profile_name).expect("profile checked by caller"));
     println!("session: {sid}");
-    println!("delta db: {}", delta_db_path(&sid)?.display());
+    println!("fs.db: {}", session_db_path(&sid)?.display());
     println!("command:  {}", argv.join(" "));
     if allows.is_empty() {
         println!("allow:    (defaults only)");
@@ -929,10 +929,10 @@ fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
 fn cmd_inspect(sid: &str) -> Result<()> {
     valid_sid(sid)?;
     block_on(async move {
-        let db_path = delta_db_path(sid)?;
+        let db_path = session_db_path(sid)?;
         let agent = match open_session(sid).await? {
             Some(a) => a,
-            None => bail!("no delta DB for session {sid} at {}", db_path.display()),
+            None => bail!("no fs.db for session {sid} at {}", db_path.display()),
         };
         let snap = snapshot_fs(&agent).await;
         let bytes: i64 = snap.values().map(|v| v.2).sum();
@@ -980,7 +980,7 @@ async fn collect_session_rows(run_dir: &Path) -> Result<Vec<SessionRow>> {
     let mut rows = Vec::with_capacity(sids.len());
     for sid in sids {
         let session_dir = run_dir.join(&sid);
-        let db = session_dir.join("delta.db");
+        let db = session_dir.join("fs.db");
         let base_path = std::fs::read_to_string(session_dir.join("base_path"))
             .unwrap_or_default()
             .trim()
@@ -1080,9 +1080,9 @@ fn cmd_sessions(select: bool) -> Result<()> {
     Ok(())
 }
 
-/// Session ids are directory names under ~/.agentfs/run (slug, PIT_SESSION,
+/// Session ids are directory names under ~/.pit/sessions (slug, PIT_SESSION,
 /// or a listed session) — refuse anything that could escape the tree: a
-/// stray `pit rm ..` must not delete ~/.agentfs itself.
+/// stray `pit rm ..` must not delete ~/.pit itself.
 fn valid_sid(sid: &str) -> Result<()> {
     if sid.is_empty() || sid == "." || sid == ".." || sid.contains('/') || sid.contains('\\') {
         bail!("invalid session id '{sid}'");
@@ -1161,7 +1161,7 @@ fn selftest_sandbox() -> Result<()> {
 
         // Create the session DB and seed it from the temp dir.
         let (n, before) = block_on(async {
-            let dbp = delta_db_path(&sid)?;
+            let dbp = session_db_path(&sid)?;
             std::fs::create_dir_all(dbp.parent().unwrap_or(Path::new(".")))?;
             let opts = AgentFSOptions::with_path(dbp.to_string_lossy().to_string());
             let agent = AgentFS::open(opts).await?;
@@ -1239,7 +1239,7 @@ fn selftest_sandbox() -> Result<()> {
         ??;
         check_sandbox(code != 0, true, "/etc write rejected (EROFS)")?;
 
-        // Session join: second run with the same sid joins, delta survives.
+        // Session join: second run with the same sid joins, fs.db survives.
         let code = block_on(sandbox::run_cmd(
             Vec::new(),
             sid.clone(),
@@ -1250,7 +1250,7 @@ fn selftest_sandbox() -> Result<()> {
         check_sandbox(code == 0, true, "join-session run exit code")?;
 
         std::fs::remove_dir_all(&dir)?;
-        let _ = std::fs::remove_dir_all(delta_db_path(&sid)?.parent().unwrap_or(std::path::Path::new("")));
+        let _ = std::fs::remove_dir_all(session_db_path(&sid)?.parent().unwrap_or(std::path::Path::new("")));
         println!("sandbox selftest OK (seed, mount, vfs writes, ro-enforcement, join)");
     }
     Ok(())
@@ -1271,11 +1271,11 @@ fn usage() -> String {
      pit inspect [session-id]     list a session's virtual FS + timeline\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
      pit rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
-     pit replicate [sid] [url]    stream a session's delta DB to S3 via litestream (daemon)
+     pit replicate [sid] [url]    stream a session's fs.db to S3 via litestream (daemon)
   \
      pit pull [sid] [url] [--force] [--to db]   restore a session from its litestream replica
   \
-     pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  LTX backup of a session's delta DB\n  \
+     pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  LTX backup of a session's fs.db\n  \
      pit restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
      pit ltx <file.ltx>         inspect/verify a backup file\n  \
      pit list                     list profiles\n  \
@@ -1457,7 +1457,7 @@ fn cmd_backup_args(rest: &[String]) -> Result<()> {
 }
 
 /// `pit restore <file.ltx> [--to <db>]` — target defaults to the session the
-/// file is named after (codex-foo.ltx -> ~/.agentfs/run/codex-foo/delta.db).
+/// file is named after (codex-foo.ltx -> ~/.pit/sessions/codex-foo/fs.db).
 fn cmd_restore_args(rest: &[String]) -> Result<()> {
     let mut ltx = None;
     let mut to = None;

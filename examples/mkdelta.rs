@@ -1,12 +1,11 @@
-//! Throwaway: build a session delta DB that looks like what `agentfs run` would
+//! Throwaway: build a session fs.db that looks like what `pit run` would
 //! leave behind, so we can exercise `pit inspect` / `pit sessions` (and the
-//! post-run SDK summary) without installing the real agentfs CLI.
+//! post-run summary) without installing a real agent CLI.
 //!
 //!   cargo run --example mkdelta -- <session-id> [base-dir]
 //!
-//! Creates `~/.agentfs/run/<session-id>/delta.db` with overlay schema (base
-//! recorded), one created file `/hello.txt`, one created dir `/out`, and one
-//! whiteout `README.md`. Then print the sid.
+//! Creates `~/.pit/sessions/<session-id>/fs.db` with one file `/hello.txt`,
+//! one dir `/out`, and one whiteout `README.md`. Then print the sid.
 
 use agentfs_sdk::{AgentFS, AgentFSOptions, DEFAULT_FILE_MODE};
 use anyhow::Result;
@@ -22,9 +21,9 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&base)?;
 
     let home = std::env::var("HOME")?;
-    let dir = format!("{home}/.agentfs/run/{sid}");
+    let dir = format!("{home}/.pit/sessions/{sid}");
     std::fs::create_dir_all(&dir)?;
-    let db = format!("{dir}/delta.db");
+    let db = format!("{dir}/fs.db");
     // start clean so re-runs are idempotent
     let _ = std::fs::remove_file(&db);
 
