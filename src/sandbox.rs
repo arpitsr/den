@@ -1,16 +1,13 @@
-//! Overlay sandbox using FUSE and Linux namespaces — ported from the agentfs
-//! CLI (`cli/src/sandbox/linux.rs`, MIT) so pit no longer shells out to it.
+//! Virtual-FS sandbox using FUSE and Linux namespaces — ported from the
+//! agentfs CLI (`cli/src/sandbox/linux.rs`, MIT) so pit no longer shells out.
 //!
-//! The current working directory becomes a copy-on-write overlay: a FUSE
-//! filesystem is mounted on a hidden temp dir (~/.agentfs/run/<sid>/mnt),
-//! then a child with its own user+mount namespace bind-mounts that overlay
-//! onto the cwd. Everything else is remounted read-only except an allowlist.
-//! All writes land in the session's SQLite delta DB (~/.agentfs/run/<sid>/delta.db),
-//! which the SDK then reads back (diff, whiteouts, tool timeline).
-//!
-//! To avoid a circular reference (FUSE serving from a directory it's mounted
-//! on), we open a file descriptor to the cwd before mounting; HostFS accesses
-//! the base layer through /proc/self/fd/N, bypassing the FUSE mount.
+//! The session's SQLite DB (~/.agentfs/run/<sid>/delta.db) IS the filesystem:
+//! a FUSE mount serving it is placed on a hidden dir (~/.agentfs/run/<sid>/mnt),
+//! then a child with its own user+mount namespace bind-mounts it onto the cwd.
+//! Everything else is remounted read-only except an allowlist. New sessions
+//! start empty (or seeded via --seed in main.rs); resumed sessions open the
+//! DB and nothing else — the host tree under the mount is hidden and
+//! irrelevant. The SDK reads the DB back for the touched-this-run diff.
 //!
 //! The FUSE mount at ~/.agentfs/run/<sid>/mnt lives in *this* process's
 //! namespace, so a second `pit` invocation with the same sid joins it —
@@ -45,7 +42,7 @@
 
 use crate::mount::{mount_fs, MountOpts};
 use crate::run_dir;
-use agentfs_sdk::{AgentFS, AgentFSOptions, HostFS, OverlayFS};
+use agentfs_sdk::{AgentFS, AgentFSOptions};
 use anyhow::{bail, Context, Result};
 use std::cmp::Reverse;
 use std::ffi::CString;
@@ -53,7 +50,6 @@ use std::fs;
 use std::io::BufRead;
 use std::net::TcpListener;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -276,39 +272,22 @@ pub async fn run_cmd(
         );
     }
 
-    // Open the cwd BEFORE mounting FUSE on top of it. This fd lets HostFS
-    // access the underlying directory through /proc/self/fd/N, bypassing the
-    // FUSE mount that will be placed on top.
-    let cwd_fd = fs::File::open(&cwd).context("Failed to open current directory")?;
-    let fd_num = cwd_fd.as_raw_fd();
-    let fd_path = format!("/proc/self/fd/{}", fd_num);
-
+    // The session DB IS the whole filesystem (full-vfs model): no HostFS
+    // base, no copy-on-write overlay. Mount agentfs.fs directly — an empty
+    // DB presents an empty dir, a seeded/resumed one its stored tree.
     let db_path_str = session
         .db_path
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
     let agentfs = AgentFS::open(AgentFSOptions::with_path(db_path_str.to_string()))
         .await
-        .context("Failed to create delta AgentFS")?;
-
-    let hostfs = HostFS::new(&fd_path).context("Failed to create HostFS")?;
-    let mountpoint_inode = fs::metadata(&session.fuse_mountpoint)
-        .map(|m| m.ino())
-        .context("Failed to get mountpoint inode")?;
-    let hostfs = hostfs.with_fuse_mountpoint(mountpoint_inode);
-
-    let base = std::sync::Arc::new(hostfs);
-    let overlay = OverlayFS::new(base, agentfs.fs);
+        .context("Failed to open session AgentFS")?;
 
     let cwd_str = cwd
         .to_str()
         .context("Current directory path contains non-UTF8 characters")?;
-    overlay
-        .init(cwd_str)
-        .await
-        .context("Failed to initialize overlay")?;
 
-    // Write the base path for session joining
+    // Write the cwd for session joining (bind-mount target)
     fs::write(&session.base_path_file, cwd_str).context("Failed to write session base path")?;
 
     let mount_opts = MountOpts {
@@ -321,7 +300,7 @@ pub async fn run_cmd(
         timeout: FUSE_MOUNT_TIMEOUT,
     };
 
-    let mount_handle = mount_fs(std::sync::Arc::new(tokio::sync::Mutex::new(overlay)), mount_opts).await?;
+    let mount_handle = mount_fs(std::sync::Arc::new(tokio::sync::Mutex::new(agentfs.fs)), mount_opts).await?;
 
     let net = NetMode::from_env();
     let exit_code = run_chain(
@@ -334,11 +313,9 @@ pub async fn run_cmd(
         net,
     );
 
-    // Release the cwd fd (was kept alive for HostFS), then drop the mount
-    // handle to unmount. Drop chdir's to "/" first (unmount EBUSY guard), so
-    // restore the caller's cwd after — pit lives on for the next run, unlike
-    // the agentfs CLI which exits here.
-    drop(cwd_fd);
+    // Drop the mount handle to unmount. Drop chdir's to "/" first (unmount
+    // EBUSY guard), so restore the caller's cwd after — pit lives on for the
+    // next run, unlike the agentfs CLI which exits here.
     drop(mount_handle);
     if std::env::set_current_dir(&cwd).is_err() {
         eprintln!("Warning: failed to restore cwd to {}", cwd.display());

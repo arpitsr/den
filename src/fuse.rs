@@ -875,7 +875,7 @@ fn allow_other_supported() -> bool {
     false
 }
 
-/// Mount the overlay: create the fuser session (mounts via fusermount3),
+/// Mount the virtual FS: create the fuser session (mounts via fusermount3),
 /// hand the notifier to a deferred invalidation thread, then serve requests
 /// until unmounted. Sends the mount result to `ready_tx` so the caller
 /// doesn't sit through the readiness timeout on failure.

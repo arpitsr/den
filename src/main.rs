@@ -2,12 +2,14 @@
 //! SDK access to what it did.
 //!
 //! The sandbox is in-process (src/sandbox.rs, ported from the agentfs CLI,
-//! MIT): a FUSE overlay (src/fuse.rs, via the published `fuser` crate) makes
-//! the cwd copy-on-write, a fork+unshare child gets a fresh user+mount
-//! namespace with the rest of the filesystem read-only, and every write lands
-//! in the session's SQLite delta DB (~/.agentfs/run/<sid>/delta.db). After the
-//! agent exits we bind `agentfs-sdk` to open that DB in-process and surface a
-//! typed diff (changed/deleted paths) + tool-call timeline.
+//! MIT): a FUSE mount (src/fuse.rs, via the published `fuser` crate) serves
+//! the session's virtual filesystem — a SQLite DB at
+//! ~/.agentfs/run/<sid>/delta.db that IS the whole filesystem (no host base,
+//! no overlay). New sessions start empty or seeded from a dir (`--seed`);
+//! resumed sessions open the DB and nothing else. A fork+unshare child gets
+//! a fresh user+mount namespace with the rest of the filesystem read-only.
+//! After the agent exits we diff a pre/post snapshot of the virtual FS and
+//! report what this run touched.
 //!
 //! Usage:
 //!   pit <profile> [args...]      run the agent in the sandbox; print delta after
@@ -36,9 +38,10 @@
 //!   PIT_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
 //!   PIT_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)
 
+use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT};
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -308,8 +311,8 @@ fn unmount_stale(mnt: &Path) {
     }
 }
 
-/// True if the session's delta DB records any change. Fails closed (true) so
-/// an unreadable DB gets archived, not deleted.
+/// True if the session's DB holds anything (an empty virtual FS is worthless).
+/// Fails closed (true) so an unreadable DB gets archived, not deleted.
 fn session_has_changes(dir: &Path) -> bool {
     let db = dir.join("delta.db");
     if !db.exists() {
@@ -318,10 +321,10 @@ fn session_has_changes(dir: &Path) -> bool {
     let check = async {
         let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
         match AgentFS::open(opts).await {
-            Ok(a) => {
-                let (delta, whiteouts) = fetch_diff(&a).await;
-                !delta.is_empty() || !whiteouts.is_empty()
-            }
+            Ok(a) => match a.fs.readdir(1).await {
+                Ok(Some(names)) => !names.is_empty(),
+                _ => true,
+            },
             Err(_) => true,
         }
     };
@@ -396,63 +399,106 @@ async fn open_session(sid: &str) -> Result<Option<AgentFS>> {
     }
 }
 
-async fn fetch_diff(agent: &AgentFS) -> (HashSet<String>, HashSet<String>) {
-    let delta = agent.get_delta_paths().await.unwrap_or_default();
-    let whiteouts = agent.get_whiteouts().await.unwrap_or_default();
-    (delta, whiteouts)
-}
+// ---- virtual FS: seed + snapshot --------------------------------------------
 
-async fn print_diff_labels(agent: &AgentFS, sid: &str) {
-    if let Ok(Some(base)) = agent.is_overlay_enabled().await {
-        println!("session {sid} (overlay base: {base})");
-    } else {
-        println!("session {sid}");
+/// Names never copied into a session when seeding (VCS + dep/build dirs).
+const SEED_EXCLUDES: &[&str] = &[".git", "node_modules", "target"];
+
+/// Copy a host dir into the session's virtual FS. Returns entry count.
+/// ponytail: whole-file reads; chunk pwrite if giant binaries ever matter.
+async fn seed_session(agent: &AgentFS, dir: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut count = 0u64;
+    let mut stack = vec![(dir.to_path_buf(), PathBuf::new())]; // (host dir, vfs-relative)
+    while let Some((host, rel)) = stack.pop() {
+        for entry in std::fs::read_dir(&host).with_context(|| format!("seed: read {}", host.display()))? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if SEED_EXCLUDES.contains(&name.to_string_lossy().as_ref()) {
+                continue;
+            }
+            let child_rel = rel.join(&name);
+            let vfs = format!("/{}", child_rel.display());
+            let md = std::fs::symlink_metadata(entry.path())?;
+            let (uid, gid) = (md.uid(), md.gid());
+            let ft = entry.file_type()?;
+            if ft.is_dir() {
+                agent.fs.mkdir(&vfs, uid, gid).await.with_context(|| format!("seed: mkdir {vfs}"))?;
+                count += 1;
+                stack.push((entry.path(), child_rel));
+            } else if ft.is_symlink() {
+                let target = std::fs::read_link(entry.path())?;
+                agent.fs.symlink(&target.to_string_lossy(), &vfs, uid, gid).await.with_context(|| format!("seed: symlink {vfs}"))?;
+                count += 1;
+            } else if ft.is_file() {
+                let data = std::fs::read(entry.path())?;
+                agent.fs.create_file(&vfs, md.mode(), uid, gid).await.with_context(|| format!("seed: create {vfs}"))?;
+                if !data.is_empty() {
+                    agent.fs.pwrite(&vfs, 0, &data).await.with_context(|| format!("seed: write {vfs}"))?;
+                }
+                count += 1;
+            }
+            // fifos/sockets/devices: skip
+        }
     }
+    Ok(count)
 }
 
-fn sorted(v: &HashSet<String>) -> Vec<&String> {
-    let mut s: Vec<_> = v.iter().collect();
-    s.sort();
-    s
+/// path -> (mtime, mtime_nsec, size) for every entry in the virtual FS.
+/// Comparing two snapshots tells you what a run touched.
+async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i64)> {
+    let mut out = HashMap::new();
+    let mut stack = vec![(String::new(), 1i64)]; // (path, ino); root ino = 1
+    while let Some((path, ino)) = stack.pop() {
+        let names = agent.fs.readdir(ino).await.ok().flatten().unwrap_or_default();
+        for name in names {
+            let child = format!("{path}/{name}");
+            let Some(st) = agent.fs.lstat(&child).await.ok().flatten() else { continue };
+            out.insert(child.clone(), (st.mtime, st.mtime_nsec, st.size));
+            if st.mode & S_IFMT == S_IFDIR {
+                stack.push((child, st.ino));
+            }
+        }
+    }
+    out
 }
 
-/// compact post-run summary: "session X — 3 changed, 1 deleted" + capped listing
-async fn print_run_summary(sid: &str) {
+/// compact post-run summary: what this run touched in the virtual FS
+/// (added/modified/removed vs the pre-run snapshot) + capped listing
+async fn print_run_summary(sid: &str, before: &HashMap<String, (i64, u32, i64)>) {
     if std::env::var("PIT_QUIET").as_deref() == Ok("1") {
         return;
     }
     let agent = match open_session(sid).await {
         Ok(Some(a)) => a,
-        Ok(None) => return, // no delta DB yet — nothing to summarize
+        Ok(None) => return, // no session DB — nothing to summarize
         Err(e) => {
             eprintln!("\nagentfs: {e}");
             return;
         }
     };
-    let (delta, whiteouts) = fetch_diff(&agent).await;
-    eprintln!();
-    let untouched = delta.is_empty() && whiteouts.is_empty();
+    let after = snapshot_fs(&agent).await;
+    let added: HashSet<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+    let removed: HashSet<&String> = before.keys().filter(|k| !after.contains_key(*k)).collect();
+    let modified: HashSet<&String> = after
+        .keys()
+        .filter(|k| before.get(*k).is_some_and(|b| Some(b) != after.get(*k)))
+        .collect();
     eprintln!(
-        "agentfs: session {sid} — {} changed, {} deleted {}",
-        delta.len(),
-        whiteouts.len(),
-        if untouched {
-            "(host tree untouched)"
-        } else {
-            ""
-        }
+        "\npit: session {sid} — {} added, {} modified, {} removed this run",
+        added.len(),
+        modified.len(),
+        removed.len()
     );
-    for p in sorted(&delta).into_iter().take(20) {
-        eprintln!("  + {p}");
-    }
-    if delta.len() > 20 {
-        eprintln!("  … {} more", delta.len() - 20);
-    }
-    for p in sorted(&whiteouts).into_iter().take(20) {
-        eprintln!("  - {p}");
-    }
-    if whiteouts.len() > 20 {
-        eprintln!("  … {} more deleted", whiteouts.len() - 20);
+    for (mark, set) in [("+", &added), ("M", &modified), ("-", &removed)] {
+        let mut list: Vec<_> = set.iter().collect();
+        list.sort();
+        for p in list.iter().take(20) {
+            eprintln!("  {mark} {p}");
+        }
+        if list.len() > 20 {
+            eprintln!("  … {} more", list.len() - 20);
+        }
     }
 }
 
@@ -464,7 +510,29 @@ fn cmd_run(
     passthrough: &[String],
     autostart: bool,
     auto_out: Option<PathBuf>,
+    seed: Option<PathBuf>,
 ) -> Result<i32> {
+    // full-vfs: the session DB is the whole filesystem. First run creates it
+    // (optionally seeded from a dir); later runs use the DB alone — the host
+    // tree is irrelevant. Snapshot before/after for the touched-this-run diff.
+    let db = delta_db_path(sid)?;
+    let before = block_on(async {
+        let fresh = !db.exists();
+        if fresh {
+            std::fs::create_dir_all(db.parent().unwrap_or(Path::new(".")))?;
+        }
+        let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+        let agent = AgentFS::open(opts).await.context("open session DB")?;
+        if fresh {
+            if let Some(d) = &seed {
+                let n = seed_session(&agent, d).await?;
+                eprintln!("pit: seeded session {sid} with {n} entries from {}", d.display());
+            }
+        } else if seed.is_some() {
+            eprintln!("pit: session {sid} already exists — --seed ignored (PIT_NEW=1 for a fresh session)");
+        }
+        anyhow::Ok(snapshot_fs(&agent).await)
+    })??;
     let mut argv = build_argv(profile_name, passthrough)?;
     // Resolve the command on the host PATH before entering the sandbox, so a
     // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
@@ -494,27 +562,29 @@ fn cmd_run(
         let _ = (allows, &argv);
         bail!("pit's in-process sandbox is Linux-only; run pit on Linux")
     };
-    // This runs after the sandboxed agent has exited and the delta DB is
-    // persisted — the point where we bind the SDK.
-    block_on(print_run_summary(sid))?;
+    // The agent has exited and the session DB is persisted — diff the
+    // virtual FS against the pre-run snapshot.
+    block_on(print_run_summary(sid, &before))?;
     Ok(code)
 }
 
-/// Strip pit's own `--autostart [--out <base.ltx>]` from a run's passthrough
-/// args (the rest go to agentfs). Nothing is stripped unless --autostart is
-/// present, so plain agent args are never eaten.
-fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Vec<String>) {
+/// Strip pit's own flags from a run's passthrough args (the rest go to the
+/// agent): `--seed <dir>` always, `--autostart [--out <base.ltx>]` only when
+/// --autostart is present, so plain agent args are never eaten.
+fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Option<PathBuf>, Vec<String>) {
     let autostart = rest.iter().any(|a| a == "--autostart");
-    if !autostart {
-        return (false, None, rest.to_vec());
-    }
     let mut out = None;
+    let mut seed = None;
     let mut pass = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            "--seed" if rest.get(i + 1).is_some() => {
+                seed = Some(PathBuf::from(&rest[i + 1]));
+                i += 1;
+            }
             "--autostart" => {}
-            "--out" if rest.get(i + 1).is_some() => {
+            "--out" if autostart && rest.get(i + 1).is_some() => {
                 out = Some(PathBuf::from(&rest[i + 1]));
                 i += 1;
             }
@@ -522,7 +592,7 @@ fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Vec<String>) {
         }
         i += 1;
     }
-    (true, out, pass)
+    (autostart, out, seed, pass)
 }
 
 /// Spawn a detached `pit` subcommand for this session: stdin null, output to
@@ -864,15 +934,16 @@ fn cmd_inspect(sid: &str) -> Result<()> {
             Some(a) => a,
             None => bail!("no delta DB for session {sid} at {}", db_path.display()),
         };
-        print_diff_labels(&agent, sid).await;
-        let (delta, whiteouts) = fetch_diff(&agent).await;
-        println!("changed ({}):", delta.len());
-        for p in sorted(&delta) {
-            println!("  + {p}");
+        let snap = snapshot_fs(&agent).await;
+        let bytes: i64 = snap.values().map(|v| v.2).sum();
+        println!("session {sid}: {} entries, {} bytes", snap.len(), bytes);
+        let mut paths: Vec<_> = snap.keys().collect();
+        paths.sort();
+        for p in paths.iter().take(50) {
+            println!("  {p}");
         }
-        println!("deleted ({}):", whiteouts.len());
-        for p in sorted(&whiteouts) {
-            println!("  - {p}");
+        if paths.len() > 50 {
+            println!("  … {} more", paths.len() - 50);
         }
         // Timeline: only populated if the agent itself records tool calls via the
         // SDK. Wrapped CLIs (claude/codex/...) usually leave it empty.
@@ -894,7 +965,7 @@ fn cmd_inspect(sid: &str) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionRow {
     sid: String,
-    changed: Option<(usize, usize)>,
+    entries: Option<usize>,
     base_path: String,
 }
 
@@ -914,21 +985,18 @@ async fn collect_session_rows(run_dir: &Path) -> Result<Vec<SessionRow>> {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let changed = if db.exists() {
+        let entries = if db.exists() {
             let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
             match AgentFS::open(opts).await {
-                Ok(agent) => {
-                    let (delta, whiteouts) = fetch_diff(&agent).await;
-                    Some((delta.len(), whiteouts.len()))
-                }
-                Err(_) => Some((0, 0)),
+                Ok(agent) => Some(snapshot_fs(&agent).await.len()),
+                Err(_) => Some(0),
             }
         } else {
             None
         };
         rows.push(SessionRow {
             sid,
-            changed,
+            entries,
             base_path,
         });
     }
@@ -944,9 +1012,9 @@ fn format_session_rows(rows: &[SessionRow], numbered: bool) -> String {
             } else {
                 String::new()
             };
-            let counts = match row.changed {
-                Some((changed, deleted)) => format!("{changed} changed, {deleted} deleted"),
-                None => "(no delta DB)".to_string(),
+            let counts = match row.entries {
+                Some(n) => format!("{n} entries"),
+                None => "(no session DB)".to_string(),
             };
             format!("{prefix}{}\t{counts}\t{}", row.sid, row.base_path)
         })
@@ -1072,10 +1140,10 @@ fn cmd_selftest(rest: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Full sandbox round-trip: FUSE overlay + fork/unshare child in a temp dir.
-/// Verifies (1) writes land in the delta DB, not on the host, (2) deletes
-/// become whiteouts, (3) the host tree is untouched, (4) the rest of the
-/// filesystem is actually read-only.
+/// Full sandbox round-trip: seeded virtual FS + fork/unshare child in a temp
+/// dir. Verifies (1) seeding copies the tree into the session DB, (2) agent
+/// writes/deletes land in the DB only — the host tree is untouched, (3) the
+/// rest of the filesystem is read-only, (4) session join works.
 fn selftest_sandbox() -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     bail!("selftest --sandbox is Linux-only");
@@ -1090,6 +1158,20 @@ fn selftest_sandbox() -> Result<()> {
         std::env::set_current_dir(&dir)?;
 
         let sid = format!("selftest-sandbox-{}", std::process::id());
+
+        // Create the session DB and seed it from the temp dir.
+        let (n, before) = block_on(async {
+            let dbp = delta_db_path(&sid)?;
+            std::fs::create_dir_all(dbp.parent().unwrap_or(Path::new(".")))?;
+            let opts = AgentFSOptions::with_path(dbp.to_string_lossy().to_string());
+            let agent = AgentFS::open(opts).await?;
+            let n = seed_session(&agent, &dir).await?;
+            anyhow::Ok((n, snapshot_fs(&agent).await))
+        })??;
+        check_sandbox(n == 3, true, "seed copied 3 entries")?;
+        check_sandbox(before.contains_key("/README.md"), true, "seeded /README.md")?;
+        check_sandbox(before.contains_key("/src/a.txt"), true, "seeded /src/a.txt")?;
+
         let script = "echo new > created.txt; rm README.md; mkdir -p dir1; echo x > dir1/f.txt";
         let code = block_on(sandbox::run_cmd(
             Vec::new(),
@@ -1114,23 +1196,21 @@ fn selftest_sandbox() -> Result<()> {
             "created.txt not on host",
         )?;
 
-        // Delta DB: created.txt + dir1/f.txt changed, README.md deleted.
+        // Session DB: created.txt + dir1/f.txt added, README.md removed — and
+        // the touched-this-run diff against the pre-run snapshot agrees.
         let sid_check = sid.clone();
-        let (delta, whiteouts) = block_on(async move {
-            let agent = open_session(&sid_check).await?.context("no delta DB after run")?;
-            let d = agent.get_delta_paths().await.unwrap_or_default();
-            let w = agent.get_whiteouts().await.unwrap_or_default();
-            anyhow::Ok((d, w))
+        let after = block_on(async move {
+            let agent = open_session(&sid_check).await?.context("no session DB after run")?;
+            anyhow::Ok(snapshot_fs(&agent).await)
         })
         ??;
         for p in ["/created.txt", "/dir1/f.txt"] {
-            check_sandbox(delta.contains(p), true, &format!("delta contains {p}"))?;
+            check_sandbox(after.contains_key(p), true, &format!("session FS contains {p}"))?;
         }
-        check_sandbox(
-            whiteouts.contains("/README.md"),
-            true,
-            "whiteout contains /README.md",
-        )?;
+        check_sandbox(!after.contains_key("/README.md"), true, "/README.md removed from session FS")?;
+        check_sandbox(after.contains_key("/src/a.txt"), true, "untouched seed file survives")?;
+        let touched: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+        check_sandbox(touched.len() == 3, true, "3 added this run (created.txt, dir1, dir1/f.txt)")?;
 
         // Read-only enforcement: /etc is not writable from inside the sandbox.
         let diag = format!("/tmp/pit-sandbox-diag-{}.txt", std::process::id());
@@ -1171,7 +1251,7 @@ fn selftest_sandbox() -> Result<()> {
 
         std::fs::remove_dir_all(&dir)?;
         let _ = std::fs::remove_dir_all(delta_db_path(&sid)?.parent().unwrap_or(std::path::Path::new("")));
-        println!("sandbox selftest OK (mount, delta, whiteouts, ro-enforcement, join)");
+        println!("sandbox selftest OK (seed, mount, vfs writes, ro-enforcement, join)");
     }
     Ok(())
 }
@@ -1185,9 +1265,10 @@ fn check_sandbox(cond: bool, expected: bool, what: &str) -> Result<()> {
 
 fn usage() -> String {
     "usage:\n  \
-     pit <profile> [args...]      run agent in the sandbox; --autostart streams a backup watch\n  \
+     pit <profile> [args...]      run agent in the sandbox; --seed <dir> preloads a new session,\n  \
+                                  --autostart streams a backup watch\n  \
      pit dump <profile> [args...] print the resolved sandbox plan (no exec)\n  \
-     pit inspect [session-id]     show diff + timeline for a session\n  \
+     pit inspect [session-id]     list a session's virtual FS + timeline\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
      pit rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
      pit replicate [sid] [url]    stream a session's delta DB to S3 via litestream (daemon)
@@ -1300,11 +1381,11 @@ fn main() -> Result<()> {
                     }
                 );
             }
-            let (autostart, auto_out, passthrough) = split_run_args(passthrough);
+            let (autostart, auto_out, seed, passthrough) = split_run_args(passthrough);
             let sid = session_id(pname);
             let allows = effective_allows(&profile(pname).expect("profile checked above"));
             drop_stale_session(&sid, &allows)?;
-            let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out)?;
+            let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out, seed)?;
             std::process::exit(code);
         }
     }
@@ -1448,20 +1529,20 @@ mod tests {
         let rows = vec![
             SessionRow {
                 sid: "codex-alpha".into(),
-                changed: Some((2, 1)),
+                entries: Some(42),
                 base_path: "/tmp/alpha".into(),
             },
             SessionRow {
                 sid: "pi-beta".into(),
-                changed: None,
+                entries: None,
                 base_path: String::new(),
             },
         ];
 
         let rendered = format_session_rows(&rows, true);
 
-        assert!(rendered.contains("[1]\tcodex-alpha\t2 changed, 1 deleted\t/tmp/alpha"));
-        assert!(rendered.contains("[2]\tpi-beta\t(no delta DB)\t"));
+        assert!(rendered.contains("[1]\tcodex-alpha\t42 entries\t/tmp/alpha"));
+        assert!(rendered.contains("[2]\tpi-beta\t(no session DB)\t"));
     }
 
     #[test]
@@ -1469,12 +1550,12 @@ mod tests {
         let rows = vec![
             SessionRow {
                 sid: "codex-alpha".into(),
-                changed: None,
+                entries: None,
                 base_path: String::new(),
             },
             SessionRow {
                 sid: "pi-beta".into(),
-                changed: None,
+                entries: None,
                 base_path: String::new(),
             },
         ];
@@ -1490,7 +1571,7 @@ mod tests {
     fn parse_session_selection_rejects_unknown_values() {
         let rows = vec![SessionRow {
             sid: "codex-alpha".into(),
-            changed: None,
+            entries: None,
             base_path: String::new(),
         }];
 
@@ -1502,18 +1583,20 @@ mod tests {
     fn split_run_args_extracts_autostart() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        let (auto, out, pass) = split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
+        let (auto, out, seed, pass) = split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
         assert!(auto);
         assert_eq!(out.unwrap().to_str().unwrap(), "s.ltx");
+        assert!(seed.is_none());
         assert_eq!(pass, v(&["-y"]));
 
-        // without --autostart, nothing is stripped
-        let (auto, out, pass) = split_run_args(&v(&["--out", "s.ltx"]));
+        // without --autostart, --out is not stripped (but --seed always is)
+        let (auto, out, seed, pass) = split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
         assert!(!auto && out.is_none());
+        assert_eq!(seed.unwrap().to_str().unwrap(), ".");
         assert_eq!(pass, v(&["--out", "s.ltx"]));
 
         // flags may come after positional args
-        let (auto, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
+        let (auto, _, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
         assert!(auto);
         assert_eq!(pass, v(&["-y"]));
     }
