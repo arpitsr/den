@@ -1,17 +1,17 @@
-//! LTX backup & restore of session delta DBs, using the `litetx` crate (a
+//! LTX backup & restore of session fs.db files, using the `litetx` crate (a
 //! port of https://github.com/superfly/ltx-rs — the Lite Transaction File
 //! format for SQLite backup).
 //!
 //!   pit backup <sid> [--from <prev.ltx>] [--out <path>] [-c] [--watch]
 //!     snapshot (or delta from the previous file in the chain) of
-//!     ~/.agentfs/run/<sid>/delta.db; --watch keeps appending chained deltas
+//!     ~/.pit/sessions/<sid>/fs.db; --watch keeps appending chained deltas
 //!     while the session is written (Litestream-style streaming)
 //!   pit restore <file.ltx> [--to <db>]
-//!     apply an LTX file (and any chain siblings) back into a session delta DB
+//!     apply an LTX file (and any chain siblings) back into a session fs.db
 //!   pit ltx <file.ltx>
 //!     inspect a backup file: header, page count, checksums (verifies them)
 //!
-//! The delta DB is a plain SQLite file that the agentfs SDK leaves in WAL mode
+//! The fs.db is a plain SQLite file that the agentfs SDK leaves in WAL mode
 //! (a `-wal` sibling persists after a clean close). `prepare_db` folds any WAL
 //! frames into the main file via wal_checkpoint before we read it page-by-page;
 //! a `-journal` sibling (mid-commit) is refused. Page reads are plain file
@@ -142,9 +142,9 @@ fn cmd_backup_inner(
     compress: bool,
     strict: bool,
 ) -> Result<bool> {
-    let db = crate::delta_db_path(sid)?;
+    let db = crate::session_db_path(sid)?;
     if !db.exists() {
-        bail!("no delta DB for session {sid} at {}", db.display());
+        bail!("no fs.db for session {sid} at {}", db.display());
     }
     if !prepare_db(&db, strict)? {
         return Ok(false); // writer mid-commit; the watch loop retries next round
@@ -277,7 +277,7 @@ impl Watch {
     /// is mid-commit — the frames stay safe in the WAL and the next round
     /// catches them.
     fn tick(&mut self) -> Result<()> {
-        let db = crate::delta_db_path(&self.sid)?;
+        let db = crate::session_db_path(&self.sid)?;
         let now = db_state(&db)?;
         if now == self.state {
             return Ok(());
@@ -300,7 +300,7 @@ impl Watch {
 /// tick, and restarting resumes from the newest file. `pit restore <base>.ltx`
 /// replays the whole chain.
 /// One watcher per session: hold an exclusive flock on a lock file next to
-/// the delta DB for the process lifetime, so a second `--watch` on the same
+/// the fs.db for the process lifetime, so a second `--watch` on the same
 /// session (e.g. a duplicate `pit <profile> --autostart`) refuses instead of
 /// racing on the chain files. The lock dies with the process — no stale-pid
 /// bookkeeping.
@@ -325,12 +325,12 @@ fn lock_watch(sid: &str) -> Result<File> {
 /// replays the whole chain. Waits up to 30s for the session DB to appear, so
 /// `pit <profile> --autostart` works on the very first run of a profile.
 pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
-    let db = crate::delta_db_path(sid)?;
+    let db = crate::session_db_path(sid)?;
     let mut waited = 0;
     while !db.exists() {
         if waited >= 15 {
             bail!(
-                "no delta DB for session {sid} at {} (waited 30s)",
+                "no fs.db for session {sid} at {} (waited 30s)",
                 db.display()
             );
         }
@@ -469,7 +469,7 @@ fn write_delta(
 }
 
 /// `pit restore <file.ltx> [--to <db>]` — target defaults to the session
-/// named by the file (codex-foo.ltx -> ~/.agentfs/run/codex-foo/delta.db).
+/// named by the file (codex-foo.ltx -> ~/.pit/sessions/codex-foo/fs.db).
 pub fn cmd_restore(ltx: &Path, to: &Path) -> Result<()> {
     let (header, pages, trailer) = read_ltx(ltx)?;
     if is_snapshot(&header) {
@@ -637,7 +637,7 @@ fn integrity_check(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Default restore target: codex-foo.ltx -> ~/.agentfs/run/codex-foo/delta.db.
+/// Default restore target: codex-foo.ltx -> ~/.pit/sessions/codex-foo/fs.db.
 /// Chain deltas are numbered codex-foo.NNNN.ltx; strip the number so a
 /// numbered file still resolves to the session it belongs to (session ids
 /// never contain '.', so the suffix is unambiguous).
@@ -651,7 +651,7 @@ pub fn default_restore_target(ltx: &Path) -> Result<PathBuf> {
         _ => &stem,
     }
     .to_string();
-    let db = crate::delta_db_path(&sid)?;
+    let db = crate::session_db_path(&sid)?;
     if !db.exists() {
         bail!(
             "no session '{sid}' at {} (pass --to <db-path>)",
@@ -706,13 +706,12 @@ mod tests {
         TestHome { _guard: guard, dir }
     }
 
-    /// Build a fake session delta DB via the agentfs SDK (like examples/mkdelta.rs).
+    /// Build a fake session fs.db via the agentfs SDK (like examples/mkdelta.rs).
     fn build_session(sid: &str, base: &str) {
         std::fs::create_dir_all(base).unwrap();
-        let home = std::env::var("HOME").unwrap();
-        let dir = format!("{home}/.agentfs/run/{sid}");
-        std::fs::create_dir_all(&dir).unwrap();
-        let db = format!("{dir}/delta.db");
+        let db = crate::session_db_path(sid).unwrap();
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let db = db.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&db);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -742,11 +741,10 @@ mod tests {
         });
     }
 
-    /// Reopen a session's DB and add one file (mutates the delta DB).
+    /// Reopen a session's DB and add one file (mutates the fs.db).
     fn mutate_session(sid: &str, base: &str, name: &str) {
         std::fs::create_dir_all(base).unwrap();
-        let home = std::env::var("HOME").unwrap();
-        let db = format!("{home}/.agentfs/run/{sid}/delta.db");
+        let db = crate::session_db_path(sid).unwrap().to_string_lossy().to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let agent = AgentFS::open(AgentFSOptions::with_path(&db).with_base(base))
@@ -779,7 +777,7 @@ mod tests {
         cmd_restore(&out, &restored).unwrap();
         assert_eq!(
             db_bytes(&restored),
-            db_bytes(&home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db"))
+            db_bytes(&crate::session_db_path(sid).unwrap())
         );
     }
 
@@ -813,7 +811,7 @@ mod tests {
         let restored = home.dir.0.join("restored.db");
         cmd_restore(&snap, &restored).unwrap();
         cmd_restore(&delta, &restored).unwrap();
-        let final_db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+        let final_db = crate::session_db_path(sid).unwrap();
         assert_eq!(db_bytes(&restored), db_bytes(&final_db));
     }
 
@@ -860,7 +858,7 @@ mod tests {
         // patch the header page count so the lock-byte page (which LTX never
         // stores) falls inside the DB; the guard must refuse before any page
         // is read or the out file is created
-        let db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+        let db = crate::session_db_path(sid).unwrap();
         for side in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{side}", db.display()));
         }
@@ -905,7 +903,7 @@ mod tests {
         cmd_restore(&snap, &restored).unwrap();
         cmd_restore(&d1, &restored).unwrap();
         cmd_restore(&d2, &restored).unwrap();
-        let final_db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+        let final_db = crate::session_db_path(sid).unwrap();
         assert_eq!(db_bytes(&restored), db_bytes(&final_db));
     }
 
@@ -915,7 +913,7 @@ mod tests {
         let sid = "test-proj";
         let base = home.dir.0.join("base");
         build_session(sid, base.to_str().unwrap());
-        let db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+        let db = crate::session_db_path(sid).unwrap();
 
         let out = home.dir.0.join("w.ltx");
         cmd_backup(sid, None, &out, false).unwrap(); // initial snapshot
@@ -944,7 +942,7 @@ mod tests {
         cmd_restore(&out, &restored).unwrap();
         cmd_restore(&chain_path(&out, 1), &restored).unwrap();
         cmd_restore(&chain_path(&out, 2), &restored).unwrap();
-        let final_db = home.dir.0.join("home").join(".agentfs/run").join(sid).join("delta.db");
+        let final_db = crate::session_db_path(sid).unwrap();
         assert_eq!(db_bytes(&restored), db_bytes(&final_db));
     }
 
