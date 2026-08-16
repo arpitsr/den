@@ -30,6 +30,7 @@
 //!     nft egress policy + allowlist proxy (see PIT_PROXY_ALLOW); none = netns only,
 //!     full = host network (legacy)
 //!   PIT_PROXY_ALLOW=comma,list  extra egress allowlist entries for PIT_NET=proxy
+//!   PIT_PROXY_POLICY=path.yaml  egress allow/deny lists (see src/policy.rs); deny wins
 //!   PIT_HIDE=~/.a:~/.b  extra secrets to hide (colon-separated); PIT_NO_HIDE=~/.ssh restores
 //!   PIT_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
 //!   PIT_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)
@@ -52,6 +53,7 @@ mod fuse;
 #[cfg(target_os = "linux")]
 mod mount;
 #[cfg(target_os = "linux")]
+mod policy;
 mod proxy;
 #[cfg(target_os = "linux")]
 mod sandbox;
@@ -1196,7 +1198,7 @@ fn usage() -> String {
      pit ltx <file.ltx>         inspect/verify a backup file\n  \
      pit list                     list profiles\n  \
      pit selftest                 sanity check\n\n\
-env: PIT_NET=proxy|none|full  PIT_PROXY_ALLOW  PIT_HIDE/PIT_NO_HIDE  PIT_LIMIT_*  PIT_SECCOMP\n"
+env: PIT_NET=proxy|none|full  PIT_PROXY_ALLOW/PIT_PROXY_POLICY  PIT_HIDE/PIT_NO_HIDE  PIT_LIMIT_*  PIT_SECCOMP\n"
         .to_string()
 }
 

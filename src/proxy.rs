@@ -6,53 +6,16 @@
 //! nothing else, so all egress funnels through here.
 //!
 //! Supports CONNECT (the bulk of agent traffic) and absolute-form HTTP.
-//! Hosts are checked against a default allowlist + PIT_PROXY_ALLOW
-//! (comma-separated, exact or ".suffix"). If PIT_PROXY_UPSTREAM is set
-//! (the host's own proxy), requests chain through it.
+//! Hosts are checked against the egress policy (see policy.rs: built-in
+//! defaults + PIT_PROXY_POLICY yaml + PIT_PROXY_ALLOW). If
+//! PIT_PROXY_UPSTREAM is set (the host's own proxy), requests chain
+//! through it.
 
+use crate::policy::{self, EgressPolicy};
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::FromRawFd;
-use std::sync::Arc;
-
-/// Default egress allowlist (exact host or any subdomain).
-const DEFAULT_PROXY_ALLOW: &[&str] = &[
-    "anthropic.com",
-    "claude.ai",
-    "openai.com",
-    "chatgpt.com",
-    "oaiusercontent.com",
-    "oaistatic.com",
-    "googleapis.com",
-    "accounts.google.com",
-    "opencode.ai",
-    "gstatic.com",
-    "github.com",
-    "githubusercontent.com",
-    "githubassets.com",
-    "github.io",
-    "gitlab.com",
-    "bitbucket.org",
-    "npmjs.org",
-    "yarnpkg.com",
-    "nodejs.org",
-    "pypi.org",
-    "pythonhosted.org",
-    "crates.io",
-    "rust-lang.org",
-    "static.crates.io",
-    "index.crates.io",
-    "proxy.golang.org",
-    "golang.org",
-    "huggingface.co",
-    "docker.io",
-    "docker.com",
-    "registry-1.docker.io",
-    "archlinux.org",
-    "debian.org",
-    "ubuntu.com",
-];
 
 /// Exit immediately on termination signals (async-signal-safe).
 extern "C" fn proxy_exit(_sig: libc::c_int) {
@@ -83,26 +46,27 @@ pub fn run(listen_fd: libc::c_int) -> Result<()> {
     };
     listener.set_nonblocking(false)?;
 
-    let mut allow: Vec<String> = DEFAULT_PROXY_ALLOW.iter().map(|s| s.to_string()).collect();
-    if let Ok(extra) = std::env::var("PIT_PROXY_ALLOW") {
-        allow.extend(
-            extra
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string()),
-        );
-    }
-    let allow = Arc::new(allow);
+    let source = policy::local();
     let upstream = std::env::var("PIT_PROXY_UPSTREAM").ok();
 
     for conn in listener.incoming() {
         match conn {
             Ok(c) => {
-                let allow = Arc::clone(&allow);
+                // Fail closed: no policy, no egress.
+                let policy = match source.policy() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("proxy: policy: {}", e);
+                        let _ = (&c).write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        continue;
+                    }
+                };
                 let upstream = upstream.clone();
                 // SAFETY: detached threads own their sockets.
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_connection(c, &allow, upstream.as_deref()) {
+                    if let Err(e) = handle_connection(c, &policy, upstream.as_deref()) {
                         eprintln!("proxy: {}", e);
                     }
                 });
@@ -113,7 +77,7 @@ pub fn run(listen_fd: libc::c_int) -> Result<()> {
     Ok(())
 }
 
-fn handle_connection(client: TcpStream, allow: &[String], upstream: Option<&str>) -> Result<()> {
+fn handle_connection(client: TcpStream, policy: &EgressPolicy, upstream: Option<&str>) -> Result<()> {
     let mut reader = BufReader::new(client.try_clone()?);
     let head = read_head(&mut reader)?;
     let first = head.lines().next().context("empty request")?.to_string();
@@ -122,9 +86,9 @@ fn handle_connection(client: TcpStream, allow: &[String], upstream: Option<&str>
     let target = parts.next().unwrap_or("").to_string();
 
     if method == "CONNECT" {
-        handle_connect(target, reader, client, allow, upstream)
+        handle_connect(target, reader, client, policy, upstream)
     } else if target.starts_with("http://") {
-        handle_http(method, target, &head, reader, client, allow, upstream)
+        handle_http(method, target, &head, reader, client, policy, upstream)
     } else {
         bail!("unsupported request: {}", first)
     }
@@ -137,17 +101,17 @@ fn upstream_hostport(up: &str) -> &str {
     rest.split('/').next().unwrap_or(rest)
 }
 
-/// CONNECT host:port — allowlist check, then a raw TCP tunnel. Chains
+/// CONNECT host:port — policy check, then a raw TCP tunnel. Chains
 /// through the upstream proxy if one is configured.
 fn handle_connect(
     target: String,
     mut reader: BufReader<TcpStream>,
     mut client: TcpStream,
-    allow: &[String],
+    policy: &EgressPolicy,
     upstream: Option<&str>,
 ) -> Result<()> {
     let (host, port) = parse_authority(&target)?;
-    if let Err(e) = check_allowed(&host, allow) {
+    if let Err(e) = check_allowed(&host, policy) {
         let _ = client.write_all(
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
@@ -197,7 +161,7 @@ fn handle_connect(
     Ok(())
 }
 
-/// Absolute-form HTTP request: allowlist check, rebuild in origin-form (or
+/// Absolute-form HTTP request: policy check, rebuild in origin-form (or
 /// keep absolute-form for the upstream), single request per connection.
 fn handle_http(
     method: String,
@@ -205,11 +169,11 @@ fn handle_http(
     head: &str,
     reader: BufReader<TcpStream>,
     mut client: TcpStream,
-    allow: &[String],
+    policy: &EgressPolicy,
     upstream: Option<&str>,
 ) -> Result<()> {
     let url = parse_absolute_url(&target)?;
-    if let Err(e) = check_allowed(&url.host, allow) {
+    if let Err(e) = check_allowed(&url.host, policy) {
         let _ = client.write_all(
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
@@ -360,14 +324,13 @@ fn parse_absolute_url(url: &str) -> Result<Url> {
     Ok(Url { host, port, path })
 }
 
-/// Allowlist check: exact match or any subdomain.
-fn check_allowed(host: &str, allow: &[String]) -> Result<()> {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    if allow.iter().any(|d| h == *d || h.ends_with(&format!(".{}", d))) {
+/// Policy check with a 403-able error naming the escape hatches.
+fn check_allowed(host: &str, policy: &EgressPolicy) -> Result<()> {
+    if policy.allows(host) {
         Ok(())
     } else {
         bail!(
-            "host {} is not in the egress allowlist (extend with PIT_PROXY_ALLOW=comma,separated)",
+            "host {} denied by egress policy (extend: PIT_PROXY_ALLOW=comma,list or PIT_PROXY_POLICY=allow-deny.yaml)",
             host
         )
     }
