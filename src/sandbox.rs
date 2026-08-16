@@ -1,17 +1,17 @@
 //! Virtual-FS sandbox using FUSE and Linux namespaces — ported from the
 //! agentfs CLI (`cli/src/sandbox/linux.rs`, MIT) so pit no longer shells out.
 //!
-//! The session's SQLite DB (~/.agentfs/run/<sid>/delta.db) IS the filesystem:
-//! a FUSE mount serving it is placed on a hidden dir (~/.agentfs/run/<sid>/mnt),
+//! The session's SQLite DB (~/.pit/sessions/<sid>/fs.db) IS the filesystem:
+//! a FUSE mount serving it is placed on a hidden dir (~/.pit/sessions/<sid>/mnt),
 //! then a child with its own user+mount namespace bind-mounts it onto the cwd.
 //! Everything else is remounted read-only except an allowlist. New sessions
 //! start empty (or seeded via --seed in main.rs); resumed sessions open the
 //! DB and nothing else — the host tree under the mount is hidden and
 //! irrelevant. The SDK reads the DB back for the touched-this-run diff.
 //!
-//! The FUSE mount at ~/.agentfs/run/<sid>/mnt lives in *this* process's
+//! The FUSE mount at ~/.pit/sessions/<sid>/mnt lives in *this* process's
 //! namespace, so a second `pit` invocation with the same sid joins it —
-//! multiple terminals share one session's delta layer.
+//! multiple terminals share one session's fs.db.
 //!
 //! Process tree (PIT_NET != full):
 //!
@@ -321,7 +321,7 @@ pub async fn run_cmd(
         eprintln!("Warning: failed to restore cwd to {}", cwd.display());
     }
 
-    // Clean up the FUSE mountpoint dir (keep the delta DB).
+    // Clean up the FUSE mountpoint dir (keep the fs.db).
     if let Err(e) = fs::remove_dir_all(&session.fuse_mountpoint) {
         eprintln!(
             "Warning: Failed to clean up mountpoint {}: {}",
@@ -1675,21 +1675,21 @@ fn wait_status_to_exit_code(status: libc::c_int) -> i32 {
     }
 }
 
-/// A sandbox run session: delta DB path, FUSE mountpoint, base-path marker.
+/// A sandbox run session: fs.db path, FUSE mountpoint, base-path marker.
 struct RunSession {
     db_path: PathBuf,
     fuse_mountpoint: PathBuf,
     base_path_file: PathBuf,
 }
 
-/// Create the run directory (~/.agentfs/run/<sid>) with delta DB, mountpoint
-/// and base-path marker. Kept compatible with agentfs so sessions interop.
+/// Create the run directory (~/.pit/sessions/<sid>) with fs.db, mountpoint
+/// and base-path marker.
 fn setup_run_directory(session_id: &str) -> Result<RunSession> {
     let run_dir = run_dir()?;
     let run_dir = run_dir.join(session_id);
     fs::create_dir_all(&run_dir).context("Failed to create run directory")?;
 
-    let db_path = run_dir.join("delta.db");
+    let db_path = run_dir.join("fs.db");
     let fuse_mountpoint = run_dir.join("mnt");
     let base_path_file = run_dir.join("base_path");
     fs::create_dir_all(&fuse_mountpoint).context("Failed to create FUSE mountpoint")?;
