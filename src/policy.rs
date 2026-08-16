@@ -11,43 +11,9 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Built-in allowlist (exact host or any subdomain).
-const DEFAULT_ALLOW: &[&str] = &[
-    "anthropic.com",
-    "claude.ai",
-    "openai.com",
-    "chatgpt.com",
-    "oaiusercontent.com",
-    "oaistatic.com",
-    "googleapis.com",
-    "accounts.google.com",
-    "opencode.ai",
-    "gstatic.com",
-    "github.com",
-    "githubusercontent.com",
-    "githubassets.com",
-    "github.io",
-    "gitlab.com",
-    "bitbucket.org",
-    "npmjs.org",
-    "yarnpkg.com",
-    "nodejs.org",
-    "pypi.org",
-    "pythonhosted.org",
-    "crates.io",
-    "rust-lang.org",
-    "static.crates.io",
-    "index.crates.io",
-    "proxy.golang.org",
-    "golang.org",
-    "huggingface.co",
-    "docker.io",
-    "docker.com",
-    "registry-1.docker.io",
-    "archlinux.org",
-    "debian.org",
-    "ubuntu.com",
-];
+/// Built-in default policy, embedded so zero-config runs stay fail-safe
+/// even with no user file. Same schema as PIT_PROXY_POLICY files.
+const DEFAULT_YAML: &str = include_str!("default-egress.yaml");
 
 /// Allow/deny host lists. Deny wins over allow; entries match the host
 /// exactly or any of its subdomains.
@@ -99,10 +65,9 @@ pub fn local() -> Arc<dyn PolicySource> {
     struct Local;
     impl PolicySource for Local {
         fn policy(&self) -> Result<EgressPolicy> {
-            let mut p = EgressPolicy {
-                allow: DEFAULT_ALLOW.iter().map(|s| s.to_string()).collect(),
-                deny: Vec::new(),
-            };
+            // Static asset; a parse failure here is a build-time bug.
+            let mut p: EgressPolicy =
+                serde_yaml::from_str(DEFAULT_YAML).expect("default-egress.yaml");
             if let Ok(f) = std::env::var("PIT_PROXY_POLICY") {
                 p.merge(FilePolicy(f.into()).policy()?);
             }
@@ -123,6 +88,13 @@ pub fn local() -> Arc<dyn PolicySource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_default_parses() {
+        let p: EgressPolicy = serde_yaml::from_str(DEFAULT_YAML).unwrap();
+        assert!(p.allows("api.github.com"));
+        assert!(!p.allows("example.com"));
+    }
 
     #[test]
     fn deny_wins_subdomains_match() {
