@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-/// Options for mounting the overlay filesystem.
+/// Options for mounting the virtual filesystem.
 pub struct MountOpts {
     pub mountpoint: PathBuf,
     pub fsname: String,
@@ -22,7 +22,7 @@ pub struct MountOpts {
     pub timeout: Duration,
 }
 
-/// A mounted overlay; unmounts when dropped.
+/// A mounted virtual FS; unmounts when dropped.
 pub struct MountHandle {
     mountpoint: PathBuf,
     lazy_unmount: bool,
@@ -129,7 +129,7 @@ impl FileSystem for MutexFsAdapter {
     }
 }
 
-/// Mount the overlay filesystem at the mountpoint. The FUSE session runs on a
+/// Mount the virtual filesystem at the mountpoint. The FUSE session runs on a
 /// background thread; the mountpoint stays mounted until the handle drops
 /// (unmounting then is this process's job — the child's namespace only sees
 /// the bind-mounted cwd, which dies with the child).

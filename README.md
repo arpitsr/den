@@ -1,16 +1,22 @@
 # pit (Rust) — local coding agents, sandboxed, with typed SDK state
 
 A Rust binary that launches any local coding-agent CLI (`claude`, `codex`,
-`gemini`, `opencode`, `pi`, …) inside an OS-level sandbox (FUSE copy-on-write
-overlay + user/mount namespaces), and binds the `agentfs-sdk` crate for typed,
-in-process access to what the sandboxed agent did.
+`gemini`, `opencode`, `pi`, …) inside an OS-level sandbox (FUSE virtual
+filesystem + user/mount namespaces), and binds the `agentfs-sdk` crate for
+typed, in-process access to what the sandboxed agent did.
+
+The agent's whole filesystem is one SQLite file (`delta.db`). New sessions
+start empty — or seeded from a directory (`--seed`) — and resumed sessions
+open the DB and nothing else: the host tree is hidden behind the mount and
+irrelevant. Every session is self-contained and shippable to another machine
+(`pit backup` / `pit replicate` + `pit pull`).
 
 ## Design
 
 The sandbox layer is **in this binary** — no `agentfs` CLI dependency:
 
 - `src/sandbox.rs` — `fork`/`unshare` user+mount namespaces, uid/gid mapping,
-  `MS_REC|MS_PRIVATE`, bind-mount of the overlay onto the cwd, read-only
+  `MS_REC|MS_PRIVATE`, bind-mount of the virtual FS onto the cwd, read-only
   remount of everything else (small allowlist), exec, signal forwarding.
 - `src/proxy.rs` — egress allowlist proxy: the sandbox's only network path
   (via slirp4netns), CONNECT + absolute-form HTTP, chains to the host's own
@@ -28,17 +34,19 @@ mountpoints. The network is a fresh netns (slirp4netns → tap), nft policy
 (allowlist via the proxy, DNS to 10.0.2.3, everything else dropped), and a
 fresh `/dev`, `/tmp`, `/run`, `/var/tmp`.
 - `src/fuse.rs` + `src/mount.rs` — the FUSE filesystem (published `fuser`
-  crate) that serves the copy-on-write overlay. The current working directory
-  is the sandbox base: host files are read-only, every write is captured to a
-  SQLite delta DB, deletes become whiteouts.
+  crate) that serves the session's virtual filesystem. There is no host base
+  and no copy-on-write overlay: the SQLite DB *is* the filesystem, mounted
+  over the cwd. The agent sees a normal POSIX tree; the host directory
+  underneath is hidden and untouched.
 - The storage layer is `agentfs-sdk` (`AgentFS { kv, fs, tools }`): a
   POSIX-like filesystem, a key-value store, and a tool-call audit trail in
   one SQLite file at `~/.agentfs/run/<sid>/delta.db`.
 
-pit opens that DB in-process and surfaces a typed diff (`get_delta_paths` /
-`get_whiteouts` / `is_overlay_enabled`) and tool-call timeline
-(`tools.recent`). The session layout is identical to agentfs's, so existing
-agentfs sessions interoperate.
+pit snapshots the virtual FS before and after each run and reports what the
+run touched (added/modified/removed), plus the tool-call timeline
+(`tools.recent`) in `pit inspect`. The session layout is identical to
+agentfs's, so existing agentfs sessions interoperate (as plain trees, without
+their host base).
 
 If you want the SDK to *be* the sandbox (drop FUSE/namespaces, build an agent
 loop whose tools call `agent.fs.*` / `agent.kv.*` directly), that's a
@@ -66,16 +74,17 @@ cargo install --path .                         # installs a binary named `pit`
 ## Use
 
 ```bash
-cd /path/to/your/project     # this dir becomes the copy-on-write sandbox base
-pit claude "refactor auth"    # runs `claude` inside the sandbox; prints delta diff after
-pit codex  "fix the flaky test"
-pit pi     "..."
+cd /path/to/your/project
+pit claude --seed . "refactor auth"   # new session preloaded with the cwd; runs `claude` inside
+pit claude "continue the refactor"    # resumes: the DB is the whole FS, host tree ignored
+pit codex  "fix the flaky test"       # separate session per profile+dir
+pit pi     "..."                      # no --seed: starts in an empty virtual FS
 pit opencode
 pit list                      # configured profiles
 pit selftest                  # sanity-check argv assembly
-pit selftest --sandbox        # full round-trip: mount, delta, whiteouts, ro-enforcement
+pit selftest --sandbox        # full round-trip: seed, mount, vfs writes, ro-enforcement
 pit dump codex exec --json    # print the exact run argv (no exec)
-pit sessions                  # list persisted sessions with changed/deleted counts
+pit sessions                  # list persisted sessions with entry counts
 pit sessions --select         # show numbered sessions, choose one, print its id
 pit inspect [session-id]      # open a session's delta DB; omit id to choose interactively
 pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's delta DB
@@ -85,16 +94,24 @@ pit replicate [sid] [url]     # litestream daemon: stream the session's delta DB
 pit pull [sid] [url] [--force] [--to db]              # restore the session from its S3 replica
 ```
 
-The wrapped agent runs normally and sees its own working tree; writes land in
-the delta layer, not on disk. After the agent exits, `pit` opens the persisted
-delta DB via the SDK and prints a compact diff:
+The wrapped agent runs normally and sees the session's virtual tree; nothing
+touches the host disk. After the agent exits, `pit` diffs the virtual FS
+against the pre-run snapshot and prints what this run touched:
 
 ```
-pit: session codex-myproject — 3 changed, 1 deleted
-  + /src/auth.rs
+pit: session codex-myproject — 2 added, 1 modified, 1 removed this run
   + /src/auth_test.rs
+  M /src/auth.rs
   - README.md
 ```
+
+Sessions are born portable: `delta.db` always contains the complete tree, so
+`pit backup`/`replicate` + `pit pull` (or just copying the file) reproduces
+the exact environment on another machine or VM — no host checkout needed.
+
+Note: because resumed sessions see only the DB, host-side changes (`git pull`,
+IDE edits) are invisible to an existing session. Start a fresh one
+(`PIT_NEW=1`) when the world outside changes.
 
 ### Resume / fresh / quiet
 
@@ -124,16 +141,16 @@ same dir **resumes** the same sandbox (changes persist across calls).
 ### Inspecting sessions
 
 ```bash
-pit sessions                  # list ~/.agentfs/run/* with changed/deleted counts (via SDK)
+pit sessions                  # list ~/.agentfs/run/* with virtual-FS entry counts (via SDK)
 pit sessions --select         # number the list, prompt for a choice, print the selected id
-pit inspect [session-id]      # full diff +, deletions -, and tool-call timeline; omit id to select
+pit inspect [session-id]      # list the session's virtual FS + tool-call timeline; omit id to select
 pit rm [session-id]           # delete a session dir (unmounts stale FUSE mounts first; --select to pick)
 ```
 
 The tool-call timeline is only populated if the agent *itself* records tool calls
 through the `agentfs-sdk` (an agent you wrote). Wrapped CLIs like `claude`/`codex`
-leave it empty — for those, the useful SDK surface is the delta diff (what files
-the agent created/modified/deleted), which is typed and in-process.
+leave it empty — for those, the useful SDK surface is the touched-this-run diff
+and the virtual FS listing, which is typed and in-process.
 
 ### LTX backups
 
@@ -235,10 +252,10 @@ than a couple of custom agents, bring in a TOML config (`~/.config/pit/agents.to
 ```
 pit/
   Cargo.toml            agentfs-sdk 0.6.4, fuser (FUSE), tokio, anyhow, litetx, rusqlite
-  src/main.rs           profiles, argv assembly, run/inspect/sessions/dump/selftest
+  src/main.rs           profiles, argv assembly, seed/snapshot, run/inspect/sessions/dump/selftest
   src/sandbox.rs        fork/unshare namespaces, read-only remount, exec, signals
   src/proxy.rs          egress allowlist proxy (CONNECT + absolute-form HTTP)
-  src/fuse.rs           FUSE filesystem serving the COW overlay (fuser)
+  src/fuse.rs           FUSE filesystem serving the session's SQLite virtual FS (fuser)
   src/mount.rs          mount lifecycle (fusermount), MountHandle, helpers
   src/backup.rs         LTX backup/restore/inspect of session delta DBs (litetx + rusqlite)
   examples/mkdelta.rs   throwaway: builds a fake session delta DB via the SDK (used to test
