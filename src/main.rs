@@ -12,13 +12,13 @@
 //! report what this run touched.
 //!
 //! Usage:
-//!   pit <profile> [args...]      run the agent in the sandbox; print delta after
-//!   pit dump <profile> [args...] print the resolved sandbox plan (no exec)
+//!   pit <cmd> [args...]         run any agent CLI in the sandbox; print delta after
+//!   pit dump <cmd> [args...]    print the resolved sandbox plan (no exec)
 //!   pit inspect <session-id>     open a session's fs.db and show diff+timeline
 //!   pit sessions                 list persisted sessions under ~/.pit/sessions
 //!   pit replicate [sid] [url]    litestream daemon: stream the fs.db to S3 continuously
 //!   pit pull [sid] [url]         restore a session's fs.db from the litestream replica
-//!   pit list                     list configured profiles
+//!   pit list                     list known profiles (any other cmd works too)
 //!   pit selftest                 sanity-check argv assembly
 //!
 //! Env:
@@ -40,7 +40,7 @@
 
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT};
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -68,38 +68,29 @@ struct Profile {
     allows: Vec<String>, // extra host dirs to keep writable inside the sandbox
 }
 
-/// Built-in agent profiles. To add a custom agent, add a match arm (or bring
-/// back a TOML config when you have more than a couple — YAGNI for now).
-fn profile(name: &str) -> Option<Profile> {
-    let home = std::env::var("HOME").ok()?;
-    let cfg = || vec![format!("{home}/.config")];
-    Some(match name {
-        "claude" => Profile {
-            cmd: vec!["claude".into()],
-            allows: cfg(),
-        },
-        "codex" => Profile {
-            cmd: vec!["codex".into()],
-            allows: cfg(),
-        },
-        "gemini" => Profile {
-            cmd: vec!["gemini".into()],
-            allows: cfg(),
-        },
-        "pi" => Profile {
-            cmd: vec!["pi".into()],
-            allows: cfg().into_iter().chain([format!("{home}/.pi")]).collect(),
-        },
-        "opencode" => Profile {
-            cmd: vec!["opencode".into()],
-            allows: vec![format!("{home}/.config"), format!("{home}/.opencode")],
-        },
-        _ => return None,
-    })
+/// Profile for a command name. Every name is valid: known agents just get
+/// extra host dirs kept writable (`~/.config` is the default for all), and
+/// unknown ones run as-is — `pit any-cli args...` wraps any agent.
+fn profile(name: &str) -> Profile {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut allows = vec![format!("{home}/.config")];
+    let extra: &[&str] = match name {
+        "ak" => &[".ak"],
+        "pi" => &[".pi"],
+        "opencode" => &[".opencode"],
+        _ => &[],
+    };
+    allows.extend(extra.iter().map(|d| format!("{home}/{d}")));
+    Profile {
+        cmd: vec![name.into()],
+        allows,
+    }
 }
 
+/// Known agent names (for `pit list`); any other command works too — these
+/// are just the ones that get extra writable dirs in profile().
 fn list_profiles() -> Vec<&'static str> {
-    let mut v = ["claude", "codex", "gemini", "opencode", "pi"];
+    let mut v = ["ak", "claude", "codex", "gemini", "opencode", "pi"];
     v.sort();
     v.to_vec()
 }
@@ -346,12 +337,7 @@ fn effective_allows(p: &Profile) -> Vec<String> {
 /// The argv we exec inside the sandbox (command + passthrough). Used by run,
 /// dump, selftest.
 fn build_argv(profile_name: &str, passthrough: &[String]) -> Result<Vec<String>> {
-    let p = profile(profile_name).ok_or_else(|| {
-        anyhow!(
-            "unknown profile '{profile_name}' (defined: {})",
-            list_profiles().join(" ")
-        )
-    })?;
+    let p = profile(profile_name);
     let mut v = p.cmd.clone();
     // pi: default the session display name to the cwd slug so it's findable
     // in `pi -r`. Skip on resume/continue/session or an explicit --name —
@@ -538,7 +524,7 @@ fn cmd_run(
     // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
     // shadow the real agent binary via PATH ordering inside the sandbox.
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
-    let allows = effective_allows(&profile(profile_name).expect("profile checked by caller"));
+    let allows = effective_allows(&profile(profile_name));
     if autostart {
         spawn_watch(sid, auto_out.as_deref())?;
     }
@@ -914,7 +900,7 @@ fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
     let sid = session_id(profile_name);
     let mut argv = build_argv(profile_name, passthrough)?;
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
-    let allows = effective_allows(&profile(profile_name).expect("profile checked by caller"));
+    let allows = effective_allows(&profile(profile_name));
     println!("session: {sid}");
     println!("fs.db: {}", session_db_path(&sid)?.display());
     println!("command:  {}", argv.join(" "));
@@ -1265,9 +1251,9 @@ fn check_sandbox(cond: bool, expected: bool, what: &str) -> Result<()> {
 
 fn usage() -> String {
     "usage:\n  \
-     pit <profile> [args...]      run agent in the sandbox; --seed <dir> preloads a new session,\n  \
-                                  --autostart streams a backup watch\n  \
-     pit dump <profile> [args...] print the resolved sandbox plan (no exec)\n  \
+     pit <cmd> [args...]         run any agent CLI in the sandbox; --seed <dir> preloads a\n  \
+                                 new session, --autostart streams a backup watch\n  \
+     pit dump <cmd> [args...]    print the resolved sandbox plan (no exec)\n  \
      pit inspect [session-id]     list a session's virtual FS + timeline\n  \
      pit sessions [--select]      list persisted sessions, optionally choose one\n  \
      pit rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
@@ -1278,7 +1264,7 @@ fn usage() -> String {
      pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  LTX backup of a session's fs.db\n  \
      pit restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
      pit ltx <file.ltx>         inspect/verify a backup file\n  \
-     pit list                     list profiles\n  \
+     pit list                     list known profiles (any other cmd works too)\n  \
      pit selftest                 sanity check\n\n\
 env: PIT_NET=proxy|none|full  PIT_PROXY_ALLOW/PIT_PROXY_POLICY  PIT_HIDE/PIT_NO_HIDE  PIT_LIMIT_*  PIT_SECCOMP\n"
         .to_string()
@@ -1370,20 +1356,13 @@ fn main() -> Result<()> {
             }
         }
         [pname, passthrough @ ..] => {
-            if profile(pname).is_none() {
-                bail!(
-                    "unknown profile '{pname}' (defined: {}). {}",
-                    list_profiles().join(" "),
-                    if pname == "run" {
-                        "(did you mean: pit <profile>? run is implicit)"
-                    } else {
-                        ""
-                    }
-                );
+            // "run" is not a command name; the run is implicit (`pit claude`).
+            if pname == "run" {
+                bail!("pit run isn't a command — the run is implicit: pit <cmd> [args...]");
             }
             let (autostart, auto_out, seed, passthrough) = split_run_args(passthrough);
             let sid = session_id(pname);
-            let allows = effective_allows(&profile(pname).expect("profile checked above"));
+            let allows = effective_allows(&profile(pname));
             drop_stale_session(&sid, &allows)?;
             let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out, seed)?;
             std::process::exit(code);
@@ -1502,16 +1481,8 @@ fn cmd_restore_args(rest: &[String]) -> Result<()> {
 /// For `dump`: everything after `dump` is `<profile> [passthrough...]`.
 fn split_profile(rest: &[String]) -> Result<(String, Vec<String>)> {
     match rest {
-        [] => bail!("pit dump <profile> [args...]"),
-        [p, rest @ ..] => {
-            if profile(p).is_none() {
-                bail!(
-                    "unknown profile '{p}' (defined: {})",
-                    list_profiles().join(" ")
-                );
-            }
-            Ok((p.clone(), rest.to_vec()))
-        }
+        [] => bail!("pit dump <cmd> [args...]"),
+        [p, rest @ ..] => Ok((p.clone(), rest.to_vec())),
     }
 }
 
