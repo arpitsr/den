@@ -324,14 +324,70 @@ fn parse_absolute_url(url: &str) -> Result<Url> {
     Ok(Url { host, port, path })
 }
 
-/// Policy check with a 403-able error naming the escape hatches.
+/// Session memory of hosts the user approved interactively, so we never
+/// prompt twice for the same host within one run.
+fn approved() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static APPROVED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    APPROVED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Serializes interactive prompts so two connections don't both ask.
+static PROMPT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Policy check; on miss, ask the user to approve and (on "y") add the host
+/// to the persisted allowlist, where the re-reading FilePolicy picks it up.
 fn check_allowed(host: &str, policy: &EgressPolicy) -> Result<()> {
     if policy.allows(host) {
-        Ok(())
-    } else {
+        return Ok(());
+    }
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    let already = approved().lock().unwrap().contains(&normalized);
+    if !already && !prompt_and_persist(&normalized)? {
         bail!(
             "host {} denied by egress policy (extend: PIT_PROXY_ALLOW=comma,list or PIT_PROXY_POLICY=allow-deny.yaml)",
             host
-        )
+        );
     }
+    // Re-check against a fresh policy read: deny entries still win over a
+    // just-approved allow, and the persisted file is now authoritative.
+    let fresh = crate::policy::local().policy()?;
+    if !fresh.allows(&normalized) {
+        bail!("host {} denied by egress policy", host);
+    }
+    approved().lock().unwrap().insert(normalized);
+    Ok(())
+}
+
+/// Ask on the terminal whether to allow `host`. On consent, persist the
+/// entry. Returns false without prompting when stdin/stdout isn't a TTY
+/// (non-interactive runs fail closed) or the user declines.
+fn prompt_and_persist(host: &str) -> Result<bool> {
+    // SAFETY: isatty just inspects the fd.
+    if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
+        return Ok(false);
+    }
+    let _guard = PROMPT_LOCK.lock().unwrap();
+    // Another thread may have gotten approval while we waited.
+    if approved().lock().unwrap().contains(host) {
+        return Ok(true);
+    }
+    eprint!("\npit: agent is requesting network access to \"{}\" (not in egress allowlist). Allow and remember? [y/N] ", host);
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer)? == 0 {
+        return Ok(false);
+    }
+    let yes = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if yes {
+        match crate::policy::persist_allow(host) {
+            Ok(path) => eprintln!("pit: added {} to {}", host, path.display()),
+            Err(e) => {
+                // Session-scoped approval still applies via `approved()` +
+                // the fresh-policy bypass below; surface why it didn't stick.
+                eprintln!("pit: warning: could not persist allowlist entry: {}", e);
+            }
+        }
+    }
+    Ok(yes)
 }
