@@ -56,8 +56,7 @@ Linux with FUSE available (`fusermount3` or `fusermount` on `PATH` — the same
 runtime requirement agentfs has). macOS is not supported (no sandbox path; the
 binary bails with a clear message).
 
-Any agent CLI you wrap (`claude`/`codex`/`gemini`/`opencode`/`pi`) must already
-be installed and authed on your `PATH`.
+Any agent CLI you wrap must already be installed and authed on your `PATH`.
 
 ## Build & install
 
@@ -65,7 +64,7 @@ be installed and authed on your `PATH`.
 cd pit
 cargo build --release           # heavy first build: pulls turso + sync (~280 crates)
 # then either:
-cargo run --release -- <profile> [args...]     # from the project dir
+cargo run --release -- <cmd> [args...]          # from the project dir
 cargo install --path .                         # installs a binary named `pit`
 ```
 
@@ -78,7 +77,7 @@ pit claude "continue the refactor"    # resumes: the DB is the whole FS, host tr
 pit codex  "fix the flaky test"       # separate session per profile+dir
 pit pi     "..."                      # no --seed: starts in an empty virtual FS
 pit opencode
-pit list                      # configured profiles
+pit list                      # known profiles (any other CLI works: pit <cmd> args...)
 pit selftest                  # sanity-check argv assembly
 pit selftest --sandbox        # full round-trip: seed, mount, vfs writes, ro-enforcement
 pit dump codex exec --json    # print the exact run argv (no exec)
@@ -236,14 +235,14 @@ pit pull codex-myproject --force --to /tmp/db  # overwrite / restore elsewhere
   refuses to overwrite an existing DB unless `--force`. Don't pull into a
   session while its agent is still running — same hazard as LTX restore.
 
-## Profiles
+## Commands (profiles)
 
-Built into `src/main.rs` (`fn profile`): `claude`, `codex`, `gemini`, `opencode`,
-`pi`. Each maps to a command plus extra `--allow` host dirs (beyond the sandbox
-defaults: `~/.config`, `~/.cache`, `~/.local`, `~/.npm`, `~/.claude`, `~/.codex`,
-`~/.gemini`, `~/.amp`). To add a custom agent, add a match arm. When you have more
-than a couple of custom agents, bring in a TOML config (`~/.config/pit/agents.toml`)
-— YAGNI until then.
+Any first argument is the command to run: `pit anything args...` execs
+`anything args...` inside the sandbox. A few known agents get extra host dirs
+kept writable beyond the sandbox defaults (`~/.config`, `~/.cache`, `~/.local`,
+`~/.npm`, `~/.claude`, `~/.codex`, `~/.gemini`, `~/.amp`): `ak` (`.ak`),
+`pi` (`.pi`), `opencode` (`.opencode`) — see `fn profile` in `src/main.rs`.
+Unknown commands just get the defaults.
 
 ## Project layout
 

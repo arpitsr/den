@@ -93,6 +93,59 @@ pub fn local() -> Arc<dyn PolicySource> {
     Arc::new(Local)
 }
 
+/// Append `host` to the allow list of the user's egress policy file
+/// (PIT_PROXY_POLICY, else ./pit-egress.yaml in the project dir), creating
+/// it if needed. Returns the file written so the caller can tell the user.
+/// Existing comments/structure are preserved; the entry is appended to the
+/// `allow:` list (or a new one is added).
+pub fn persist_allow(host: &str) -> Result<PathBuf> {
+    let path = match std::env::var("PIT_PROXY_POLICY") {
+        Ok(f) => PathBuf::from(f),
+        Err(_) => std::env::current_dir()?.join("pit-egress.yaml"),
+    };
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    let mut out = String::with_capacity(existing.len() + 32);
+    let mut in_allow = false;
+    let mut appended = false;
+    for line in existing.lines() {
+        let trimmed = line.trim_end();
+        if trimmed == "allow:" || trimmed.starts_with("allow:") && !trimmed[6..].trim().is_empty() {
+            // Inline form ("allow: [a.com]") or block form — normalize to block.
+            if trimmed.ends_with(':') {
+                out.push_str(line);
+                out.push('\n');
+                out.push_str(&format!("  - {}\n", host));
+                appended = true;
+            } else {
+                out.push_str(&format!("allow:\n  - {}\n", host));
+                appended = true;
+            }
+            in_allow = trimmed.ends_with(':');
+            continue;
+        }
+        if in_allow {
+            if line.starts_with(' ') || line.starts_with('-') {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            in_allow = false;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !appended {
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&format!("allow:\n  - {}\n", host));
+    }
+    std::fs::write(&path, out)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
