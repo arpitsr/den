@@ -407,16 +407,85 @@ async fn seed_session(agent: &AgentFS, dir: &Path, git_dir: Option<&Path>) -> Re
     let mut count = seed_tree(agent, dir, PathBuf::new()).await?;
     if let Some(g) = git_dir {
         count += seed_tree(agent, g, PathBuf::from(".git")).await?;
+        scrub_git_config(agent).await?;
     }
     Ok(count)
 }
 
+/// The seeded `/.git` ships with the session (`den backup`), and remote URLs
+/// in `.git/config` often embed credentials — `https://user:token@host/x`.
+/// Strip userinfo from url lines so host secrets don't ride along in the
+/// session DB. No config, or config that isn't text: nothing to do.
+async fn scrub_git_config(agent: &AgentFS) -> Result<()> {
+    let Some(data) = agent.fs.read_file("/.git/config").await? else {
+        return Ok(());
+    };
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return Ok(());
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    for line in text.split_inclusive('\n') {
+        match scrub_url_creds(line) {
+            Some(s) => {
+                changed = true;
+                out.push_str(&s);
+            }
+            None => out.push_str(line),
+        }
+    }
+    if changed {
+        agent.fs.pwrite("/.git/config", 0, out.as_bytes()).await?;
+        if out.len() < data.len() {
+            agent.fs.truncate("/.git/config", out.len() as u64).await?;
+        }
+    }
+    Ok(())
+}
+
+/// One config line: `url = scheme://user:pass@host/...` loses the userinfo.
+/// None when the line needs no change. Guard against cutting path `@`s
+/// (`.../repo@v1`): only strip when the candidate userinfo contains no `/`.
+fn scrub_url_creds(line: &str) -> Option<String> {
+    let eq = line.find('=')?;
+    if !line[..eq].trim().eq_ignore_ascii_case("url") {
+        return None;
+    }
+    let val = line[eq + 1..].trim_start();
+    for scheme in ["https://", "http://", "ssh://", "git://"] {
+        let Some(rest) = val.strip_prefix(scheme) else {
+            continue;
+        };
+        let Some(at) = rest.find('@') else {
+            continue;
+        };
+        if rest[..at].contains('/') {
+            continue;
+        }
+        let head = &line[..line.len() - rest.len()]; // prefix incl. scheme
+        return Some(format!("{head}{}", &rest[at + 1..]));
+    }
+    None
+}
+
 /// Walk `host` into the virtual FS under `rel0` ("" seeds the tree at /).
+/// The walk only creates children — a non-empty `rel0` mountpoint must be
+/// mkdir'd here first, or its first child create fails.
 /// ponytail: whole-file reads; chunk pwrite if giant binaries ever matter.
 async fn seed_tree(agent: &AgentFS, host_root: &Path, rel0: PathBuf) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     let mut count = 0u64;
     let mut stack = vec![(host_root.to_path_buf(), rel0)]; // (host dir, vfs-relative)
+    if let Some(vfs) = stack[0].1.to_str().filter(|s| !s.is_empty()) {
+        let md = std::fs::metadata(host_root)?;
+        let vfs = format!("/{vfs}");
+        agent
+            .fs
+            .mkdir(&vfs, md.uid(), md.gid())
+            .await
+            .with_context(|| format!("seed: mkdir {vfs}"))?;
+        count += 1;
+    }
     while let Some((host, rel)) = stack.pop() {
         for entry in
             std::fs::read_dir(&host).with_context(|| format!("seed: read {}", host.display()))?
@@ -476,8 +545,8 @@ struct GitSeedCtx {
     toplevel: PathBuf,
     prefix: String,
     dirty: Vec<String>,
-    /// None on an unborn branch (fresh `git init`, no commits yet).
-    head: Option<String>,
+    /// False on an unborn branch (fresh `git init`, no commits yet).
+    has_head: bool,
 }
 
 /// Probe the seed dir for a git repo. Any failure — no `git` on PATH, not a
@@ -508,7 +577,7 @@ fn git_seed_ctx(dir: &Path) -> Option<GitSeedCtx> {
             .lines()
             .map(str::to_string)
             .collect(),
-        head: run(&["rev-parse", "--verify", "-q", "HEAD"]),
+        has_head: run(&["rev-parse", "--verify", "-q", "HEAD"]).is_some(),
     })
 }
 
@@ -580,7 +649,9 @@ fn extract_head_archive(ctx: &GitSeedCtx) -> Result<PathBuf> {
         .arg("-x")
         .arg("-C")
         .arg(&tmp)
-        .stdin(Stdio::from(arch.stdout.take().context("git archive stdout")?))
+        .stdin(Stdio::from(
+            arch.stdout.take().context("git archive stdout")?,
+        ))
         .stderr(Stdio::null())
         .status();
     let arch_st = arch.wait();
@@ -638,7 +709,7 @@ fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
     if include {
         return Ok(with_git(dir.into(), None, false));
     }
-    if ctx.head.is_none() {
+    if !ctx.has_head {
         return Ok(with_git(
             dir.into(),
             Some("unborn HEAD (no commits yet) — seeding worktree as-is".into()),
@@ -747,7 +818,13 @@ fn cmd_run(
         if fresh {
             if let Some(d) = &seed {
                 let rs = resolve_seed_source(d, dirty)?;
-                let n = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await?;
+                let n = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await;
+                if rs.temp {
+                    // Clean up whether seeding succeeded or failed — a `?`
+                    // above would otherwise leak the HEAD-extract temp dir.
+                    let _ = std::fs::remove_dir_all(&rs.src);
+                }
+                let n = n?;
                 eprintln!(
                     "den: seeded session {sid} with {n} entries from {}",
                     d.display()
@@ -757,9 +834,6 @@ fn cmd_run(
                 }
                 if let Some(x) = &rs.note {
                     eprintln!("den: {x}");
-                }
-                if rs.temp {
-                    let _ = std::fs::remove_dir_all(&rs.src);
                 }
             }
         } else if seed.is_some() {
@@ -807,7 +881,13 @@ fn cmd_run(
 /// are never eaten.
 fn split_run_args(
     rest: &[String],
-) -> (bool, Option<PathBuf>, Option<PathBuf>, Option<String>, Vec<String>) {
+) -> (
+    bool,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<String>,
+    Vec<String>,
+) {
     let autostart = rest.iter().any(|a| a == "--autostart");
     let mut out = None;
     let mut seed = None;
@@ -816,14 +896,14 @@ fn split_run_args(
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
-    "--seed" if rest.get(i + 1).is_some() => {
-        seed = Some(PathBuf::from(&rest[i + 1]));
-        i += 1;
-    }
-    "--seed-dirty" if rest.get(i + 1).is_some() => {
-        dirty = Some(rest[i + 1].clone());
-        i += 1;
-    }
+            "--seed" if rest.get(i + 1).is_some() => {
+                seed = Some(PathBuf::from(&rest[i + 1]));
+                i += 1;
+            }
+            "--seed-dirty" if rest.get(i + 1).is_some() => {
+                dirty = Some(rest[i + 1].clone());
+                i += 1;
+            }
             "--autostart" => {}
             "--out" if autostart && rest.get(i + 1).is_some() => {
                 out = Some(PathBuf::from(&rest[i + 1]));
@@ -1840,8 +1920,7 @@ mod tests {
         assert_eq!(pass, v(&["-y"]));
 
         // without --autostart, --out is not stripped (but --seed always is)
-        let (auto, out, seed, dirty, pass) =
-            split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
+        let (auto, out, seed, dirty, pass) = split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
         assert!(!auto && out.is_none());
         assert_eq!(seed.unwrap().to_str().unwrap(), ".");
         assert!(dirty.is_none());
@@ -1897,6 +1976,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), "committed\n").unwrap();
         git(&dir, "git init -q .");
+        git(
+            &dir,
+            "git remote add origin https://user:tok123@github.com/x/y.git",
+        );
         git(&dir, "git -c user.email=t@t -c user.name=t add a.txt");
         git(&dir, "git -c user.email=t@t -c user.name=t commit -qm init");
         std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
@@ -1922,8 +2005,15 @@ mod tests {
             let snap = snapshot_fs(&agent).await;
             assert!(snap.contains_key("/a.txt"));
             assert!(snap.contains_key("/.git/HEAD"));
+            // /.git ships with the session — its config url must arrive
+            // credential-free.
+            let cfg_raw = agent.fs.read_file("/.git/config").await?.unwrap();
+            let cfg = String::from_utf8_lossy(&cfg_raw);
+            assert!(cfg.contains("https://github.com/x/y.git"), "url: {cfg}");
+            assert!(!cfg.contains("tok123"), "credentials leaked: {cfg}");
             anyhow::Ok(())
         })
+        .unwrap()
         .unwrap();
 
         std::fs::remove_dir_all(&rs.src).unwrap();
