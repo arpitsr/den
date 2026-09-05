@@ -21,7 +21,10 @@ starts. When the dir is inside a git repo, seeding is git-aware:
   repo is never touched, and the copy ships with `den backup` like
   everything else in the session DB. (Only when the seed dir *is* the repo
   root — a subdir seed gets no `/.git`, since a root-level history would
-  mis-describe the partial tree.)
+  mis-describe the partial tree; linked worktrees and submodules, where
+  `.git` is a file, get no history either.) Remote URLs in `/.git/config`
+  have credentials (`user:pass@host`) stripped before seeding, so host
+  secrets don't ride along in the session DB.
 - If the worktree has uncommitted changes, `den` asks:
   `N uncommitted change(s) — seed them too? [y/N]`. The default is **N**:
   the session is then seeded from HEAD via `git archive`, so it holds
