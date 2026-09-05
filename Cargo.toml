@@ -1,11 +1,11 @@
 [package]
-name = "pit"
+name = "den"
 version = "0.1.0"
 edition = "2021"
 description = "Run any local coding-agent CLI inside an AgentFS sandbox, with typed SDK access to the resulting state."
 
 [[bin]]
-name = "pit"
+name = "den"
 path = "src/main.rs"
 
 [dependencies]

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Built-in default policy, embedded so zero-config runs stay fail-safe
-/// even with no user file. Same schema as PIT_PROXY_POLICY files.
+/// even with no user file. Same schema as DEN_PROXY_POLICY files.
 const DEFAULT_YAML: &str = include_str!("default-egress.yaml");
 
 /// Allow/deny host lists. Deny wins over allow; entries match the host
@@ -43,7 +43,7 @@ pub trait PolicySource: Send + Sync {
     fn policy(&self) -> Result<EgressPolicy>;
 }
 
-/// YAML allow/deny file (PIT_PROXY_POLICY, else ./pit-egress.yaml in the project):
+/// YAML allow/deny file (DEN_PROXY_POLICY, else ./den-egress.yaml in the project):
 ///
 /// ```yaml
 /// allow: [example.com]
@@ -60,9 +60,9 @@ impl PolicySource for FilePolicy {
 }
 
 /// Local policy resolution: built-in defaults + policy file +
-/// PIT_PROXY_ALLOW (comma-separated). File: PIT_PROXY_POLICY if set
-/// (explicit — unreadable fails closed), else pit-egress.yaml in the
-/// project dir if present (the proxy inherits pit's cwd). Base that a
+/// DEN_PROXY_ALLOW (comma-separated). File: DEN_PROXY_POLICY if set
+/// (explicit — unreadable fails closed), else den-egress.yaml in the
+/// project dir if present (the proxy inherits den's cwd). Base that a
 /// cloud source merges over.
 pub fn local() -> Arc<dyn PolicySource> {
     struct Local;
@@ -71,15 +71,15 @@ pub fn local() -> Arc<dyn PolicySource> {
             // Static asset; a parse failure here is a build-time bug.
             let mut p: EgressPolicy =
                 serde_yaml::from_str(DEFAULT_YAML).expect("default-egress.yaml");
-            if let Ok(f) = std::env::var("PIT_PROXY_POLICY") {
+            if let Ok(f) = std::env::var("DEN_PROXY_POLICY") {
                 p.merge(FilePolicy(f.into()).policy()?);
             } else {
-                let f = std::env::current_dir()?.join("pit-egress.yaml");
+                let f = std::env::current_dir()?.join("den-egress.yaml");
                 if f.exists() {
                     p.merge(FilePolicy(f).policy()?);
                 }
             }
-            if let Ok(extra) = std::env::var("PIT_PROXY_ALLOW") {
+            if let Ok(extra) = std::env::var("DEN_PROXY_ALLOW") {
                 p.allow.extend(
                     extra
                         .split(',')
@@ -94,14 +94,14 @@ pub fn local() -> Arc<dyn PolicySource> {
 }
 
 /// Append `host` to the allow list of the user's egress policy file
-/// (PIT_PROXY_POLICY, else ./pit-egress.yaml in the project dir), creating
+/// (DEN_PROXY_POLICY, else ./den-egress.yaml in the project dir), creating
 /// it if needed. Returns the file written so the caller can tell the user.
 /// Existing comments/structure are preserved; the entry is appended to the
 /// `allow:` list (or a new one is added).
 pub fn persist_allow(host: &str) -> Result<PathBuf> {
-    let path = match std::env::var("PIT_PROXY_POLICY") {
+    let path = match std::env::var("DEN_PROXY_POLICY") {
         Ok(f) => PathBuf::from(f),
-        Err(_) => std::env::current_dir()?.join("pit-egress.yaml"),
+        Err(_) => std::env::current_dir()?.join("den-egress.yaml"),
     };
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
@@ -141,8 +141,7 @@ pub fn persist_allow(host: &str) -> Result<PathBuf> {
         }
         out.push_str(&format!("allow:\n  - {}\n", host));
     }
-    std::fs::write(&path, out)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 
@@ -172,7 +171,7 @@ mod tests {
 
     #[test]
     fn file_policy_reads_yaml() {
-        let path = std::env::temp_dir().join(format!("pit-policy-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("den-policy-test-{}", std::process::id()));
         std::fs::write(&path, "allow: [a.com]\ndeny: [b.a.com]").unwrap();
         let p = FilePolicy(path.clone()).policy().unwrap();
         std::fs::remove_file(&path).ok();
