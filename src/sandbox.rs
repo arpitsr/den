@@ -1,22 +1,22 @@
 //! Virtual-FS sandbox using FUSE and Linux namespaces — ported from the
-//! agentfs CLI (`cli/src/sandbox/linux.rs`, MIT) so pit no longer shells out.
+//! agentfs CLI (`cli/src/sandbox/linux.rs`, MIT) so den no longer shells out.
 //!
-//! The session's SQLite DB (~/.pit/sessions/<sid>/fs.db) IS the filesystem:
-//! a FUSE mount serving it is placed on a hidden dir (~/.pit/sessions/<sid>/mnt),
+//! The session's SQLite DB (~/.den/sessions/<sid>/fs.db) IS the filesystem:
+//! a FUSE mount serving it is placed on a hidden dir (~/.den/sessions/<sid>/mnt),
 //! then a child with its own user+mount namespace bind-mounts it onto the cwd.
 //! Everything else is remounted read-only except an allowlist. New sessions
 //! start empty (or seeded via --seed in main.rs); resumed sessions open the
 //! DB and nothing else — the host tree under the mount is hidden and
 //! irrelevant. The SDK reads the DB back for the touched-this-run diff.
 //!
-//! The FUSE mount at ~/.pit/sessions/<sid>/mnt lives in *this* process's
-//! namespace, so a second `pit` invocation with the same sid joins it —
+//! The FUSE mount at ~/.den/sessions/<sid>/mnt lives in *this* process's
+//! namespace, so a second `den` invocation with the same sid joins it —
 //! multiple terminals share one session's fs.db.
 //!
-//! Process tree (PIT_NET != full):
+//! Process tree (DEN_NET != full):
 //!
-//!   M (pit, init userns, host netns)
-//!    ├─ P (pit proxy: host-side allowlist HTTP proxy, fd 3 = listener)
+//!   M (den, init userns, host netns)
+//!    ├─ P (den proxy: host-side allowlist HTTP proxy, fd 3 = listener)
 //!    └─ N (sandbox userns — maps "0 <host-uid> 1" so exec keeps root caps;
 //!         still in the host netns, so it can spawn slirp4netns which
 //!         setns()es into U's netns to create tap0)
@@ -30,15 +30,15 @@
 //!              N ->U  "net ready"   (slirp's --ready-fd: tap0 up + configured)
 //!              U ->N  agent pid (4 bytes, after A forks)
 //!
-//! Network (PIT_NET=proxy, the default): N runs
+//! Network (DEN_NET=proxy, the default): N runs
 //!   slirp4netns --configure --userns-path=/proc/U/ns/user \
 //!               --netns-type=path /proc/U/ns/net --ready-fd=FD tap0
 //! giving eth0 10.0.2.100/24. 10.0.2.2 = host loopback (the proxy P),
 //! 10.0.2.3 = DNS forwarder (resolv.conf is overridden to it). U then applies
 //! nft rules: allow lo, allow DNS to 10.0.2.3, allow TCP to 10.0.2.2 (the
 //! proxy), drop everything else — egress is impossible outside the proxy,
-//! and the proxy itself enforces an allowlist. PIT_NET=none keeps the netns
-//! but no slirp/nft; PIT_NET=full keeps the legacy behaviour (host network).
+//! and the proxy itself enforces an allowlist. DEN_NET=none keeps the netns
+//! but no slirp/nft; DEN_NET=full keeps the legacy behaviour (host network).
 
 use crate::mount::{mount_fs, MountOpts};
 use crate::run_dir;
@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-/// Network isolation mode (PIT_NET).
+/// Network isolation mode (DEN_NET).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NetMode {
     /// netns + slirp4netns + nft egress policy + local allowlist proxy
@@ -70,12 +70,12 @@ pub enum NetMode {
 
 impl NetMode {
     pub fn from_env() -> NetMode {
-        match std::env::var("PIT_NET").as_deref() {
+        match std::env::var("DEN_NET").as_deref() {
             Ok("none") => NetMode::None,
             Ok("full") => NetMode::Full,
             Ok("proxy") => NetMode::Proxy,
             Ok(other) => {
-                eprintln!("warning: unknown PIT_NET={} (proxy|none|full), using proxy", other);
+                eprintln!("warning: unknown DEN_NET={} (proxy|none|full), using proxy", other);
                 NetMode::Proxy
             }
             Err(_) => {
@@ -84,7 +84,7 @@ impl NetMode {
                 } else {
                     eprintln!(
                         "warning: slirp4netns and/or nft not found on PATH — falling back to \
-                         PIT_NET=full (shared host network, no egress policy)"
+                         DEN_NET=full (shared host network, no egress policy)"
                     );
                     NetMode::Full
                 }
@@ -142,7 +142,7 @@ const DEFAULT_ALLOWED_DIRS: &[&str] = &[
 ];
 
 /// Secrets hidden from the agent by default: shadowed by an empty tmpfs
-/// (dirs) or a /dev/null bind (files). PIT_NO_HIDE=~/.ssh restores.
+/// (dirs) or a /dev/null bind (files). DEN_NO_HIDE=~/.ssh restores.
 const DEFAULT_HIDE: &[&str] = &[
     ".ssh",
     ".aws",
@@ -247,7 +247,7 @@ pub async fn run_cmd(
     args: Vec<String>,
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
-    if std::env::var("PIT_SANDBOX_DEBUG").is_ok() {
+    if std::env::var("DEN_SANDBOX_DEBUG").is_ok() {
         eprintln!("sandbox: cwd={} sid={}", cwd.display(), session_id);
     }
     let allowed_paths = build_allowed_paths(&allow)?;
@@ -257,7 +257,7 @@ pub async fn run_cmd(
     // Same layout as agentfs: if the FUSE mountpoint is already mounted, join
     // the running session instead of starting a second overlay.
     if crate::mount::is_mountpoint(&session.fuse_mountpoint) {
-        if std::env::var("PIT_SANDBOX_DEBUG").is_ok() {
+        if std::env::var("DEN_SANDBOX_DEBUG").is_ok() {
             eprintln!("sandbox: joining existing session");
         }
         let overlay_base = std::fs::read_to_string(&session.base_path_file)
@@ -315,7 +315,7 @@ pub async fn run_cmd(
     );
 
     // Drop the mount handle to unmount. Drop chdir's to "/" first (unmount
-    // EBUSY guard), so restore the caller's cwd after — pit lives on for the
+    // EBUSY guard), so restore the caller's cwd after — den lives on for the
     // next run, unlike the agentfs CLI which exits here.
     drop(mount_handle);
     if std::env::set_current_dir(&cwd).is_err() {
@@ -628,7 +628,7 @@ fn run_ns_holder(
     unsafe { libc::_exit(code) }
 }
 
-/// Spawn `pit proxy` with the listener on fd 3. Returns its pid.
+/// Spawn `den proxy` with the listener on fd 3. Returns its pid.
 fn spawn_proxy() -> Result<libc::pid_t> {
     // Chain to the host's own proxy if one is set (e.g. a mitm wrapper).
     let host_proxy = [
@@ -637,21 +637,21 @@ fn spawn_proxy() -> Result<libc::pid_t> {
     .iter()
     .find_map(|v| std::env::var(v).ok());
     if let Some(u) = host_proxy {
-        std::env::set_var("PIT_PROXY_UPSTREAM", u);
+        std::env::set_var("DEN_PROXY_UPSTREAM", u);
     }
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let fd = listener.as_raw_fd();
     let port = listener.local_addr()?.port();
-    let exe = std::env::current_exe().context("Failed to get pit executable path")?;
+    let exe = std::env::current_exe().context("Failed to get den executable path")?;
 
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("proxy");
-    if let Ok(upstream) = std::env::var("PIT_PROXY_UPSTREAM") {
-        cmd.env("PIT_PROXY_UPSTREAM", upstream);
+    if let Ok(upstream) = std::env::var("DEN_PROXY_UPSTREAM") {
+        cmd.env("DEN_PROXY_UPSTREAM", upstream);
     }
-    if let Ok(extra) = std::env::var("PIT_PROXY_ALLOW") {
-        cmd.env("PIT_PROXY_ALLOW", extra);
+    if let Ok(extra) = std::env::var("DEN_PROXY_ALLOW") {
+        cmd.env("DEN_PROXY_ALLOW", extra);
     }
     // Pass the listener on fd 3 (dup2 clears CLOEXEC there).
     // SAFETY: pre_exec runs in the child before exec; dup2/fcntl are safe.
@@ -665,7 +665,7 @@ fn spawn_proxy() -> Result<libc::pid_t> {
     let child = cmd.spawn().context("Failed to spawn proxy")?;
 
     // The sandbox reaches the proxy at 10.0.2.2 (slirp's host loopback alias).
-    std::env::set_var("PIT_PROXY_URL", format!("http://10.0.2.2:{}", port));
+    std::env::set_var("DEN_PROXY_URL", format!("http://10.0.2.2:{}", port));
     Ok(child.id() as libc::pid_t)
 }
 
@@ -799,7 +799,7 @@ fn run_sandbox_child(
     }
 
     // Step 3: hostname + private mounts.
-    let hn = CString::new("pit").unwrap();
+    let hn = CString::new("den").unwrap();
     // SAFETY: sethostname with a valid buffer.
     unsafe {
         libc::sethostname(hn.as_ptr() as *const libc::c_char, 3);
@@ -935,7 +935,7 @@ fn run_sandbox_child(
     apply_hides(cwd);
 
     // Step 13: fork the agent (pid 1 of the pid namespace).
-    if std::env::var("PIT_SANDBOX_DEBUG").is_ok() {
+    if std::env::var("DEN_SANDBOX_DEBUG").is_ok() {
         if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
             for line in s.lines() {
                 if line.starts_with("VmSize") || line.starts_with("VmRSS") || line.starts_with("VmData") {
@@ -1061,7 +1061,7 @@ fn run_agent_exec(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
         child_exit("Failed to set no_new_privs");
     }
 
-    if std::env::var("PIT_SECCOMP").as_deref() != Ok("0") {
+    if std::env::var("DEN_SECCOMP").as_deref() != Ok("0") {
         if let Err(e) = install_seccomp() {
             child_exit(&format!("Failed to install seccomp filter: {}", e));
         }
@@ -1183,13 +1183,13 @@ fn bind_mount_fd(fd: libc::c_int, dst: &str) {
 /// nft egress policy (proxy mode): lo + DNS via 10.0.2.3 + TCP to 10.0.2.2
 /// (the proxy) are allowed; everything else drops at the netns boundary.
 fn apply_nft_rules() -> Result<()> {
-    let rules = "table inet pit {
+    let rules = "table inet den {
   chain input { type filter hook input priority 0; policy drop; iifname \"lo\" accept; ct state established,related accept; }
   chain output { type filter hook output priority 0; policy drop; oifname \"lo\" accept; udp dport 53 ip daddr 10.0.2.3 accept; tcp dport 53 ip daddr 10.0.2.3 accept; ip daddr 10.0.2.2 accept; }
   chain forward { type filter hook forward priority 0; policy drop; }
 }
 ";
-    let path = format!("/tmp/pit-nft-{}.rules", std::process::id());
+    let path = format!("/tmp/den-nft-{}.rules", std::process::id());
     fs::write(&path, rules).context("Failed to write nft rules")?;
     let status = std::process::Command::new("nft")
         .arg("-f")
@@ -1325,7 +1325,7 @@ fn unescape_mount_path(s: &str) -> String {
     out
 }
 
-/// The effective hide list: DEFAULT_HIDE + PIT_HIDE - PIT_NO_HIDE, resolved
+/// The effective hide list: DEFAULT_HIDE + DEN_HIDE - DEN_NO_HIDE, resolved
 /// against HOME ("~/x" or relative → HOME, absolute kept as-is).
 fn effective_hides() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -1347,12 +1347,12 @@ fn effective_hides() -> Vec<PathBuf> {
     for d in DEFAULT_HIDE {
         add(d);
     }
-    if let Ok(extra) = std::env::var("PIT_HIDE") {
+    if let Ok(extra) = std::env::var("DEN_HIDE") {
         for p in extra.split(':').filter(|s| !s.is_empty()) {
             add(p);
         }
     }
-    if let Ok(no) = std::env::var("PIT_NO_HIDE") {
+    if let Ok(no) = std::env::var("DEN_NO_HIDE") {
         for p in no.split(':').filter(|s| !s.is_empty()) {
             let pb = if p.starts_with("~/") {
                 Path::new(&home).join(&p[2..])
@@ -1609,14 +1609,14 @@ fn setup_env_vars(session_id: &str) {
     std::env::set_var("AGENTFS_SESSION", session_id);
     std::env::set_var("PS1", "🤖 \\u@\\h:\\w\\$ ");
 
-    // PIT_PROXY_UPSTREAM holds the host's own proxy URL (possibly with
-    // credentials) — the pit proxy's secret, not the agent's. The proxy
+    // DEN_PROXY_UPSTREAM holds the host's own proxy URL (possibly with
+    // credentials) — the den proxy's secret, not the agent's. The proxy
     // child gets it explicitly via env in spawn_proxy, so drop it here.
-    std::env::remove_var("PIT_PROXY_UPSTREAM");
+    std::env::remove_var("DEN_PROXY_UPSTREAM");
 
     // Proxy mode: route everything through the sandbox proxy at 10.0.2.2
-    // (PIT_PROXY_URL is set by M before the fork; inherited down the chain).
-    if let Ok(proxy_url) = std::env::var("PIT_PROXY_URL") {
+    // (DEN_PROXY_URL is set by M before the fork; inherited down the chain).
+    if let Ok(proxy_url) = std::env::var("DEN_PROXY_URL") {
         for v in [
             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
             "NO_PROXY", "no_proxy",
@@ -1683,7 +1683,7 @@ struct RunSession {
     base_path_file: PathBuf,
 }
 
-/// Create the run directory (~/.pit/sessions/<sid>) with fs.db, mountpoint
+/// Create the run directory (~/.den/sessions/<sid>) with fs.db, mountpoint
 /// and base-path marker.
 fn setup_run_directory(session_id: &str) -> Result<RunSession> {
     let run_dir = run_dir()?;
@@ -1814,10 +1814,10 @@ fn child_exit(msg: &str) -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// rlimits (PIT_LIMIT_*)
+// rlimits (DEN_LIMIT_*)
 // ---------------------------------------------------------------------------
 
-/// What a PIT_LIMIT_* env var says.
+/// What a DEN_LIMIT_* env var says.
 enum Lim {
     Unset,
     Unlimited,
@@ -1848,7 +1848,7 @@ fn parse_limit(name: &str) -> Lim {
     }
 }
 
-/// Resolve a PIT_LIMIT_* var: default when unset, None for "unlimited"
+/// Resolve a DEN_LIMIT_* var: default when unset, None for "unlimited"
 /// (leave the inherited limit alone).
 fn lim_value(name: &str, default: u64) -> Option<u64> {
     match parse_limit(name) {
@@ -1859,7 +1859,7 @@ fn lim_value(name: &str, default: u64) -> Option<u64> {
 }
 
 /// Apply rlimits to the agent: hard defaults (core 0, fsize 8G, nofile 4096,
-/// nproc 1024) overridable via PIT_LIMIT_FSIZE / _NOFILE / _NPROC / _AS /
+/// nproc 1024) overridable via DEN_LIMIT_FSIZE / _NOFILE / _NPROC / _AS /
 /// _CPU ("unlimited" or K/M/G suffixed values).
 fn apply_rlimits() {
     // SAFETY: setrlimit with a valid struct.
@@ -1880,24 +1880,24 @@ fn apply_rlimits() {
                 libc::setrlimit(res, &rl);
             }
         };
-        apply(libc::RLIMIT_FSIZE, lim_value("PIT_LIMIT_FSIZE", 8u64 << 30));
+        apply(libc::RLIMIT_FSIZE, lim_value("DEN_LIMIT_FSIZE", 8u64 << 30));
         apply(
             libc::RLIMIT_NOFILE,
-            lim_value("PIT_LIMIT_NOFILE", 4096).map(|v| v.min(1048576)),
+            lim_value("DEN_LIMIT_NOFILE", 4096).map(|v| v.min(1048576)),
         );
         apply(
             libc::RLIMIT_NPROC,
-            lim_value("PIT_LIMIT_NPROC", 1024).map(|v| v.min(1048576)),
+            lim_value("DEN_LIMIT_NPROC", 1024).map(|v| v.min(1048576)),
         );
         // AS/CPU: only when explicitly set (default: inherited, i.e. unlimited).
-        if let Lim::Bytes(n) = parse_limit("PIT_LIMIT_AS") {
+        if let Lim::Bytes(n) = parse_limit("DEN_LIMIT_AS") {
             let rl = libc::rlimit {
                 rlim_cur: n,
                 rlim_max: n,
             };
             libc::setrlimit(libc::RLIMIT_AS, &rl);
         }
-        if let Lim::Bytes(n) = parse_limit("PIT_LIMIT_CPU") {
+        if let Lim::Bytes(n) = parse_limit("DEN_LIMIT_CPU") {
             let rl = libc::rlimit {
                 rlim_cur: n,
                 rlim_max: n,
@@ -1908,7 +1908,7 @@ fn apply_rlimits() {
 }
 
 // ---------------------------------------------------------------------------
-// seccomp (PIT_SECCOMP=0 disables)
+// seccomp (DEN_SECCOMP=0 disables)
 // ---------------------------------------------------------------------------
 
 /// Install a deny-list seccomp filter (x86_64): namespace/init-syscall

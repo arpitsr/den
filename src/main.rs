@@ -1,10 +1,10 @@
-//! pit — run any local coding-agent CLI inside an AgentFS sandbox, with typed
+//! den — run any local coding-agent CLI inside an AgentFS sandbox, with typed
 //! SDK access to what it did.
 //!
 //! The sandbox is in-process (src/sandbox.rs, ported from the agentfs CLI,
 //! MIT): a FUSE mount (src/fuse.rs, via the published `fuser` crate) serves
 //! the session's virtual filesystem — a SQLite DB at
-//! ~/.pit/sessions/<sid>/fs.db that IS the whole filesystem (no host base,
+//! ~/.den/sessions/<sid>/fs.db that IS the whole filesystem (no host base,
 //! no overlay). New sessions start empty or seeded from a dir (`--seed`);
 //! resumed sessions open the DB and nothing else. A fork+unshare child gets
 //! a fresh user+mount namespace with the rest of the filesystem read-only.
@@ -12,31 +12,31 @@
 //! report what this run touched.
 //!
 //! Usage:
-//!   pit <cmd> [args...]         run any agent CLI in the sandbox; print delta after
-//!   pit dump <cmd> [args...]    print the resolved sandbox plan (no exec)
-//!   pit inspect <session-id>     open a session's fs.db and show diff+timeline
-//!   pit sessions                 list persisted sessions under ~/.pit/sessions
-//!   pit replicate [sid] [url]    litestream daemon: stream the fs.db to S3 continuously
-//!   pit pull [sid] [url]         restore a session's fs.db from the litestream replica
-//!   pit list                     list known profiles (any other cmd works too)
-//!   pit selftest                 sanity-check argv assembly
+//!   den <cmd> [args...]         run any agent CLI in the sandbox; print delta after
+//!   den dump <cmd> [args...]    print the resolved sandbox plan (no exec)
+//!   den inspect <session-id>     open a session's fs.db and show diff+timeline
+//!   den sessions                 list persisted sessions under ~/.den/sessions
+//!   den replicate [sid] [url]    litestream daemon: stream the fs.db to S3 continuously
+//!   den pull [sid] [url]         restore a session's fs.db from the litestream replica
+//!   den list                     list known profiles (any other cmd works too)
+//!   den selftest                 sanity-check argv assembly
 //!
 //! Env:
-//!   PIT_SESSION=<id>  reuse/resume this session id (default <profile>-<cwd-slug>)
-//!   PIT_NEW=1         start a fresh unique session id like <profile>-<cwd-slug>-<5 chars>
-//!   PIT_QUIET=1       don't print the post-run delta summary
-//!   PIT_LITESTREAM=<bin>  path to the litestream binary (default: litestream on PATH)
-//!   PIT_REPLICA=<url>    replica URL (default: LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET)
-//!   PIT_DETACHED=1  (internal) spawned detached by --autostart; survives Ctrl-C on the run
-//!   PIT_NET=proxy|none|full  network isolation (default proxy): slirp4netns netns +
-//!     nft egress policy + allowlist proxy (see PIT_PROXY_ALLOW); none = netns only,
+//!   DEN_SESSION=<id>  reuse/resume this session id (default <profile>-<cwd-slug>)
+//!   DEN_NEW=1         start a fresh unique session id like <profile>-<cwd-slug>-<5 chars>
+//!   DEN_QUIET=1       don't print the post-run delta summary
+//!   DEN_LITESTREAM=<bin>  path to the litestream binary (default: litestream on PATH)
+//!   DEN_REPLICA=<url>    replica URL (default: LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET)
+//!   DEN_DETACHED=1  (internal) spawned detached by --autostart; survives Ctrl-C on the run
+//!   DEN_NET=proxy|none|full  network isolation (default proxy): slirp4netns netns +
+//!     nft egress policy + allowlist proxy (see DEN_PROXY_ALLOW); none = netns only,
 //!     full = host network (legacy)
-//!   PIT_PROXY_ALLOW=comma,list  extra egress allowlist entries for PIT_NET=proxy
-//!   PIT_PROXY_POLICY=path.yaml  egress allow/deny lists (else ./pit-egress.yaml if present;
+//!   DEN_PROXY_ALLOW=comma,list  extra egress allowlist entries for DEN_NET=proxy
+//!   DEN_PROXY_POLICY=path.yaml  egress allow/deny lists (else ./den-egress.yaml if present;
 //!     schema: src/default-egress.yaml); deny wins
-//!   PIT_HIDE=~/.a:~/.b  extra secrets to hide (colon-separated); PIT_NO_HIDE=~/.ssh restores
-//!   PIT_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
-//!   PIT_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)
+//!   DEN_HIDE=~/.a:~/.b  extra secrets to hide (colon-separated); DEN_NO_HIDE=~/.ssh restores
+//!   DEN_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
+//!   DEN_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)
 
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT};
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
@@ -70,7 +70,7 @@ struct Profile {
 
 /// Profile for a command name. Every name is valid: known agents just get
 /// extra host dirs kept writable (`~/.config` is the default for all), and
-/// unknown ones run as-is — `pit any-cli args...` wraps any agent.
+/// unknown ones run as-is — `den any-cli args...` wraps any agent.
 fn profile(name: &str) -> Profile {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut allows = vec![format!("{home}/.config")];
@@ -87,7 +87,7 @@ fn profile(name: &str) -> Profile {
     }
 }
 
-/// Known agent names (for `pit list`); any other command works too — these
+/// Known agent names (for `den list`); any other command works too — these
 /// are just the ones that get extra writable dirs in profile().
 fn list_profiles() -> Vec<&'static str> {
     let mut v = ["ak", "claude", "codex", "gemini", "opencode", "pi"];
@@ -136,21 +136,21 @@ fn random_suffix(len: usize) -> String {
         .collect()
 }
 
-/// session id: PIT_SESSION wins, else PIT_NEW=1 -> fresh k8s-style id, else <profile>-<cwd-slug>
+/// session id: DEN_SESSION wins, else DEN_NEW=1 -> fresh k8s-style id, else <profile>-<cwd-slug>
 fn session_id(profile: &str) -> String {
-    if let Ok(s) = std::env::var("PIT_SESSION") {
+    if let Ok(s) = std::env::var("DEN_SESSION") {
         if !s.is_empty() {
             return s;
         }
     }
-    if std::env::var("PIT_NEW").as_deref() == Ok("1") {
+    if std::env::var("DEN_NEW").as_deref() == Ok("1") {
         return format!("{}-{}-{}", profile, slug(&cwd_string()), random_suffix(5));
     }
     format!("{}-{}", profile, slug(&cwd_string()))
 }
 
 fn litestream_bin() -> String {
-    std::env::var("PIT_LITESTREAM").unwrap_or_else(|_| "litestream".to_string())
+    std::env::var("DEN_LITESTREAM").unwrap_or_else(|_| "litestream".to_string())
 }
 
 /// true if `bin` is an existing path itself, or resolves on PATH
@@ -181,14 +181,14 @@ fn resolve_bin(bin: &str) -> PathBuf {
 }
 
 /// Replica URL for a session's fs.db: explicit arg wins, then
-/// PIT_REPLICA, then LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET with a
+/// DEN_REPLICA, then LITESTREAM_REPLICA_URL, then LITESTREAM_BUCKET with a
 /// per-session path. Credentials are litestream's business (AWS_*/LITESTREAM_*
 /// env vars — command-line mode, see https://litestream.io/reference/replicate/).
 fn replica_url(sid: &str, explicit: Option<&str>) -> Result<String> {
     if let Some(u) = explicit {
         return Ok(u.to_string());
     }
-    for var in ["PIT_REPLICA", "LITESTREAM_REPLICA_URL"] {
+    for var in ["DEN_REPLICA", "LITESTREAM_REPLICA_URL"] {
         if let Ok(u) = std::env::var(var) {
             if !u.is_empty() {
                 return Ok(u);
@@ -201,7 +201,7 @@ fn replica_url(sid: &str, explicit: Option<&str>) -> Result<String> {
         }
     }
     bail!(
-        "no replica configured — set PIT_REPLICA=s3://bucket/path, \
+        "no replica configured — set DEN_REPLICA=s3://bucket/path, \
          LITESTREAM_REPLICA_URL, or LITESTREAM_BUCKET"
     )
 }
@@ -211,10 +211,10 @@ fn litestream_autostart(sid: &str) -> bool {
     bin_found(&litestream_bin()) && replica_url(sid, None).is_ok()
 }
 
-/// ~/.pit/sessions — where sessions (and their fs.db files) persist
+/// ~/.den/sessions — where sessions (and their fs.db files) persist
 pub(crate) fn run_dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(".pit/sessions"))
+    Ok(PathBuf::from(home).join(".den/sessions"))
 }
 
 fn cwd_string() -> String {
@@ -243,9 +243,9 @@ fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
 ///   config changed, fs.db has work -> archive (rename aside), never delete
 ///
 /// "Config" = cwd + effective --allow list, stamped to .stamps/<sid>.
-/// PIT_NO_DROP=1 keeps the old join-blind behaviour.
+/// DEN_NO_DROP=1 keeps the old join-blind behaviour.
 fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
-    if std::env::var("PIT_NO_DROP").as_deref() == Ok("1") {
+    if std::env::var("DEN_NO_DROP").as_deref() == Ok("1") {
         return Ok(());
     }
     let run_dir = run_dir()?;
@@ -259,7 +259,7 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
         }
         unmount_stale(&dir.join("mnt"));
         if session_has_changes(&dir) {
-            // ponytail: archives are never GC'd — rm ~/.pit/sessions/*.archived-* by hand
+            // ponytail: archives are never GC'd — rm ~/.den/sessions/*.archived-* by hand
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -267,10 +267,10 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
             let name = format!("{sid}.archived-{ts}");
             std::fs::rename(&dir, run_dir.join(&name))
                 .with_context(|| format!("archive session {sid}"))?;
-            eprintln!("pit: config changed — archived previous session as {name} (pit inspect {name} to view)");
+            eprintln!("den: config changed — archived previous session as {name} (den inspect {name} to view)");
         } else {
             std::fs::remove_dir_all(&dir).with_context(|| format!("drop stale session {sid}"))?;
-            eprintln!("pit: dropped stale session {sid} (config changed, nothing to keep)");
+            eprintln!("den: dropped stale session {sid} (config changed, nothing to keep)");
         }
     }
 
@@ -366,7 +366,7 @@ fn build_argv(profile_name: &str, passthrough: &[String]) -> Result<Vec<String>>
 }
 
 // ---- AgentFS SDK: open a persisted session fs.db --------------------------
-/// ~/.pit/sessions/<sid>/fs.db — the session's persisted virtual filesystem
+/// ~/.den/sessions/<sid>/fs.db — the session's persisted virtual filesystem
 pub(crate) fn session_db_path(sid: &str) -> Result<PathBuf> {
     Ok(run_dir()?.join(sid).join("fs.db"))
 }
@@ -452,7 +452,7 @@ async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i64)> {
 /// compact post-run summary: what this run touched in the virtual FS
 /// (added/modified/removed vs the pre-run snapshot) + capped listing
 async fn print_run_summary(sid: &str, before: &HashMap<String, (i64, u32, i64)>) {
-    if std::env::var("PIT_QUIET").as_deref() == Ok("1") {
+    if std::env::var("DEN_QUIET").as_deref() == Ok("1") {
         return;
     }
     let agent = match open_session(sid).await {
@@ -512,10 +512,10 @@ fn cmd_run(
         if fresh {
             if let Some(d) = &seed {
                 let n = seed_session(&agent, d).await?;
-                eprintln!("pit: seeded session {sid} with {n} entries from {}", d.display());
+                eprintln!("den: seeded session {sid} with {n} entries from {}", d.display());
             }
         } else if seed.is_some() {
-            eprintln!("pit: session {sid} already exists — --seed ignored (PIT_NEW=1 for a fresh session)");
+            eprintln!("den: session {sid} already exists — --seed ignored (DEN_NEW=1 for a fresh session)");
         }
         anyhow::Ok(snapshot_fs(&agent).await)
     })??;
@@ -546,7 +546,7 @@ fn cmd_run(
         // ponytail: the macOS NFS+sandbox-exec path was not ported; the FUSE
         // sandbox is Linux-only. Re-add when macOS matters (port cli/src/sandbox/darwin.rs).
         let _ = (allows, &argv);
-        bail!("pit's in-process sandbox is Linux-only; run pit on Linux")
+        bail!("den's in-process sandbox is Linux-only; run den on Linux")
     };
     // The agent has exited and the session DB is persisted — diff the
     // virtual FS against the pre-run snapshot.
@@ -554,7 +554,7 @@ fn cmd_run(
     Ok(code)
 }
 
-/// Strip pit's own flags from a run's passthrough args (the rest go to the
+/// Strip den's own flags from a run's passthrough args (the rest go to the
 /// agent): `--seed <dir>` always, `--autostart [--out <base.ltx>]` only when
 /// --autostart is present, so plain agent args are never eaten.
 fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Option<PathBuf>, Vec<String>) {
@@ -581,9 +581,9 @@ fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Option<PathBuf>, V
     (autostart, out, seed, pass)
 }
 
-/// Spawn a detached `pit` subcommand for this session: stdin null, output to
-/// `<session>/<log_name>`, PIT_DETACHED=1 so the subcommand knows it must
-/// survive `pit run`'s Ctrl-C. The child inherits `pit run`'s SIG_IGN for
+/// Spawn a detached `den` subcommand for this session: stdin null, output to
+/// `<session>/<log_name>`, DEN_DETACHED=1 so the subcommand knows it must
+/// survive `den run`'s Ctrl-C. The child inherits `den run`'s SIG_IGN for
 /// SIGINT/SIGTERM, so it outlives Ctrl-C; subcommands restore TERM handling
 /// themselves so `kill` still stops them.
 fn spawn_detached(sid: &str, args: &[&str], log_name: &str) -> Result<u32> {
@@ -594,7 +594,7 @@ fn spawn_detached(sid: &str, args: &[&str], log_name: &str) -> Result<u32> {
     let log_file = OpenOptions::new().create(true).append(true).open(&log)?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(args)
-        .env("PIT_DETACHED", "1")
+        .env("DEN_DETACHED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
@@ -614,11 +614,11 @@ fn spawn_detached(sid: &str, args: &[&str], log_name: &str) -> Result<u32> {
     Ok(child.id())
 }
 
-/// `pit <profile> --autostart`: stream the session's changes while the agent
+/// `den <profile> --autostart`: stream the session's changes while the agent
 /// works. Preferred: a detached litestream daemon continuously replicating
-/// the fs.db to S3 (`pit replicate <sid>`), when a replica is configured
-/// (PIT_REPLICA / LITESTREAM_REPLICA_URL / LITESTREAM_BUCKET) and the
-/// binary is installed. Fallback: the local LTX chain watch (`pit backup
+/// the fs.db to S3 (`den replicate <sid>`), when a replica is configured
+/// (DEN_REPLICA / LITESTREAM_REPLICA_URL / LITESTREAM_BUCKET) and the
+/// binary is installed. Fallback: the local LTX chain watch (`den backup
 /// <sid> --watch` -> `<sid>.ltx`). Both survive Ctrl-C on the run, refuse a
 /// second autostart on the same session (flock), and exit on their own when
 /// the session is deleted.
@@ -631,7 +631,7 @@ fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
     if litestream_autostart(sid) {
         let pid = spawn_detached(sid, &["replicate", sid], "replicate.log")?;
         eprintln!(
-            "pit: autostarted litestream for {sid} -> {} (pid {pid}, log: {})",
+            "den: autostarted litestream for {sid} -> {} (pid {pid}, log: {})",
             replica_url(sid, None)?,
             crate::run_dir()?.join(sid).join("replicate.log").display()
         );
@@ -648,7 +648,7 @@ fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["backup", sid, "--watch", "--out"])
         .arg(&out)
-        .env("PIT_DETACHED", "1")
+        .env("DEN_DETACHED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
@@ -665,7 +665,7 @@ fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
         .with_context(|| format!("spawn backup watch for session {sid}"))?;
     drop(child); // detached: the watcher outlives this run
     eprintln!(
-        "pit: autostarted backup watch for {sid} -> {} (log: {})",
+        "den: autostarted backup watch for {sid} -> {} (log: {})",
         out.display(),
         log.display()
     );
@@ -701,7 +701,7 @@ fn replicate_lock(sid: &str) -> Result<File> {
 }
 
 /// Forward a signal to the litestream child so it shuts down cleanly instead
-/// of being orphaned when `pit replicate` is Ctrl-C'd or killed.
+/// of being orphaned when `den replicate` is Ctrl-C'd or killed.
 static LITESTREAM_PID: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn forward_to_litestream(_sig: i32) {
@@ -726,12 +726,12 @@ fn install_forwarder(sig: i32) {
 /// deleted and stopping the daemon.
 const REAP_POLL: Duration = Duration::from_secs(5);
 
-/// `pit replicate [sid] [replica-url]` — run a litestream daemon that
+/// `den replicate [sid] [replica-url]` — run a litestream daemon that
 /// continuously replicates the session's fs.db to S3. Command-line mode
 /// (`litestream replicate <db> <url>`, flags before positionals); credentials
 /// come from AWS_*/LITESTREAM_* env vars, so no config file is generated.
 /// `-restore-if-db-not-exists` pulls the session back from the replica on a
-/// fresh machine. Foreground by default (Ctrl-C stops it); `pit <profile>
+/// fresh machine. Foreground by default (Ctrl-C stops it); `den <profile>
 /// --autostart` spawns it detached, and it then exits on its own when the
 /// session dir is deleted (else it would hold replicate.lock forever and
 /// block the next run).
@@ -765,7 +765,7 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
         bail!(
             "litestream not found. Install it:\n  \
              curl -s https://litestream.io/install.sh | sh\n\
-             (or set PIT_LITESTREAM=/path/to/litestream)"
+             (or set DEN_LITESTREAM=/path/to/litestream)"
         );
     }
     let session_dir = run_dir()?.join(sid);
@@ -773,9 +773,9 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
     let db = session_dir.join("fs.db");
     let _lock = replicate_lock(sid)?;
     // Manual runs: Ctrl-C must stop litestream. Detached runs keep the
-    // inherited SIG_IGN for SIGINT so they survive Ctrl-C on `pit run`;
+    // inherited SIG_IGN for SIGINT so they survive Ctrl-C on `den run`;
     // TERM is restored in both so `kill` works.
-    if std::env::var("PIT_DETACHED").as_deref() != Ok("1") {
+    if std::env::var("DEN_DETACHED").as_deref() != Ok("1") {
         install_forwarder(libc::SIGINT);
     }
     install_forwarder(libc::SIGTERM);
@@ -788,7 +788,7 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
         .with_context(|| format!("failed to spawn {bin}"))?;
     LITESTREAM_PID.store(child.id() as i32, Ordering::Relaxed);
     eprintln!(
-        "pit: litestream replicating {sid} -> {url} (pid {}, db: {})",
+        "den: litestream replicating {sid} -> {url} (pid {}, db: {})",
         child.id(),
         db.display()
     );
@@ -813,7 +813,7 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
             seen_db = seen_db || db.exists();
         }
         if gone >= 3 {
-            eprintln!("pit: session {sid} gone — stopping litestream");
+            eprintln!("den: session {sid} gone — stopping litestream");
             let _ = child.kill();
             let _ = child.wait();
             return Ok(());
@@ -821,7 +821,7 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
     }
 }
 
-/// `pit pull [sid] [replica-url] [--force] [--to <db>]` — restore the
+/// `den pull [sid] [replica-url] [--force] [--to <db>]` — restore the
 /// session's fs.db from the litestream replica (newest state), defaulting
 /// back into the session dir. Refuses to overwrite an existing db unless
 /// --force; `-if-replica-exists` makes a never-backed-up session a no-op.
@@ -869,7 +869,7 @@ fn cmd_pull(sid: &str, url_opt: Option<&str>, force: bool, to: Option<PathBuf>) 
         bail!(
             "litestream not found. Install it:\n  \
              curl -s https://litestream.io/install.sh | sh\n\
-             (or set PIT_LITESTREAM=/path/to/litestream)"
+             (or set DEN_LITESTREAM=/path/to/litestream)"
         );
     }
     let to = to.unwrap_or(session_db_path(sid)?);
@@ -892,7 +892,7 @@ fn cmd_pull(sid: &str, url_opt: Option<&str>, force: bool, to: Option<PathBuf>) 
     if !status.success() {
         bail!("litestream restore failed ({status}) — pull into a fresh path with --to, or --force to overwrite");
     }
-    println!("pit: restored {sid} from {url} -> {}", to.display());
+    println!("den: restored {sid} from {url} -> {}", to.display());
     Ok(())
 }
 
@@ -1066,9 +1066,9 @@ fn cmd_sessions(select: bool) -> Result<()> {
     Ok(())
 }
 
-/// Session ids are directory names under ~/.pit/sessions (slug, PIT_SESSION,
+/// Session ids are directory names under ~/.den/sessions (slug, DEN_SESSION,
 /// or a listed session) — refuse anything that could escape the tree: a
-/// stray `pit rm ..` must not delete ~/.pit itself.
+/// stray `den rm ..` must not delete ~/.den itself.
 fn valid_sid(sid: &str) -> Result<()> {
     if sid.is_empty() || sid == "." || sid == ".." || sid.contains('/') || sid.contains('\\') {
         bail!("invalid session id '{sid}'");
@@ -1091,7 +1091,7 @@ fn cmd_rm(sid: &str) -> Result<()> {
     if stamp.exists() {
         std::fs::remove_file(&stamp).with_context(|| format!("rm stamp {sid}"))?;
     }
-    println!("pit: removed session {sid}");
+    println!("den: removed session {sid}");
     Ok(())
 }
 
@@ -1101,12 +1101,12 @@ fn cmd_selftest(rest: &[String]) -> Result<()> {
         return Ok(());
     }
     // Deterministic: pin the session id, assert argv assembly + passthrough.
-    std::env::set_var("PIT_SESSION", "selftest-sid");
+    std::env::set_var("DEN_SESSION", "selftest-sid");
     let argv = build_argv(
         "codex",
         &["exec".into(), "--json".into(), "-m".into(), "gpt-5".into()],
     )?;
-    std::env::remove_var("PIT_SESSION");
+    std::env::remove_var("DEN_SESSION");
 
     let joined = argv.join("\u{1f}"); // unit separator so substring matches are unambiguous
     macro_rules! check {
@@ -1136,7 +1136,7 @@ fn selftest_sandbox() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let dir = std::env::temp_dir().join(format!("pit-sandbox-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("den-sandbox-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("README.md"), "hello\n")?;
         std::fs::create_dir_all(dir.join("src"))?;
@@ -1199,7 +1199,7 @@ fn selftest_sandbox() -> Result<()> {
         check_sandbox(touched.len() == 3, true, "3 added this run (created.txt, dir1, dir1/f.txt)")?;
 
         // Read-only enforcement: /etc is not writable from inside the sandbox.
-        let diag = format!("/tmp/pit-sandbox-diag-{}.txt", std::process::id());
+        let diag = format!("/tmp/den-sandbox-diag-{}.txt", std::process::id());
         let code = block_on(sandbox::run_cmd(
             Vec::new(),
             sid.clone(),
@@ -1220,7 +1220,7 @@ fn selftest_sandbox() -> Result<()> {
             Vec::new(),
             sid.clone(),
             "/bin/sh".into(),
-            vec!["-c".into(), "touch /etc/pit-sandbox-evil".into()],
+            vec!["-c".into(), "touch /etc/den-sandbox-evil".into()],
         ))
         ??;
         check_sandbox(code != 0, true, "/etc write rejected (EROFS)")?;
@@ -1251,22 +1251,22 @@ fn check_sandbox(cond: bool, expected: bool, what: &str) -> Result<()> {
 
 fn usage() -> String {
     "usage:\n  \
-     pit <cmd> [args...]         run any agent CLI in the sandbox; --seed <dir> preloads a\n  \
+     den <cmd> [args...]         run any agent CLI in the sandbox; --seed <dir> preloads a\n  \
                                  new session, --autostart streams a backup watch\n  \
-     pit dump <cmd> [args...]    print the resolved sandbox plan (no exec)\n  \
-     pit inspect [session-id]     list a session's virtual FS + timeline\n  \
-     pit sessions [--select]      list persisted sessions, optionally choose one\n  \
-     pit rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
-     pit replicate [sid] [url]    stream a session's fs.db to S3 via litestream (daemon)
+     den dump <cmd> [args...]    print the resolved sandbox plan (no exec)\n  \
+     den inspect [session-id]     list a session's virtual FS + timeline\n  \
+     den sessions [--select]      list persisted sessions, optionally choose one\n  \
+     den rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
+     den replicate [sid] [url]    stream a session's fs.db to S3 via litestream (daemon)
   \
-     pit pull [sid] [url] [--force] [--to db]   restore a session from its litestream replica
+     den pull [sid] [url] [--force] [--to db]   restore a session from its litestream replica
   \
-     pit backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  LTX backup of a session's fs.db\n  \
-     pit restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
-     pit ltx <file.ltx>         inspect/verify a backup file\n  \
-     pit list                     list known profiles (any other cmd works too)\n  \
-     pit selftest                 sanity check\n\n\
-env: PIT_NET=proxy|none|full  PIT_PROXY_ALLOW/PIT_PROXY_POLICY  PIT_HIDE/PIT_NO_HIDE  PIT_LIMIT_*  PIT_SECCOMP\n"
+     den backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  LTX backup of a session's fs.db\n  \
+     den restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
+     den ltx <file.ltx>         inspect/verify a backup file\n  \
+     den list                     list known profiles (any other cmd works too)\n  \
+     den selftest                 sanity check\n\n\
+env: DEN_NET=proxy|none|full  DEN_PROXY_ALLOW/DEN_PROXY_POLICY  DEN_HIDE/DEN_NO_HIDE  DEN_LIMIT_*  DEN_SECCOMP\n"
         .to_string()
 }
 
@@ -1299,7 +1299,7 @@ fn main() -> Result<()> {
             let sid = match rest.first().map(String::as_str) {
                 Some("--select") => select_session()?,
                 Some(sid) => sid.to_string(),
-                None => bail!("pit rm <session-id> (or --select)"),
+                None => bail!("den rm <session-id> (or --select)"),
             };
             cmd_rm(&sid)
         }
@@ -1315,7 +1315,7 @@ fn main() -> Result<()> {
         [c, rest @ ..] if c == "pull" => cmd_pull_args(rest),
         [c, rest @ ..] if c == "restore" => cmd_restore_args(rest),
         [c, rest @ ..] if c == "ltx" => {
-            let path = rest.first().context("pit ltx <file.ltx>")?;
+            let path = rest.first().context("den ltx <file.ltx>")?;
             if rest.len() > 1 {
                 bail!("unexpected argument '{}'", rest[1]);
             }
@@ -1339,7 +1339,7 @@ fn main() -> Result<()> {
             {
                 let (cmd, args) = rest
                     .split_first()
-                    .context("pit raw <cmd> [args...]")?;
+                    .context("den raw <cmd> [args...]")?;
                 let sid = format!("raw-{}", std::process::id());
                 let code = block_on(sandbox::run_cmd(
                     Vec::new(),
@@ -1356,9 +1356,9 @@ fn main() -> Result<()> {
             }
         }
         [pname, passthrough @ ..] => {
-            // "run" is not a command name; the run is implicit (`pit claude`).
+            // "run" is not a command name; the run is implicit (`den claude`).
             if pname == "run" {
-                bail!("pit run isn't a command — the run is implicit: pit <cmd> [args...]");
+                bail!("den run isn't a command — the run is implicit: den <cmd> [args...]");
             }
             let (autostart, auto_out, seed, passthrough) = split_run_args(passthrough);
             let sid = session_id(pname);
@@ -1379,9 +1379,9 @@ fn take_value(rest: &[String], i: &mut usize, flag: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(v))
 }
 
-/// `pit backup [sid] [--from <prev.ltx>] [--out <path>] [-c] [--watch]` — sid
+/// `den backup [sid] [--from <prev.ltx>] [--out <path>] [-c] [--watch]` — sid
 /// defaults to an interactive selection when `--select` is given or omitted
-/// with no positional argument (mirrors `pit inspect`). `--watch` streams
+/// with no positional argument (mirrors `den inspect`). `--watch` streams
 /// chained deltas until interrupted instead of writing one file.
 fn cmd_backup_args(rest: &[String]) -> Result<()> {
     let mut from = None;
@@ -1435,8 +1435,8 @@ fn cmd_backup_args(rest: &[String]) -> Result<()> {
     }
 }
 
-/// `pit restore <file.ltx> [--to <db>]` — target defaults to the session the
-/// file is named after (codex-foo.ltx -> ~/.pit/sessions/codex-foo/fs.db).
+/// `den restore <file.ltx> [--to <db>]` — target defaults to the session the
+/// file is named after (codex-foo.ltx -> ~/.den/sessions/codex-foo/fs.db).
 fn cmd_restore_args(rest: &[String]) -> Result<()> {
     let mut ltx = None;
     let mut to = None;
@@ -1453,7 +1453,7 @@ fn cmd_restore_args(rest: &[String]) -> Result<()> {
             }
         }
     }
-    let ltx = ltx.context("pit restore <file.ltx> [--to <db>]")?;
+    let ltx = ltx.context("den restore <file.ltx> [--to <db>]")?;
     let to = match to {
         Some(t) => t,
         None => backup::default_restore_target(&ltx)?,
@@ -1470,7 +1470,7 @@ fn cmd_restore_args(rest: &[String]) -> Result<()> {
     }
     if !chain.is_empty() {
         println!(
-            "pit: replayed {} chain delta(s) onto {}",
+            "den: replayed {} chain delta(s) onto {}",
             chain.len(),
             to.display()
         );
@@ -1481,7 +1481,7 @@ fn cmd_restore_args(rest: &[String]) -> Result<()> {
 /// For `dump`: everything after `dump` is `<profile> [passthrough...]`.
 fn split_profile(rest: &[String]) -> Result<(String, Vec<String>)> {
     match rest {
-        [] => bail!("pit dump <cmd> [args...]"),
+        [] => bail!("den dump <cmd> [args...]"),
         [p, rest @ ..] => Ok((p.clone(), rest.to_vec())),
     }
 }
@@ -1576,7 +1576,7 @@ mod tests {
     fn replica_url_resolution_precedence() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("LITESTREAM_BUCKET", "mybucket");
-        std::env::remove_var("PIT_REPLICA");
+        std::env::remove_var("DEN_REPLICA");
         std::env::remove_var("LITESTREAM_REPLICA_URL");
 
         // bucket alone synthesizes a per-session path
@@ -1595,13 +1595,13 @@ mod tests {
             replica_url("codex-foo", None).unwrap(),
             "s3://env-bucket/env-path"
         );
-        // PIT_REPLICA beats both
-        std::env::set_var("PIT_REPLICA", "s3://pit-bucket/pit-path");
+        // DEN_REPLICA beats both
+        std::env::set_var("DEN_REPLICA", "s3://den-bucket/den-path");
         assert_eq!(
             replica_url("codex-foo", None).unwrap(),
-            "s3://pit-bucket/pit-path"
+            "s3://den-bucket/den-path"
         );
-        std::env::remove_var("PIT_REPLICA");
+        std::env::remove_var("DEN_REPLICA");
         std::env::remove_var("LITESTREAM_REPLICA_URL");
         std::env::remove_var("LITESTREAM_BUCKET");
         assert!(replica_url("codex-foo", None).is_err());
@@ -1611,14 +1611,14 @@ mod tests {
     fn litestream_autostart_requires_binary_and_replica() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("LITESTREAM_BUCKET", "b");
-        std::env::set_var("PIT_LITESTREAM", "/bin/true"); // exists, so bin_found
+        std::env::set_var("DEN_LITESTREAM", "/bin/true"); // exists, so bin_found
         assert!(litestream_autostart("x"));
 
-        std::env::set_var("PIT_LITESTREAM", "/nonexistent/pit-ls");
+        std::env::set_var("DEN_LITESTREAM", "/nonexistent/den-ls");
         assert!(!litestream_autostart("x")); // binary missing -> LTX fallback
 
         std::env::remove_var("LITESTREAM_BUCKET");
-        std::env::remove_var("PIT_LITESTREAM");
+        std::env::remove_var("DEN_LITESTREAM");
         assert!(!litestream_autostart("x")); // no replica -> LTX fallback
     }
 }
