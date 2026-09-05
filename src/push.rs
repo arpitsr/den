@@ -53,10 +53,21 @@ fn pushable(path: &str, baseline_tops: &HashSet<&str>) -> bool {
     baseline_tops.contains(top) || !PUSH_DENY.contains(&top)
 }
 
-/// (added_or_modified, deleted) vs the seed baseline. Pure — unit-tested
-/// without a VFS.
-pub(crate) fn diff_snapshots(baseline: &Snap, now: &Snap) -> (Vec<String>, Vec<String>) {
+/// (added_or_modified, deleted, dropped) vs the seed baseline. Pure —
+/// unit-tested without a VFS. `dropped` holds changed paths excluded from
+/// the push by sandbox-dir rules etc. — surface them so agents and users
+/// aren't surprised by silently-vanishing files.
+pub(crate) fn diff_snapshots(
+    baseline: &Snap,
+    now: &Snap,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let base_tops: HashSet<&str> = baseline.keys().filter_map(|p| top_component(p)).collect();
+    let mut dropped: Vec<String> = now
+        .iter()
+        .filter(|(p, v)| !pushable(p, &base_tops) && baseline.get(*p) != Some(*v))
+        .map(|(p, _)| p.clone())
+        .collect();
+    dropped.sort();
     let mut changed: Vec<String> = now
         .iter()
         .filter(|(p, v)| pushable(p, &base_tops) && baseline.get(*p) != Some(*v))
@@ -69,7 +80,7 @@ pub(crate) fn diff_snapshots(baseline: &Snap, now: &Snap) -> (Vec<String>, Vec<S
         .collect();
     changed.sort();
     deleted.sort();
-    (changed, deleted)
+    (changed, deleted, dropped)
 }
 
 /// Baseline serialization: one entry per line, `path\tmtime\tnsec\tsize`.
@@ -170,6 +181,9 @@ pub(crate) struct PushOutcome {
     pub repo: PathBuf,
     /// Some when the worktree was kept (--keep, or dry-run --keep).
     pub worktree: Option<PathBuf>,
+    /// Paths under sandbox-internal dirs (etc/, usr/, …) that were present
+    /// but never pushed — counted so the drop isn't silent.
+    pub dropped: usize,
     pub pushed: bool,
     /// Remote's own push message (GitHub prints its PR link here).
     pub push_note: String,
@@ -198,9 +212,16 @@ pub(crate) async fn push_session(
         })?;
     let baseline = snapshot_from_tsv(&base_text)?;
     let now = snapshot_fs(&agent).await;
-    let (changed, deleted) = diff_snapshots(&baseline, &now);
+    let (changed, deleted, dropped) = diff_snapshots(&baseline, &now);
     if changed.is_empty() && deleted.is_empty() {
-        bail!("session {sid}: no file changes vs its seed baseline — nothing to push");
+        if dropped.is_empty() {
+            bail!("session {sid}: no file changes vs its seed baseline — nothing to push");
+        }
+        bail!(
+            "session {sid}: no pushable changes — {} changed path(s) under sandbox-internal \
+             dirs (etc/, usr/, …) are never pushed",
+            dropped.len()
+        );
     }
 
     // Copy contents out of the VFS before any host-side git work: a failure
@@ -223,7 +244,14 @@ pub(crate) async fn push_session(
     }
     drop(agent);
     if payload.is_empty() && deleted.is_empty() {
-        bail!("session {sid}: only non-file changes — nothing pushable");
+        if dropped.is_empty() {
+            bail!("session {sid}: only non-file changes — nothing pushable");
+        }
+        bail!(
+            "session {sid}: no pushable file changes — sandbox-internal paths ({} dropped) \
+             and non-file entries are never pushed",
+            dropped.len()
+        );
     }
 
     // Where do the changes land? --to wins; else the session's recorded cwd.
@@ -241,6 +269,21 @@ pub(crate) async fn push_session(
             repo.display()
         );
     }
+    // Baseline-vs-HEAD drift: the payload diffs against the seed-time tree,
+    // but the worktree below is cut from the host's HEAD *now*. If the host
+    // repo advanced since seeding, its commits land on the branch and
+    // agent-touched files may overwrite newer host content — say so.
+    if let Ok(sha) = std::fs::read_to_string(session_dir.join("seed.sha")) {
+        if !sha.trim().is_empty()
+            && git_probe(&repo, &["rev-parse", "HEAD"]).as_deref() != Some(sha.trim())
+        {
+            eprintln!(
+                "den: warning: {} has advanced past the session's seed commit — \
+                 host-side commits since seeding are folded into the branch",
+                repo.display()
+            );
+        }
+    }
     let branch = o.branch.clone().unwrap_or_else(|| format!("den/{sid}"));
     if !valid_branch(&branch) {
         bail!("invalid branch name {branch:?}");
@@ -252,7 +295,17 @@ pub(crate) async fn push_session(
             .duration_since(std::time::UNIX_EPOCH)?
             .subsec_nanos()
     ));
-    let res = push_apply(&repo, &wt, &branch, &payload, &deleted, ignored, sid, o);
+    let res = push_apply(
+        &repo,
+        &wt,
+        &branch,
+        &payload,
+        &deleted,
+        ignored,
+        dropped.len(),
+        sid,
+        o,
+    );
     if !o.keep {
         // Throwaway worktree — the commit lives in the repo's object store.
         let _ = Command::new("git")
@@ -276,11 +329,17 @@ fn push_apply(
     payload: &[(String, Vec<u8>)],
     deleted: &[String],
     ignored: usize,
+    dropped: usize,
     sid: &str,
     o: &PushOpts,
 ) -> Result<PushOutcome> {
     let wt_s = wt.to_string_lossy().to_string();
     git(repo, &["worktree", "add", "--detach", &wt_s, "HEAD"])?;
+    // The throwaway worktree root under shared /tmp — keep it private.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(wt, std::fs::Permissions::from_mode(0o700));
+    }
     for (rel, bytes) in payload {
         let dst = wt.join(rel);
         if let Some(parent) = dst.parent() {
@@ -290,13 +349,19 @@ fn push_apply(
         std::fs::write(&dst, bytes).with_context(|| format!("write {}", dst.display()))?;
     }
     for p in deleted {
+        // Silent failure is intentional: an already-absent worktree file
+        // (or an unfriendly host) shouldn't abort the push.
         let _ = std::fs::remove_file(wt.join(&p[1..]));
     }
     let status = git(wt, &["status", "--porcelain"])?;
     let mut pushed = false;
     let mut note = String::new();
     if !o.dry_run {
-        git(wt, &["checkout", "-b", branch])?;
+        // -B, not -b: a re-push after a partial failure (committed but not
+        // pushed) would otherwise die on "branch already exists". The branch
+        // tip resets to this worktree; pushing a reset branch stays safe —
+        // a non-fast-forward is rejected by the remote.
+        git(wt, &["checkout", "-B", branch])?;
         git(wt, &["add", "-A"])?;
         let msg = o.message.clone().unwrap_or_else(|| {
             format!(
@@ -349,6 +414,7 @@ fn push_apply(
         changed: payload.iter().map(|(p, _)| format!("/{p}")).collect(),
         deleted: deleted.to_vec(),
         ignored,
+        dropped,
         status,
         branch: branch.to_string(),
         repo: repo.to_path_buf(),
@@ -386,14 +452,17 @@ mod tests {
             ("/etc/hosts", (4, 0, 8)),
             ("/tmp/junk", (4, 0, 1)),
         ]);
-        let (changed, deleted) = diff_snapshots(&base, &now);
+        let (changed, deleted, dropped) = diff_snapshots(&base, &now);
         assert_eq!(changed, vec!["/a.txt", "/docs2/new.md"]);
         assert_eq!(deleted, vec!["/gone.txt"]);
+        // Sandbox-internal paths that changed after seeding are reported,
+        // not swallowed.
+        assert_eq!(dropped, vec!["/.git/config", "/etc/hosts", "/tmp/junk"]);
 
         // A repo that genuinely has etc/ pushes changes under it.
         let base2 = snap(&[("/etc/keep", (1, 0, 2))]);
         let now2 = snap(&[("/etc/hosts", (4, 0, 8))]);
-        let (changed2, _) = diff_snapshots(&base2, &now2);
+        let (changed2, _, _) = diff_snapshots(&base2, &now2);
         assert_eq!(changed2, vec!["/etc/hosts"]);
     }
 
@@ -402,7 +471,11 @@ mod tests {
         let s = snap(&[("/a b.txt", (1, 2, 3)), ("/x/y.bin", (7, 999, 0))]);
         assert_eq!(snapshot_from_tsv(&snapshot_to_tsv(&s)).unwrap(), s);
         let r = snapshot_from_tsv(&snapshot_to_tsv(&s)).unwrap();
-        assert!(diff_snapshots(&r, &s).0.is_empty() && diff_snapshots(&r, &s).1.is_empty());
+        assert!(
+            diff_snapshots(&r, &s).0.is_empty()
+                && diff_snapshots(&r, &s).1.is_empty()
+                && diff_snapshots(&r, &s).2.is_empty()
+        );
         assert_eq!(snapshot_from_tsv("").unwrap().len(), 0);
         assert!(snapshot_from_tsv("a\tb").is_err());
         // \t in a path can't round-trip — must not be silently corrupted.

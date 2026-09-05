@@ -417,12 +417,47 @@ pub(crate) async fn seed_session(
     Ok(count)
 }
 
-/// The seeded `/.git` ships with the session (`den backup`), and remote URLs
-/// in `.git/config` often embed credentials — `https://user:token@host/x`.
-/// Strip userinfo from url lines so host secrets don't ride along in the
-/// session DB. No config, or config that isn't text: nothing to do.
+/// The seeded `/.git` ships with the session (`den backup`), and git state
+/// often embeds host credentials:
+///   - remote URLs in `.git/config`: `https://user:token@host/...`
+///   - `.git/FETCH_HEAD`: git writes the full fetch URL per ref line
+///   - `.git/modules/*/config`: submodule remotes carry the same URLs
+///   - `http.<url>.extraheader` in config: CI tooling injects auth headers
+///
+/// Strip or drop all of it — the sandbox session needs no network access.
 async fn scrub_git_config(agent: &AgentFS) -> Result<()> {
-    let Some(data) = agent.fs.read_file("/.git/config").await? else {
+    scrub_config_file(agent, "/.git/config").await?;
+    // FETCH_HEAD records the fetch URL (with userinfo, for tokened remotes)
+    // per fetched ref — and it's junk info for the sandbox anyway.
+    let _ = agent.fs.remove("/.git/FETCH_HEAD").await;
+    // Submodule configs hide one or two levels down — walk /.git/modules.
+    let mut stack = vec!["/.git/modules".to_string()];
+    while let Some(dir) = stack.pop() {
+        let Some(st) = agent.fs.stat(&dir).await? else {
+            continue;
+        };
+        if st.mode & S_IFMT != S_IFDIR {
+            continue;
+        }
+        let entries = agent.fs.readdir(st.ino).await?.unwrap_or_default();
+        for e in entries {
+            let p = format!("{dir}/{e}");
+            if let Some(es) = agent.fs.lstat(&p).await.ok().flatten() {
+                if es.mode & S_IFMT == S_IFDIR {
+                    stack.push(p);
+                } else if e == "config" {
+                    scrub_config_file(agent, &p).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scrub one git config file in the VFS by rewriting its own bytes. No
+/// file, or file that isn't text: nothing to do.
+async fn scrub_config_file(agent: &AgentFS, path: &str) -> Result<()> {
+    let Some(data) = agent.fs.read_file(path).await? else {
         return Ok(());
     };
     let Ok(text) = std::str::from_utf8(&data) else {
@@ -431,6 +466,10 @@ async fn scrub_git_config(agent: &AgentFS) -> Result<()> {
     let mut out = String::with_capacity(text.len());
     let mut changed = false;
     for line in text.split_inclusive('\n') {
+        if scrub_drop_line(line) {
+            changed = true;
+            continue;
+        }
         match scrub_url_creds(line) {
             Some(s) => {
                 changed = true;
@@ -440,12 +479,25 @@ async fn scrub_git_config(agent: &AgentFS) -> Result<()> {
         }
     }
     if changed {
-        agent.fs.pwrite("/.git/config", 0, out.as_bytes()).await?;
+        agent.fs.pwrite(path, 0, out.as_bytes()).await?;
         if out.len() < data.len() {
-            agent.fs.truncate("/.git/config", out.len() as u64).await?;
+            agent.fs.truncate(path, out.len() as u64).await?;
         }
     }
     Ok(())
+}
+
+/// Config lines dropped entirely. `extraheader` keys carry injected HTTP
+/// auth headers (e.g. `AUTHORIZATION: basic ***` from CI checkouts); keys
+/// like `http.<url>.extraheader` land in the sandbox with the token intact.
+/// Dropping them is safe: the session never talks to the network.
+fn scrub_drop_line(line: &str) -> bool {
+    let Some(eq) = line.find('=') else {
+        return false;
+    };
+    let key = line[..eq].trim();
+    let key = key.split('.').next_back().unwrap_or(key);
+    key.eq_ignore_ascii_case("extraheader")
 }
 
 /// One config line: `url = scheme://user:pass@host/...` loses the userinfo.
@@ -550,8 +602,9 @@ struct GitSeedCtx {
     toplevel: PathBuf,
     prefix: String,
     dirty: Vec<String>,
-    /// False on an unborn branch (fresh `git init`, no commits yet).
-    has_head: bool,
+    /// The seed-time HEAD sha, or None on an unborn branch (fresh `git
+    /// init`, no commits yet). Doubles as the has_head check.
+    head_sha: Option<String>,
 }
 
 /// Probe the seed dir for a git repo. Any failure — no `git` on PATH, not a
@@ -582,7 +635,7 @@ fn git_seed_ctx(dir: &Path) -> Option<GitSeedCtx> {
             .lines()
             .map(str::to_string)
             .collect(),
-        has_head: run(&["rev-parse", "--verify", "-q", "HEAD"]).is_some(),
+        head_sha: run(&["rev-parse", "HEAD"]),
     })
 }
 
@@ -642,6 +695,11 @@ fn extract_head_archive(ctx: &GitSeedCtx) -> Result<PathBuf> {
         .unwrap_or(0);
     let tmp = std::env::temp_dir().join(format!("den-seed-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
+    // HEAD's checkout lands here, under shared /tmp — keep it private.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
+    }
     let mut arch = Command::new("git")
         .arg("-C")
         .arg(&ctx.toplevel)
@@ -670,6 +728,7 @@ fn extract_head_archive(ctx: &GitSeedCtx) -> Result<PathBuf> {
 }
 
 /// Where a `--seed <dir>` actually seeds from, decided once, up front.
+#[derive(Debug)]
 struct ResolvedSeed {
     src: PathBuf,
     /// Repo `.git` to seed as `/.git`. None for non-repos and for repo-subdir
@@ -679,6 +738,10 @@ struct ResolvedSeed {
     note: Option<String>,
     /// `src` is a temp dir the caller removes after seeding.
     temp: bool,
+    /// Host HEAD at seed time, when a repo `.git` is seeded. Persisted as
+    /// `<session>/seed.sha`; `den push` warns when the host repo has
+    /// advanced past this commit (baseline drift).
+    head_sha: Option<String>,
 }
 
 /// Decide the seed source: the live dir, or HEAD via `git archive` when the
@@ -691,6 +754,7 @@ fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
         git_dir: None,
         note,
         temp: false,
+        head_sha: None,
     };
     let Some(ctx) = git_seed_ctx(dir) else {
         return Ok(fallback(None));
@@ -702,6 +766,7 @@ fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
         git_dir: git_dir.clone(),
         note,
         temp,
+        head_sha: git_dir.as_ref().and(ctx.head_sha.clone()),
     };
     if ctx.dirty.is_empty() {
         return Ok(with_git(dir.into(), None, false));
@@ -711,15 +776,20 @@ fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
         DirtyMode::Head => false,
         DirtyMode::Ask => ask_seed_dirty(ctx.dirty.len(), dir)?,
     };
+    // An unborn HEAD can't exclude the dirt (there's no committed state to
+    // fall back to) — the options are seeding the dirt or seeding nothing.
+    // The user's --seed-dirty=head / "N" answer wins, so refuse instead of
+    // seeding the dirt behind their back.
+    if !include && ctx.head_sha.is_none() {
+        bail!(
+            "{} has no commits yet (unborn HEAD) and {} uncommitted change(s) are excluded \
+             by --seed-dirty — nothing to seed; commit first or use --seed-dirty=all",
+            dir.display(),
+            ctx.dirty.len()
+        );
+    }
     if include {
         return Ok(with_git(dir.into(), None, false));
-    }
-    if !ctx.has_head {
-        return Ok(with_git(
-            dir.into(),
-            Some("unborn HEAD (no commits yet) — seeding worktree as-is".into()),
-            false,
-        ));
     }
     let src = extract_head_archive(&ctx)?;
     Ok(with_git(
@@ -839,6 +909,12 @@ fn cmd_run(
                 }
                 if let Some(x) = &rs.note {
                     eprintln!("den: {x}");
+                }
+                if let Some(sha) = &rs.head_sha {
+                    // Seed-time HEAD: lets `den push` detect baseline drift
+                    // if the host repo advances between seed and push.
+                    let sd = db.parent().context("session dir")?;
+                    std::fs::write(sd.join("seed.sha"), sha)?;
                 }
             }
         } else if seed.is_some() {
@@ -1813,11 +1889,19 @@ fn cmd_push_args(rest: &[String]) -> Result<()> {
     let out = block_on(push::push_session(&sid, &sdir, &o))??;
 
     println!(
-        "den: session {sid} — {} changed, {} deleted{}",
+        "den: session {sid} — {} changed, {} deleted{}{}",
         out.changed.len(),
         out.deleted.len(),
         if out.ignored > 0 {
             format!(", {} non-file ignored", out.ignored)
+        } else {
+            String::new()
+        },
+        if out.dropped > 0 {
+            format!(
+                ", {} under sandbox dirs not pushed (etc/, usr/, …)",
+                out.dropped
+            )
         } else {
             String::new()
         }
@@ -2080,6 +2164,46 @@ mod tests {
         assert!(parse_dirty_mode("wat").is_err());
     }
 
+    #[test]
+    fn scrub_drops_injected_auth_headers() {
+        assert!(scrub_drop_line(
+            "\textraheader = AUTHORIZATION: basic dXNlcjp0b2s=\n"
+        ));
+        assert!(scrub_drop_line("    http.extraHeader = Bearer tok\n"));
+        assert!(!scrub_drop_line("\turl = https://user:tok@host/x.git\n"));
+        assert!(!scrub_drop_line("\tbare = true\n"));
+        assert!(!scrub_drop_line("[http \"https://example.com\"]\n"));
+    }
+
+    /// Unborn HEAD + dirty worktree + dirt excluded: refuse to seed rather    /// than silently seeding the dirt despite --seed-dirty=head / a "no".
+    #[test]
+    fn resolve_seed_unborn_dirty_bails_when_dirt_excluded() {
+        let dir = std::env::temp_dir().join(format!("den-seedtest-unborn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let st = std::process::Command::new("git")
+            .args(["init", "-q", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let rs = resolve_seed_source(&dir, DirtyMode::Head);
+        let err = rs.unwrap_err().to_string();
+        assert!(err.contains("unborn"), "err: {err}");
+        // Ask mode in a non-TTY test run also declines the dirt (same path).
+        let err2 = resolve_seed_source(&dir, DirtyMode::Ask)
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("unborn"), "err: {err2}");
+        // --seed-dirty all is the escape hatch.
+        let rs3 = resolve_seed_source(&dir, DirtyMode::All).unwrap();
+        assert!(rs3.head_sha.is_none() && rs3.git_dir.is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Dirty repo + --seed-dirty head: seeds exactly HEAD via `git archive`
     /// (dirty edit and untracked file excluded), and seeds the repo's `.git`
     /// as `/.git` into the session DB. Also checks the non-repo fallback.
@@ -2110,6 +2234,7 @@ mod tests {
 
         let rs = resolve_seed_source(&dir, DirtyMode::Head).unwrap();
         assert!(rs.temp && rs.note.as_deref().unwrap().contains("excluded"));
+        assert!(rs.head_sha.is_some(), "seed-time HEAD sha must be captured");
         assert_eq!(
             std::fs::read_to_string(rs.src.join("a.txt")).unwrap(),
             "committed\n"
