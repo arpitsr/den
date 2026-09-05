@@ -11,6 +11,27 @@ open the DB and nothing else: the host tree is hidden behind the mount and
 irrelevant. Every session is self-contained and shippable to another machine
 (`den backup` / `den replicate` + `den pull`).
 
+### Seeding
+
+`--seed <dir>` copies the dir into the session's virtual FS before the agent
+starts. When the dir is inside a git repo, seeding is git-aware:
+
+- The repo's `.git` is seeded too, as `/.git`: the agent can `git diff`,
+  `git log`, and branch/commit inside the session — all private; the host
+  repo is never touched, and the copy ships with `den backup` like
+  everything else in the session DB. (Only when the seed dir *is* the repo
+  root — a subdir seed gets no `/.git`, since a root-level history would
+  mis-describe the partial tree.)
+- If the worktree has uncommitted changes, `den` asks:
+  `N uncommitted change(s) — seed them too? [y/N]`. The default is **N**:
+  the session is then seeded from HEAD via `git archive`, so it holds
+  exactly the committed state — dirty edits and untracked files stay on the
+  host. Non-interactive runs default to N without prompting.
+- `--seed-dirty ask|all|head` overrides: `all` always seeds the dirty
+  worktree, `head` never asks. Note `git archive` honors `export-ignore`
+  attributes, so a repo that export-ignores (say) its tests seeds without
+  them.
+
 ## Design
 
 The sandbox layer is **in this binary** — no `agentfs` CLI dependency:
@@ -73,6 +94,7 @@ cargo install --path .                         # installs a binary named `den`
 ```bash
 cd /path/to/your/project
 den claude --seed . "refactor auth"   # new session preloaded with the cwd; runs `claude` inside
+den claude --seed . --seed-dirty all "finish the wip"  # seed uncommitted changes too (default: ask [y/N], N seeds HEAD)
 den claude "continue the refactor"    # resumes: the DB is the whole FS, host tree ignored
 den codex  "fix the flaky test"       # separate session per profile+dir
 den pi     "..."                      # no --seed: starts in an empty virtual FS
