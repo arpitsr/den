@@ -5,8 +5,10 @@
 //! MIT): a FUSE mount (src/fuse.rs, via the published `fuser` crate) serves
 //! the session's virtual filesystem — a SQLite DB at
 //! ~/.den/sessions/<sid>/fs.db that IS the whole filesystem (no host base,
-//! no overlay). New sessions start empty or seeded from a dir (`--seed`);
-//! resumed sessions open the DB and nothing else. A fork+unshare child gets
+//! no overlay). New sessions start empty or seeded from a dir (`--seed`;
+//! git-aware: repo history is seeded as /.git, and a dirty worktree seeds
+//! HEAD by default — see README "Seeding"); resumed sessions open the DB
+//! and nothing else. A fork+unshare child gets
 //! a fresh user+mount namespace with the rest of the filesystem read-only.
 //! After the agent exits we diff a pre/post snapshot of the virtual FS and
 //! report what this run touched.
@@ -59,6 +61,7 @@ mod mount;
 #[cfg(target_os = "linux")]
 mod policy;
 mod proxy;
+pub(crate) mod push;
 #[cfg(target_os = "linux")]
 mod sandbox;
 
@@ -227,7 +230,7 @@ fn cwd_string() -> String {
 
 /// Run one future on a throwaway runtime (sync CLI entry points).
 /// Note: if the future itself returns Result, you need `??` at the call site.
-fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
     Ok(tokio::runtime::Runtime::new()?.block_on(f))
 }
 
@@ -389,15 +392,157 @@ async fn open_session(sid: &str) -> Result<Option<AgentFS>> {
 
 // ---- virtual FS: seed + snapshot --------------------------------------------
 
-/// Names never copied into a session when seeding (VCS + dep/build dirs).
+/// Names never copied into a session when seeding (dep/build dirs). Note:
+/// `.git` is NOT excluded here — for a git repo the session's `/.git` is
+/// seeded on purpose (see `seed_session`), and this walk of the repo root
+/// skips its `.git` dir so it is copied exactly once.
 const SEED_EXCLUDES: &[&str] = &[".git", "node_modules", "target"];
 
 /// Copy a host dir into the session's virtual FS. Returns entry count.
+/// `git_dir`, when given (a git repo's `.git`), is copied in as `/.git` so the
+/// agent gets real git context — diff, log, branch — all private to the
+/// session; the host repo is never touched. The copy ships with backup/
+/// replicate like everything else in the session DB.
 /// ponytail: whole-file reads; chunk pwrite if giant binaries ever matter.
-async fn seed_session(agent: &AgentFS, dir: &Path) -> Result<u64> {
+pub(crate) async fn seed_session(
+    agent: &AgentFS,
+    dir: &Path,
+    git_dir: Option<&Path>,
+) -> Result<u64> {
+    let mut count = seed_tree(agent, dir, PathBuf::new()).await?;
+    if let Some(g) = git_dir {
+        count += seed_tree(agent, g, PathBuf::from(".git")).await?;
+        scrub_git_config(agent).await?;
+    }
+    Ok(count)
+}
+
+/// The seeded `/.git` ships with the session (`den backup`), and git state
+/// often embeds host credentials:
+///   - remote URLs in `.git/config`: `https://user:token@host/...`
+///   - `.git/FETCH_HEAD`: git writes the full fetch URL per ref line
+///   - `.git/modules/*/config`: submodule remotes carry the same URLs
+///   - `http.<url>.extraheader` in config: CI tooling injects auth headers
+///
+/// Strip or drop all of it — the sandbox session needs no network access.
+async fn scrub_git_config(agent: &AgentFS) -> Result<()> {
+    scrub_config_file(agent, "/.git/config").await?;
+    // FETCH_HEAD records the fetch URL (with userinfo, for tokened remotes)
+    // per fetched ref — and it's junk info for the sandbox anyway.
+    let _ = agent.fs.remove("/.git/FETCH_HEAD").await;
+    // Submodule configs hide one or two levels down — walk /.git/modules.
+    let mut stack = vec!["/.git/modules".to_string()];
+    while let Some(dir) = stack.pop() {
+        let Some(st) = agent.fs.stat(&dir).await? else {
+            continue;
+        };
+        if st.mode & S_IFMT != S_IFDIR {
+            continue;
+        }
+        let entries = agent.fs.readdir(st.ino).await?.unwrap_or_default();
+        for e in entries {
+            let p = format!("{dir}/{e}");
+            if let Some(es) = agent.fs.lstat(&p).await.ok().flatten() {
+                if es.mode & S_IFMT == S_IFDIR {
+                    stack.push(p);
+                } else if e == "config" {
+                    scrub_config_file(agent, &p).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scrub one git config file in the VFS by rewriting its own bytes. No
+/// file, or file that isn't text: nothing to do.
+async fn scrub_config_file(agent: &AgentFS, path: &str) -> Result<()> {
+    let Some(data) = agent.fs.read_file(path).await? else {
+        return Ok(());
+    };
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return Ok(());
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    for line in text.split_inclusive('\n') {
+        if scrub_drop_line(line) {
+            changed = true;
+            continue;
+        }
+        match scrub_url_creds(line) {
+            Some(s) => {
+                changed = true;
+                out.push_str(&s);
+            }
+            None => out.push_str(line),
+        }
+    }
+    if changed {
+        agent.fs.pwrite(path, 0, out.as_bytes()).await?;
+        if out.len() < data.len() {
+            agent.fs.truncate(path, out.len() as u64).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Config lines dropped entirely. `extraheader` keys carry injected HTTP
+/// auth headers (e.g. `AUTHORIZATION: basic ***` from CI checkouts); keys
+/// like `http.<url>.extraheader` land in the sandbox with the token intact.
+/// Dropping them is safe: the session never talks to the network.
+fn scrub_drop_line(line: &str) -> bool {
+    let Some(eq) = line.find('=') else {
+        return false;
+    };
+    let key = line[..eq].trim();
+    let key = key.split('.').next_back().unwrap_or(key);
+    key.eq_ignore_ascii_case("extraheader")
+}
+
+/// One config line: `url = scheme://user:pass@host/...` loses the userinfo.
+/// None when the line needs no change. Guard against cutting path `@`s
+/// (`.../repo@v1`): only strip when the candidate userinfo contains no `/`.
+fn scrub_url_creds(line: &str) -> Option<String> {
+    let eq = line.find('=')?;
+    if !line[..eq].trim().eq_ignore_ascii_case("url") {
+        return None;
+    }
+    let val = line[eq + 1..].trim_start();
+    for scheme in ["https://", "http://", "ssh://", "git://"] {
+        let Some(rest) = val.strip_prefix(scheme) else {
+            continue;
+        };
+        let Some(at) = rest.find('@') else {
+            continue;
+        };
+        if rest[..at].contains('/') {
+            continue;
+        }
+        let head = &line[..line.len() - rest.len()]; // prefix incl. scheme
+        return Some(format!("{head}{}", &rest[at + 1..]));
+    }
+    None
+}
+
+/// Walk `host` into the virtual FS under `rel0` ("" seeds the tree at /).
+/// The walk only creates children — a non-empty `rel0` mountpoint must be
+/// mkdir'd here first, or its first child create fails.
+/// ponytail: whole-file reads; chunk pwrite if giant binaries ever matter.
+pub(crate) async fn seed_tree(agent: &AgentFS, host_root: &Path, rel0: PathBuf) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     let mut count = 0u64;
-    let mut stack = vec![(dir.to_path_buf(), PathBuf::new())]; // (host dir, vfs-relative)
+    let mut stack = vec![(host_root.to_path_buf(), rel0)]; // (host dir, vfs-relative)
+    if let Some(vfs) = stack[0].1.to_str().filter(|s| !s.is_empty()) {
+        let md = std::fs::metadata(host_root)?;
+        let vfs = format!("/{vfs}");
+        agent
+            .fs
+            .mkdir(&vfs, md.uid(), md.gid())
+            .await
+            .with_context(|| format!("seed: mkdir {vfs}"))?;
+        count += 1;
+    }
     while let Some((host, rel)) = stack.pop() {
         for entry in
             std::fs::read_dir(&host).with_context(|| format!("seed: read {}", host.display()))?
@@ -450,9 +595,216 @@ async fn seed_session(agent: &AgentFS, dir: &Path) -> Result<u64> {
     Ok(count)
 }
 
+/// What `git` told us about the seed dir's repo: where the root is, the seed
+/// dir's path inside it ("" when the seed dir IS the root), and the
+/// `git status --porcelain` lines (empty = clean worktree).
+struct GitSeedCtx {
+    toplevel: PathBuf,
+    prefix: String,
+    dirty: Vec<String>,
+    /// The seed-time HEAD sha, or None on an unborn branch (fresh `git
+    /// init`, no commits yet). Doubles as the has_head check.
+    head_sha: Option<String>,
+}
+
+/// Probe the seed dir for a git repo. Any failure — no `git` on PATH, not a
+/// repo, bare repo — returns None and seeding falls back to copying the dir
+/// as-is, exactly as before this feature existed.
+fn git_seed_ctx(dir: &Path) -> Option<GitSeedCtx> {
+    let run = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let toplevel = run(&["rev-parse", "--show-toplevel"])?;
+    if toplevel.is_empty() {
+        return None;
+    }
+    Some(GitSeedCtx {
+        toplevel: PathBuf::from(toplevel),
+        prefix: run(&["rev-parse", "--show-prefix"]).unwrap_or_default(),
+        dirty: run(&["status", "--porcelain=v1"])?
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        head_sha: run(&["rev-parse", "HEAD"]),
+    })
+}
+
+/// How to treat uncommitted changes when seeding a dirty git repo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DirtyMode {
+    /// Ask `[y/N]` on a TTY; default N when non-interactive.
+    Ask,
+    /// Seed the worktree as-is, uncommitted changes included.
+    All,
+    /// Seed the committed state only (`git archive HEAD`).
+    Head,
+}
+
+fn parse_dirty_mode(s: &str) -> Result<DirtyMode> {
+    match s {
+        "ask" => Ok(DirtyMode::Ask),
+        "all" => Ok(DirtyMode::All),
+        "head" => Ok(DirtyMode::Head),
+        _ => bail!("--seed-dirty expects ask|all|head, got '{s}'"),
+    }
+}
+
+/// The `[y/N]` prompt for dirty seeds. Non-TTY stdin defaults to N — a run is
+/// reproducible from HEAD, and scripts shouldn't block on a question; pass
+/// `--seed-dirty=all` to force the dirt in.
+fn ask_seed_dirty(n: usize, dir: &Path) -> Result<bool> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprint!(
+        "den: {} uncommitted change(s) in {} — seed them too? [y/N] ",
+        n,
+        dir.display()
+    );
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let a = line.trim();
+    Ok(a.eq_ignore_ascii_case("y") || a.eq_ignore_ascii_case("yes"))
+}
+
+/// Materialize the seed dir's committed state into a temp dir via
+/// `git archive HEAD[:<prefix>]`, so a dirty worktree seeded as "no" yields
+/// exactly HEAD: tracked deletions undone, untracked files absent. Caller
+/// removes the dir after seeding.
+fn extract_head_archive(ctx: &GitSeedCtx) -> Result<PathBuf> {
+    let spec = if ctx.prefix.is_empty() {
+        "HEAD".to_string()
+    } else {
+        format!("HEAD:{}", ctx.prefix.trim_end_matches('/'))
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("den-seed-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&tmp)?;
+    // HEAD's checkout lands here, under shared /tmp — keep it private.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
+    }
+    let mut arch = Command::new("git")
+        .arg("-C")
+        .arg(&ctx.toplevel)
+        .args(["archive", &spec])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("git -C {} archive {spec}", ctx.toplevel.display()))?;
+    let tar = Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(&tmp)
+        .stdin(Stdio::from(
+            arch.stdout.take().context("git archive stdout")?,
+        ))
+        .stderr(Stdio::null())
+        .status();
+    let arch_st = arch.wait();
+    match (tar, arch_st) {
+        (Ok(t), Ok(a)) if t.success() && a.success() => Ok(tmp),
+        _ => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            bail!("git archive {spec} failed")
+        }
+    }
+}
+
+/// Where a `--seed <dir>` actually seeds from, decided once, up front.
+#[derive(Debug)]
+struct ResolvedSeed {
+    src: PathBuf,
+    /// Repo `.git` to seed as `/.git`. None for non-repos and for repo-subdir
+    /// seeds — a subdir seed gets a partial tree, and pairing it with a
+    /// root-level `/.git` would make `git status` inside the session lie.
+    git_dir: Option<PathBuf>,
+    note: Option<String>,
+    /// `src` is a temp dir the caller removes after seeding.
+    temp: bool,
+    /// Host HEAD at seed time, when a repo `.git` is seeded. Persisted as
+    /// `<session>/seed.sha`; `den push` warns when the host repo has
+    /// advanced past this commit (baseline drift).
+    head_sha: Option<String>,
+}
+
+/// Decide the seed source: the live dir, or HEAD via `git archive` when the
+/// worktree is dirty and the user declines the dirt. `.git` is always seeded
+/// when the seed dir is the repo root — clean, dirty-and-accepted, or
+/// HEAD-extracted — so the agent sees diff/log/history either way.
+fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
+    let fallback = |note: Option<String>| ResolvedSeed {
+        src: dir.to_path_buf(),
+        git_dir: None,
+        note,
+        temp: false,
+        head_sha: None,
+    };
+    let Some(ctx) = git_seed_ctx(dir) else {
+        return Ok(fallback(None));
+    };
+    let git_dir = (ctx.prefix.is_empty() && ctx.toplevel.join(".git").is_dir())
+        .then(|| ctx.toplevel.join(".git"));
+    let with_git = |src: PathBuf, note: Option<String>, temp: bool| ResolvedSeed {
+        src,
+        git_dir: git_dir.clone(),
+        note,
+        temp,
+        head_sha: git_dir.as_ref().and(ctx.head_sha.clone()),
+    };
+    if ctx.dirty.is_empty() {
+        return Ok(with_git(dir.into(), None, false));
+    }
+    let include = match mode {
+        DirtyMode::All => true,
+        DirtyMode::Head => false,
+        DirtyMode::Ask => ask_seed_dirty(ctx.dirty.len(), dir)?,
+    };
+    // An unborn HEAD can't exclude the dirt (there's no committed state to
+    // fall back to) — the options are seeding the dirt or seeding nothing.
+    // The user's --seed-dirty=head / "N" answer wins, so refuse instead of
+    // seeding the dirt behind their back.
+    if !include && ctx.head_sha.is_none() {
+        bail!(
+            "{} has no commits yet (unborn HEAD) and {} uncommitted change(s) are excluded \
+             by --seed-dirty — nothing to seed; commit first or use --seed-dirty=all",
+            dir.display(),
+            ctx.dirty.len()
+        );
+    }
+    if include {
+        return Ok(with_git(dir.into(), None, false));
+    }
+    let src = extract_head_archive(&ctx)?;
+    Ok(with_git(
+        src,
+        Some(format!(
+            "{} uncommitted change(s) excluded — seeded from HEAD (--seed-dirty=all to include)",
+            ctx.dirty.len()
+        )),
+        true,
+    ))
+}
+
 /// path -> (mtime, mtime_nsec, size) for every entry in the virtual FS.
 /// Comparing two snapshots tells you what a run touched.
-async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i64)> {
+pub(crate) async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i64)> {
     let mut out = HashMap::new();
     let mut stack = vec![(String::new(), 1i64)]; // (path, ino); root ino = 1
     while let Some((path, ino)) = stack.pop() {
@@ -525,13 +877,14 @@ fn cmd_run(
     autostart: bool,
     auto_out: Option<PathBuf>,
     seed: Option<PathBuf>,
+    dirty: DirtyMode,
 ) -> Result<i32> {
     // full-vfs: the session DB is the whole filesystem. First run creates it
     // (optionally seeded from a dir); later runs use the DB alone — the host
     // tree is irrelevant. Snapshot before/after for the touched-this-run diff.
     let db = session_db_path(sid)?;
+    let fresh = !db.exists();
     let before = block_on(async {
-        let fresh = !db.exists();
         if fresh {
             std::fs::create_dir_all(db.parent().unwrap_or(Path::new(".")))?;
         }
@@ -539,17 +892,43 @@ fn cmd_run(
         let agent = AgentFS::open(opts).await.context("open session DB")?;
         if fresh {
             if let Some(d) = &seed {
-                let n = seed_session(&agent, d).await?;
+                let rs = resolve_seed_source(d, dirty)?;
+                let n = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await;
+                if rs.temp {
+                    // Clean up whether seeding succeeded or failed — a `?`
+                    // above would otherwise leak the HEAD-extract temp dir.
+                    let _ = std::fs::remove_dir_all(&rs.src);
+                }
+                let n = n?;
                 eprintln!(
                     "den: seeded session {sid} with {n} entries from {}",
                     d.display()
                 );
+                if rs.git_dir.is_some() {
+                    eprintln!("den: repo history seeded as /.git (private to the session)");
+                }
+                if let Some(x) = &rs.note {
+                    eprintln!("den: {x}");
+                }
+                if let Some(sha) = &rs.head_sha {
+                    // Seed-time HEAD: lets `den push` detect baseline drift
+                    // if the host repo advances between seed and push.
+                    let sd = db.parent().context("session dir")?;
+                    std::fs::write(sd.join("seed.sha"), sha)?;
+                }
             }
         } else if seed.is_some() {
             eprintln!("den: session {sid} already exists — --seed ignored (DEN_NEW=1 for a fresh session)");
         }
         anyhow::Ok(snapshot_fs(&agent).await)
     })??;
+    // Seed baseline for `den push`: a snapshot of exactly what was seeded
+    // (repo + /.git, before any agent or sandbox-setup writes). Written once
+    // at session creation; push diffs the VFS against this.
+    if fresh && seed.is_some() {
+        let sd = db.parent().context("session dir")?;
+        std::fs::write(sd.join("seed.snapshot"), push::snapshot_to_tsv(&before))?;
+    }
     let mut argv = build_argv(profile_name, passthrough)?;
     // Resolve the command on the host PATH before entering the sandbox, so a
     // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
@@ -585,18 +964,32 @@ fn cmd_run(
 }
 
 /// Strip den's own flags from a run's passthrough args (the rest go to the
-/// agent): `--seed <dir>` always, `--autostart [--out <base.ltx>]` only when
-/// --autostart is present, so plain agent args are never eaten.
-fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Option<PathBuf>, Vec<String>) {
+/// agent): `--seed <dir>` and `--seed-dirty <mode>` always, `--autostart
+/// [--out <base.ltx>]` only when --autostart is present, so plain agent args
+/// are never eaten.
+fn split_run_args(
+    rest: &[String],
+) -> (
+    bool,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<String>,
+    Vec<String>,
+) {
     let autostart = rest.iter().any(|a| a == "--autostart");
     let mut out = None;
     let mut seed = None;
+    let mut dirty = None;
     let mut pass = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
             "--seed" if rest.get(i + 1).is_some() => {
                 seed = Some(PathBuf::from(&rest[i + 1]));
+                i += 1;
+            }
+            "--seed-dirty" if rest.get(i + 1).is_some() => {
+                dirty = Some(rest[i + 1].clone());
                 i += 1;
             }
             "--autostart" => {}
@@ -608,7 +1001,7 @@ fn split_run_args(rest: &[String]) -> (bool, Option<PathBuf>, Option<PathBuf>, V
         }
         i += 1;
     }
-    (autostart, out, seed, pass)
+    (autostart, out, seed, dirty, pass)
 }
 
 /// Spawn a detached `den` subcommand for this session: stdin null, output to
@@ -928,7 +1321,10 @@ fn cmd_pull(sid: &str, url_opt: Option<&str>, force: bool, to: Option<PathBuf>) 
 
 fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
     let sid = session_id(profile_name);
-    let mut argv = build_argv(profile_name, passthrough)?;
+    // Run strips den's own flags (--seed/--seed-dirty/--autostart...); dump
+    // must preview the same argv the agent will actually get.
+    let (_, _, _, _, passthrough) = split_run_args(passthrough);
+    let mut argv = build_argv(profile_name, &passthrough)?;
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
     let allows = effective_allows(&profile(profile_name));
     println!("session: {sid}");
@@ -1181,7 +1577,7 @@ fn selftest_sandbox() -> Result<()> {
             std::fs::create_dir_all(dbp.parent().unwrap_or(Path::new(".")))?;
             let opts = AgentFSOptions::with_path(dbp.to_string_lossy().to_string());
             let agent = AgentFS::open(opts).await?;
-            let n = seed_session(&agent, &dir).await?;
+            let n = seed_session(&agent, &dir, None).await?;
             anyhow::Ok((n, snapshot_fs(&agent).await))
         })??;
         check_sandbox(n == 3, true, "seed copied 3 entries")?;
@@ -1302,6 +1698,8 @@ fn usage() -> String {
                                  new session, --autostart streams a backup watch\n  \
      den dump <cmd> [args...]    print the resolved sandbox plan (no exec)\n  \
      den inspect [session-id]     list a session's virtual FS + timeline\n  \
+     den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run]\n  \
+                [--keep] [--pr]  land a session's changes as a git branch on the host\n  \
      den sessions [--select]      list persisted sessions, optionally choose one\n  \
      den rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
      den replicate [sid] [url]    stream a session's fs.db to S3 via litestream (daemon)
@@ -1358,6 +1756,7 @@ fn main() -> Result<()> {
             cmd_inspect(&sid)
         }
         [c, rest @ ..] if c == "backup" => cmd_backup_args(rest),
+        [c, rest @ ..] if c == "push" => cmd_push_args(rest),
         [c, rest @ ..] if c == "replicate" => cmd_replicate_args(rest),
         [c, rest @ ..] if c == "pull" => cmd_pull_args(rest),
         [c, rest @ ..] if c == "restore" => cmd_restore_args(rest),
@@ -1404,11 +1803,15 @@ fn main() -> Result<()> {
             if pname == "run" {
                 bail!("den run isn't a command — the run is implicit: den <cmd> [args...]");
             }
-            let (autostart, auto_out, seed, passthrough) = split_run_args(passthrough);
+            let (autostart, auto_out, seed, dirty_raw, passthrough) = split_run_args(passthrough);
+            let dirty = match dirty_raw.as_deref() {
+                None => DirtyMode::Ask,
+                Some(s) => parse_dirty_mode(s)?,
+            };
             let sid = session_id(pname);
             let allows = effective_allows(&profile(pname));
             drop_stale_session(&sid, &allows)?;
-            let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out, seed)?;
+            let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out, seed, dirty)?;
             std::process::exit(code);
         }
     }
@@ -1423,6 +1826,122 @@ fn take_value(rest: &[String], i: &mut usize, flag: &str) -> Result<PathBuf> {
         .with_context(|| format!("{flag} needs a path"))?;
     *i += 2;
     Ok(PathBuf::from(v))
+}
+
+/// `den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run]
+/// [--keep] [--pr]` — diff the session VFS against its seed baseline and land
+/// the delta as a git branch on the host. The push runs here, outside the
+/// sandbox, at the trust boundary: the agent never sees git credentials.
+fn cmd_push_args(rest: &[String]) -> Result<()> {
+    let mut sid: Option<String> = None;
+    let mut o = push::PushOpts {
+        branch: None,
+        to: None,
+        remote: None,
+        message: None,
+        dry_run: false,
+        keep: false,
+        pr: false,
+    };
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        let value = |i: &mut usize, flag: &str| -> Result<String> {
+            let v = rest
+                .get(*i + 1)
+                .with_context(|| format!("{flag} needs a value"))?
+                .clone();
+            *i += 2;
+            Ok(v)
+        };
+        match a {
+            "--branch" => o.branch = Some(value(&mut i, a)?),
+            "--to" => o.to = Some(PathBuf::from(value(&mut i, a)?)),
+            "--remote" => o.remote = Some(value(&mut i, a)?),
+            "--message" | "-m" => o.message = Some(value(&mut i, a)?),
+            "--dry-run" => {
+                o.dry_run = true;
+                i += 1;
+            }
+            "--keep" => {
+                o.keep = true;
+                i += 1;
+            }
+            "--pr" => {
+                o.pr = true;
+                i += 1;
+            }
+            _ if a.starts_with('-') => bail!("unknown flag '{a}'"),
+            _ => {
+                if sid.is_some() {
+                    bail!("unexpected argument '{a}'");
+                }
+                sid = Some(a.to_string());
+                i += 1;
+            }
+        }
+    }
+    let sid = match sid {
+        Some(s) => s,
+        None => select_session()?,
+    };
+    let sdir = run_dir()?.join(&sid);
+    let out = block_on(push::push_session(&sid, &sdir, &o))??;
+
+    println!(
+        "den: session {sid} — {} changed, {} deleted{}{}",
+        out.changed.len(),
+        out.deleted.len(),
+        if out.ignored > 0 {
+            format!(", {} non-file ignored", out.ignored)
+        } else {
+            String::new()
+        },
+        if out.dropped > 0 {
+            format!(
+                ", {} under sandbox dirs not pushed (etc/, usr/, …)",
+                out.dropped
+            )
+        } else {
+            String::new()
+        }
+    );
+    for (mark, list) in [("M", &out.changed), ("D", &out.deleted)] {
+        for p in list.iter().take(20) {
+            println!("  {mark} {p}");
+        }
+        if list.len() > 20 {
+            println!("  … {} more", list.len() - 20);
+        }
+    }
+    if !out.status.trim().is_empty() {
+        println!("den: worktree status:");
+        for l in out.status.lines() {
+            println!("  {l}");
+        }
+    }
+    if o.dry_run {
+        match &out.worktree {
+            Some(w) => println!("den: dry-run — worktree kept at {}", w.display()),
+            None => println!("den: dry-run — worktree discarded (pass --keep to inspect it)"),
+        }
+        return Ok(());
+    }
+    if out.pushed {
+        println!("den: pushed {} ({})", out.branch, out.repo.display());
+    }
+    if !out.push_note.trim().is_empty() {
+        println!("{}", out.push_note.trim());
+    }
+    if !o.pr {
+        let gh = Command::new("gh").arg("--version").output().is_ok();
+        if gh {
+            println!("next: gh pr create --fill --head {}", out.branch);
+        } else {
+            println!("next: open a PR for branch {}", out.branch);
+        }
+    }
+    Ok(())
 }
 
 /// `den backup [sid] [--from <prev.ltx>] [--out <path>] [-c] [--watch]` — sid
@@ -1600,22 +2119,162 @@ mod tests {
     fn split_run_args_extracts_autostart() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        let (auto, out, seed, pass) = split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
+        let (auto, out, seed, dirty, pass) =
+            split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
         assert!(auto);
         assert_eq!(out.unwrap().to_str().unwrap(), "s.ltx");
-        assert!(seed.is_none());
+        assert!(seed.is_none() && dirty.is_none());
         assert_eq!(pass, v(&["-y"]));
 
         // without --autostart, --out is not stripped (but --seed always is)
-        let (auto, out, seed, pass) = split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
+        let (auto, out, seed, dirty, pass) = split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
         assert!(!auto && out.is_none());
         assert_eq!(seed.unwrap().to_str().unwrap(), ".");
+        assert!(dirty.is_none());
         assert_eq!(pass, v(&["--out", "s.ltx"]));
 
         // flags may come after positional args
-        let (auto, _, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
+        let (auto, _, _, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
         assert!(auto);
         assert_eq!(pass, v(&["-y"]));
+    }
+
+    #[test]
+    fn split_run_args_extracts_seed_dirty() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        let (_, _, seed, dirty, pass) =
+            split_run_args(&v(&["--seed", ".", "--seed-dirty", "all", "-y"]));
+        assert_eq!(seed.unwrap().to_str().unwrap(), ".");
+        assert_eq!(dirty.as_deref(), Some("all"));
+        assert_eq!(pass, v(&["-y"]));
+
+        // --seed-dirty without --seed is still stripped (harmless, ignored later)
+        let (_, _, seed, dirty, pass) = split_run_args(&v(&["--seed-dirty", "head", "task"]));
+        assert!(seed.is_none() && dirty.as_deref() == Some("head"));
+        assert_eq!(pass, v(&["task"]));
+    }
+
+    #[test]
+    fn parse_dirty_mode_validates() {
+        assert_eq!(parse_dirty_mode("ask").unwrap(), DirtyMode::Ask);
+        assert_eq!(parse_dirty_mode("all").unwrap(), DirtyMode::All);
+        assert_eq!(parse_dirty_mode("head").unwrap(), DirtyMode::Head);
+        assert!(parse_dirty_mode("").is_err());
+        assert!(parse_dirty_mode("wat").is_err());
+    }
+
+    #[test]
+    fn scrub_drops_injected_auth_headers() {
+        assert!(scrub_drop_line(
+            "\textraheader = AUTHORIZATION: basic dXNlcjp0b2s=\n"
+        ));
+        assert!(scrub_drop_line("    http.extraHeader = Bearer tok\n"));
+        assert!(!scrub_drop_line("\turl = https://user:tok@host/x.git\n"));
+        assert!(!scrub_drop_line("\tbare = true\n"));
+        assert!(!scrub_drop_line("[http \"https://example.com\"]\n"));
+    }
+
+    /// Unborn HEAD + dirty worktree + dirt excluded: refuse to seed rather    /// than silently seeding the dirt despite --seed-dirty=head / a "no".
+    #[test]
+    fn resolve_seed_unborn_dirty_bails_when_dirt_excluded() {
+        let dir = std::env::temp_dir().join(format!("den-seedtest-unborn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        let st = std::process::Command::new("git")
+            .args(["init", "-q", "."])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let rs = resolve_seed_source(&dir, DirtyMode::Head);
+        let err = rs.unwrap_err().to_string();
+        assert!(err.contains("unborn"), "err: {err}");
+        // Ask mode in a non-TTY test run also declines the dirt (same path).
+        let err2 = resolve_seed_source(&dir, DirtyMode::Ask)
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("unborn"), "err: {err2}");
+        // --seed-dirty all is the escape hatch.
+        let rs3 = resolve_seed_source(&dir, DirtyMode::All).unwrap();
+        assert!(rs3.head_sha.is_none() && rs3.git_dir.is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Dirty repo + --seed-dirty head: seeds exactly HEAD via `git archive`
+    /// (dirty edit and untracked file excluded), and seeds the repo's `.git`
+    /// as `/.git` into the session DB. Also checks the non-repo fallback.
+    #[test]
+    fn resolve_seed_head_extracts_committed_state() {
+        let git = |dir: &Path, c: &str| {
+            let st = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(c)
+                .current_dir(dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "cmd failed: {c}");
+        };
+        let dir = std::env::temp_dir().join(format!("den-seedtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "committed\n").unwrap();
+        git(&dir, "git init -q .");
+        git(
+            &dir,
+            "git remote add origin https://user:tok123@github.com/x/y.git",
+        );
+        git(&dir, "git -c user.email=t@t -c user.name=t add a.txt");
+        git(&dir, "git -c user.email=t@t -c user.name=t commit -qm init");
+        std::fs::write(dir.join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(dir.join("untracked.txt"), "x\n").unwrap();
+
+        let rs = resolve_seed_source(&dir, DirtyMode::Head).unwrap();
+        assert!(rs.temp && rs.note.as_deref().unwrap().contains("excluded"));
+        assert!(rs.head_sha.is_some(), "seed-time HEAD sha must be captured");
+        assert_eq!(
+            std::fs::read_to_string(rs.src.join("a.txt")).unwrap(),
+            "committed\n"
+        );
+        assert!(!rs.src.join("untracked.txt").exists());
+        assert!(rs.git_dir.as_ref().unwrap().ends_with(".git"));
+
+        // Full path: seed into a session DB, /.git must land with real history.
+        let sid = format!("selftest-seedgit-{}", std::process::id());
+        let dbp = session_db_path(&sid).unwrap();
+        block_on(async {
+            std::fs::create_dir_all(dbp.parent().unwrap())?;
+            let opts = AgentFSOptions::with_path(dbp.to_string_lossy().to_string());
+            let agent = AgentFS::open(opts).await?;
+            seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await?;
+            let snap = snapshot_fs(&agent).await;
+            assert!(snap.contains_key("/a.txt"));
+            assert!(snap.contains_key("/.git/HEAD"));
+            // /.git ships with the session — its config url must arrive
+            // credential-free.
+            let cfg_raw = agent.fs.read_file("/.git/config").await?.unwrap();
+            let cfg = String::from_utf8_lossy(&cfg_raw);
+            assert!(cfg.contains("https://github.com/x/y.git"), "url: {cfg}");
+            assert!(!cfg.contains("tok123"), "credentials leaked: {cfg}");
+            anyhow::Ok(())
+        })
+        .unwrap()
+        .unwrap();
+
+        std::fs::remove_dir_all(&rs.src).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(dbp.parent().unwrap());
+
+        // Non-repo dir: no git context, live seed, no temp.
+        let plain = std::env::temp_dir().join(format!("den-seedtest-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+        let rs2 = resolve_seed_source(&plain, DirtyMode::Ask).unwrap();
+        assert!(rs2.git_dir.is_none() && !rs2.temp && rs2.note.is_none());
+        std::fs::remove_dir_all(&plain).unwrap();
     }
 
     #[test]

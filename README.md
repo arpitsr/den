@@ -11,6 +11,30 @@ open the DB and nothing else: the host tree is hidden behind the mount and
 irrelevant. Every session is self-contained and shippable to another machine
 (`den backup` / `den replicate` + `den pull`).
 
+### Seeding
+
+`--seed <dir>` copies the dir into the session's virtual FS before the agent
+starts. When the dir is inside a git repo, seeding is git-aware:
+
+- The repo's `.git` is seeded too, as `/.git`: the agent can `git diff`,
+  `git log`, and branch/commit inside the session — all private; the host
+  repo is never touched, and the copy ships with `den backup` like
+  everything else in the session DB. (Only when the seed dir *is* the repo
+  root — a subdir seed gets no `/.git`, since a root-level history would
+  mis-describe the partial tree; linked worktrees and submodules, where
+  `.git` is a file, get no history either.) Remote URLs in `/.git/config`
+  have credentials (`user:pass@host`) stripped before seeding, so host
+  secrets don't ride along in the session DB.
+- If the worktree has uncommitted changes, `den` asks:
+  `N uncommitted change(s) — seed them too? [y/N]`. The default is **N**:
+  the session is then seeded from HEAD via `git archive`, so it holds
+  exactly the committed state — dirty edits and untracked files stay on the
+  host. Non-interactive runs default to N without prompting.
+- `--seed-dirty ask|all|head` overrides: `all` always seeds the dirty
+  worktree, `head` never asks. Note `git archive` honors `export-ignore`
+  attributes, so a repo that export-ignores (say) its tests seeds without
+  them.
+
 ## Design
 
 The sandbox layer is **in this binary** — no `agentfs` CLI dependency:
@@ -73,6 +97,7 @@ cargo install --path .                         # installs a binary named `den`
 ```bash
 cd /path/to/your/project
 den claude --seed . "refactor auth"   # new session preloaded with the cwd; runs `claude` inside
+den claude --seed . --seed-dirty all "finish the wip"  # seed uncommitted changes too (default: ask [y/N], N seeds HEAD)
 den claude "continue the refactor"    # resumes: the DB is the whole FS, host tree ignored
 den codex  "fix the flaky test"       # separate session per profile+dir
 den pi     "..."                      # no --seed: starts in an empty virtual FS
@@ -84,6 +109,8 @@ den dump codex exec --json    # print the exact run argv (no exec)
 den sessions                  # list persisted sessions with entry counts
 den sessions --select         # show numbered sessions, choose one, print its id
 den inspect [session-id]      # open a session's fs.db; omit id to choose interactively
+den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run] [--keep] [--pr]
+                              # land a session's changes as a git branch on the host
 den backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's fs.db
 den restore <file.ltx> [--to db]                      # apply an LTX backup (and chain) back
 den ltx <file.ltx>            # inspect/verify a backup file
@@ -109,6 +136,27 @@ the exact environment on another machine or VM — no host checkout needed.
 Note: because resumed sessions see only the DB, host-side changes (`git pull`,
 IDE edits) are invisible to an existing session. Start a fresh one
 (`DEN_NEW=1`) when the world outside changes.
+
+### Landing changes as a branch (`den push`)
+
+The agent's writes live only in the session DB — and that's where they should
+land from. `den push` (the host process, which never shows the sandbox its git
+credentials — the seeded `/.git/config` is scrubbed at seed time) diffs the
+session VFS against its seed baseline, applies the delta to a throwaway
+worktree of the host repo, commits, and pushes a branch:
+
+```bash
+den claude --seed . "fix the flaky test"     # agent works in its private sandbox
+den push                                     # -> branch den/claude-myproject, pushed to origin
+den push mysession --branch den/agent-2 -m "flaky: retry on timeout" --pr
+den push --dry-run --keep                    # apply to a kept worktree, commit nothing
+```
+
+The result is a reviewable PR: fan out N sessions on N tasks, push each to its
+own branch, review, merge. The sandbox itself never gains push power — no
+credentials inside the VFS, no egress needed; the push runs at the trust
+boundary, on the host. Changes under system dirs (`/etc`, `/tmp`, `/.git`, …)
+are never pushed; the session's `.git` is its own private history.
 
 ### Resume / fresh / quiet
 
