@@ -75,7 +75,10 @@ impl NetMode {
             Ok("full") => NetMode::Full,
             Ok("proxy") => NetMode::Proxy,
             Ok(other) => {
-                eprintln!("warning: unknown DEN_NET={} (proxy|none|full), using proxy", other);
+                eprintln!(
+                    "warning: unknown DEN_NET={} (proxy|none|full), using proxy",
+                    other
+                );
                 NetMode::Proxy
             }
             Err(_) => {
@@ -95,12 +98,13 @@ impl NetMode {
 
 /// Is a binary on PATH? (dumb but adequate)
 fn bin_found(bin: &str) -> bool {
-    std::env::var("PATH").map_or(false, |path| {
-        path.split(':').any(|dir| {
+    match std::env::var("PATH") {
+        Ok(path) => path.split(':').any(|dir| {
             let p = Path::new(dir).join(bin);
             p.is_file()
-        })
-    })
+        }),
+        Err(_) => false,
+    }
 }
 
 /// Global child PID for signal forwarding (set by the parent): N, plus the
@@ -301,7 +305,11 @@ pub async fn run_cmd(
         timeout: FUSE_MOUNT_TIMEOUT,
     };
 
-    let mount_handle = mount_fs(std::sync::Arc::new(tokio::sync::Mutex::new(agentfs.fs)), mount_opts).await?;
+    let mount_handle = mount_fs(
+        std::sync::Arc::new(tokio::sync::Mutex::new(agentfs.fs)),
+        mount_opts,
+    )
+    .await?;
 
     let net = NetMode::from_env();
     let exit_code = run_chain(
@@ -377,7 +385,10 @@ fn run_chain(
         match spawn_proxy() {
             Ok(pid) => proxy_pid = pid,
             Err(e) => {
-                eprintln!("warning: failed to start proxy, continuing without egress: {}", e);
+                eprintln!(
+                    "warning: failed to start proxy, continuing without egress: {}",
+                    e
+                );
             }
         }
     }
@@ -481,6 +492,9 @@ fn run_chain(
 /// "0 <host-uid> 1" — in-ns root so exec keeps its caps, the standard
 /// rootless-sandbox pattern), forks U, spawns slirp4netns once U's netns
 /// exists, waits for the agent pid, forwards signals, reaps everything.
+// Arity is intentional: N's setup plumbing mirrors the fork/exec boundary,
+// bundling it into a struct would just add indirection at every use site.
+#[allow(clippy::too_many_arguments)]
 fn run_ns_holder(
     cwd: &Path,
     fuse_mountpoint: &Path,
@@ -533,7 +547,10 @@ fn run_ns_holder(
     // SAFETY: fork() in a single-threaded child.
     let upid = unsafe { libc::fork() };
     if upid < 0 {
-        child_exit(&format!("Failed to fork: {}", std::io::Error::last_os_error()));
+        child_exit(&format!(
+            "Failed to fork: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     if upid == 0 {
         // U: keep the U-side ends (netns_write, netready_read, apid_write).
@@ -632,7 +649,12 @@ fn run_ns_holder(
 fn spawn_proxy() -> Result<libc::pid_t> {
     // Chain to the host's own proxy if one is set (e.g. a mitm wrapper).
     let host_proxy = [
-        "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
     ]
     .iter()
     .find_map(|v| std::env::var(v).ok());
@@ -724,6 +746,8 @@ fn wait_slirp_ready(ready_r: libc::c_int) -> bool {
 /// U: the deep sandbox. New mount/pid/ipc/uts/net namespaces, fresh tmpfs
 /// trees (/tmp, /run, /var/tmp, /dev), nft egress policy (proxy mode), the
 /// RO sweep, secret hides, then fork A (pid 1 of the pid ns) and reap it.
+// Same as above: U's setup plumbing mirrors the fork/exec boundary.
+#[allow(clippy::too_many_arguments)]
 fn run_sandbox_child(
     cwd: &Path,
     fuse_mountpoint: &Path,
@@ -789,7 +813,9 @@ fn run_sandbox_child(
     // point, so it becomes pid 1 of the new pid namespace.
     // SAFETY: unshare() with valid flags; error handled.
     if unsafe {
-        libc::unshare(libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS)
+        libc::unshare(
+            libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS,
+        )
     } != 0
     {
         child_exit(&format!(
@@ -835,7 +861,11 @@ fn run_sandbox_child(
 
     // Step 4: fresh tmpfs trees for /tmp, /var/tmp, /run (writes there are
     // invisible to the host). Skipped when they'd swallow the cwd itself.
-    for (dir, mode) in [("/tmp", "mode=1777"), ("/var/tmp", "mode=1777"), ("/run", "mode=755")] {
+    for (dir, mode) in [
+        ("/tmp", "mode=1777"),
+        ("/var/tmp", "mode=1777"),
+        ("/run", "mode=755"),
+    ] {
         if cwd == Path::new(dir) {
             continue;
         }
@@ -938,7 +968,10 @@ fn run_sandbox_child(
     if std::env::var("DEN_SANDBOX_DEBUG").is_ok() {
         if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
             for line in s.lines() {
-                if line.starts_with("VmSize") || line.starts_with("VmRSS") || line.starts_with("VmData") {
+                if line.starts_with("VmSize")
+                    || line.starts_with("VmRSS")
+                    || line.starts_with("VmData")
+                {
                     eprintln!("sandbox-U: {}", line);
                 }
             }
@@ -953,7 +986,10 @@ fn run_sandbox_child(
     // SAFETY: fork() in a single-threaded child.
     let apid = unsafe { libc::fork() };
     if apid < 0 {
-        child_exit(&format!("Failed to fork: {}", std::io::Error::last_os_error()));
+        child_exit(&format!(
+            "Failed to fork: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     if apid == 0 {
         run_agent(command, args, session_id);
@@ -1007,7 +1043,10 @@ fn run_agent(command: PathBuf, args: Vec<String>, session_id: &str) -> ! {
     // SAFETY: fork() in a single-threaded child.
     let apid = unsafe { libc::fork() };
     if apid < 0 {
-        child_exit(&format!("Failed to fork the agent: {}", std::io::Error::last_os_error()));
+        child_exit(&format!(
+            "Failed to fork the agent: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     if apid == 0 {
         run_agent_exec(command, args, session_id);
@@ -1107,7 +1146,10 @@ fn setup_dev() {
         )
     } != 0
     {
-        child_exit(&format!("Failed to mount tmpfs on /dev: {}", std::io::Error::last_os_error()));
+        child_exit(&format!(
+            "Failed to mount tmpfs on /dev: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
     for dir in ["/dev/pts", "/dev/shm", "/dev/net"] {
@@ -1209,7 +1251,10 @@ fn apply_nft_rules() -> Result<()> {
 fn apply_hides(cwd: &Path) {
     for h in effective_hides() {
         if cwd.starts_with(&h) {
-            eprintln!("warning: not hiding {} (contains the working directory)", h.display());
+            eprintln!(
+                "warning: not hiding {} (contains the working directory)",
+                h.display()
+            );
             continue;
         }
         hide_one(&h, cwd);
@@ -1222,7 +1267,9 @@ fn hide_one(target: &Path, cwd: &Path) {
     if cwd.starts_with(target) {
         return;
     }
-    let Ok(meta) = fs::metadata(target) else { return };
+    let Ok(meta) = fs::metadata(target) else {
+        return;
+    };
     let t_cstr = match CString::new(target.as_os_str().as_bytes()) {
         Ok(s) => s,
         Err(_) => return,
@@ -1271,7 +1318,9 @@ fn hide_aliases(h: &Path, cwd: &Path) {
             if *m == anc {
                 continue; // same path — already hidden
             }
-            let Ok(rel) = h.strip_prefix(&anc) else { continue };
+            let Ok(rel) = h.strip_prefix(&anc) else {
+                continue;
+            };
             if rel.as_os_str().is_empty() {
                 continue;
             }
@@ -1331,8 +1380,8 @@ fn effective_hides() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut hides: Vec<PathBuf> = Vec::new();
     let mut add = |p: &str| {
-        let pb = if p.starts_with("~/") {
-            Path::new(&home).join(&p[2..])
+        let pb = if let Some(rest) = p.strip_prefix("~/") {
+            Path::new(&home).join(rest)
         } else if p.starts_with('/') {
             PathBuf::from(p)
         } else if !home.is_empty() {
@@ -1354,8 +1403,8 @@ fn effective_hides() -> Vec<PathBuf> {
     }
     if let Ok(no) = std::env::var("DEN_NO_HIDE") {
         for p in no.split(':').filter(|s| !s.is_empty()) {
-            let pb = if p.starts_with("~/") {
-                Path::new(&home).join(&p[2..])
+            let pb = if let Some(rest) = p.strip_prefix("~/") {
+                Path::new(&home).join(rest)
             } else if p.starts_with('/') {
                 PathBuf::from(p)
             } else {
@@ -1618,13 +1667,24 @@ fn setup_env_vars(session_id: &str) {
     // (DEN_PROXY_URL is set by M before the fork; inherited down the chain).
     if let Ok(proxy_url) = std::env::var("DEN_PROXY_URL") {
         for v in [
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
-            "NO_PROXY", "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
         ] {
             std::env::remove_var(v);
         }
         for v in [
-            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
         ] {
             std::env::set_var(v, &proxy_url);
         }
@@ -1794,7 +1854,11 @@ fn path_to_cstring(path: &Path, description: &str) -> CString {
     match CString::new(path.as_os_str().as_bytes()) {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("Invalid {} (contains NUL byte): {}", description, path.display());
+            eprintln!(
+                "Invalid {} (contains NUL byte): {}",
+                description,
+                path.display()
+            );
             // SAFETY: in a forked child, _exit avoids atexit handlers and
             // stdio flushing that belong to the parent.
             unsafe { libc::_exit(1) }
@@ -1917,9 +1981,7 @@ fn apply_rlimits() {
 /// caller).
 #[cfg(target_arch = "x86_64")]
 fn install_seccomp() -> Result<()> {
-    use libc::{
-        BPF_ABS, BPF_JMP, BPF_JEQ, BPF_K, BPF_LD, BPF_RET, BPF_W, sock_filter, sock_fprog,
-    };
+    use libc::{sock_filter, sock_fprog, BPF_ABS, BPF_JEQ, BPF_JMP, BPF_K, BPF_LD, BPF_RET, BPF_W};
 
     const AUDIT_ARCH_X86_64: u32 = 0xc000003e;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
@@ -1932,9 +1994,9 @@ fn install_seccomp() -> Result<()> {
     /// open_by_handle_at, the new mount API (open_tree ... mount_setattr),
     /// userfaultfd, kcmp, process_madvise, process_mrelease, socket (below).
     const DENY: &[i64] = &[
-        165, 166, 101, 310, 311, 321, 298, 250, 248, 249, 246, 320, 169, 167, 168, 175, 313,
-        176, 308, 272, 170, 171, 155, 161, 172, 173, 304, 303, 428, 429, 430, 431, 432, 433,
-        442, 323, 312, 440, 448,
+        165, 166, 101, 310, 311, 321, 298, 250, 248, 249, 246, 320, 169, 167, 168, 175, 313, 176,
+        308, 272, 170, 171, 155, 161, 172, 173, 304, 303, 428, 429, 430, 431, 432, 433, 442, 323,
+        312, 440, 448,
     ];
 
     let mut ins: Vec<sock_filter> = Vec::new();
@@ -1946,7 +2008,12 @@ fn install_seccomp() -> Result<()> {
     emit((BPF_LD | BPF_W | BPF_ABS) as u16, 0, 0, 4);
     // 1: arch match → skip the ENOSYS ret; mismatch → ENOSYS
     emit((BPF_JMP | BPF_JEQ | BPF_K) as u16, 1, 0, AUDIT_ARCH_X86_64);
-    emit((BPF_RET | BPF_K) as u16, 0, 0, SECCOMP_RET_ERRNO | libc::ENOSYS as u32);
+    emit(
+        (BPF_RET | BPF_K) as u16,
+        0,
+        0,
+        SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+    );
     // 3: load syscall nr
     emit((BPF_LD | BPF_W | BPF_ABS) as u16, 0, 0, 0);
 
@@ -1960,7 +2027,12 @@ fn install_seccomp() -> Result<()> {
     let deny_ret = socket_jeq + 4; // jeq + LD + 2 family jeqs
     let allow_ret = deny_ret + 1;
     for (i, &nr) in DENY.iter().enumerate() {
-        emit((BPF_JMP | BPF_JEQ | BPF_K) as u16, (deny_ret - (4 + i) - 1) as u8, 0, nr as u32);
+        emit(
+            (BPF_JMP | BPF_JEQ | BPF_K) as u16,
+            (deny_ret - (4 + i) - 1) as u8,
+            0,
+            nr as u32,
+        );
     }
     // socket: only AF_NETLINK (16) and AF_PACKET (17) are denied; anything
     // else (including non-socket syscalls) jumps straight to ALLOW.
@@ -1985,7 +2057,12 @@ fn install_seccomp() -> Result<()> {
     );
 
     // deny / allow terminators
-    emit((BPF_RET | BPF_K) as u16, 0, 0, SECCOMP_RET_ERRNO | libc::EPERM as u32);
+    emit(
+        (BPF_RET | BPF_K) as u16,
+        0,
+        0,
+        SECCOMP_RET_ERRNO | libc::EPERM as u32,
+    );
     emit((BPF_RET | BPF_K) as u16, 0, 0, SECCOMP_RET_ALLOW);
 
     let mut prog = sock_fprog {
@@ -1995,9 +2072,20 @@ fn install_seccomp() -> Result<()> {
 
     // SAFETY: prctl with a valid sock_fprog; the filter array lives in `ins`
     // for the whole call.
-    if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &mut prog, 0, 0) } != 0
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &mut prog,
+            0,
+            0,
+        )
+    } != 0
     {
-        bail!("prctl(PR_SET_SECCOMP) failed: {}", std::io::Error::last_os_error());
+        bail!(
+            "prctl(PR_SET_SECCOMP) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
     Ok(())
 }
@@ -2007,4 +2095,3 @@ fn install_seccomp() -> Result<()> {
     eprintln!("warning: seccomp deny-list not implemented for this architecture");
     Ok(())
 }
-

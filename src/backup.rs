@@ -20,8 +20,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use litetx::{
-    Checksum, Decoder, Encoder, Header, HeaderFlags, PageChecksum, PageNum, PageSize, Trailer,
-    TXID,
+    Checksum, Decoder, Encoder, Header, HeaderFlags, PageChecksum, PageNum, PageSize, Trailer, TXID,
 };
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -165,7 +164,11 @@ fn cmd_backup_inner(
     };
 
     let size = std::fs::metadata(out)?.len();
-    let kind = if is_snapshot(&header) { "snapshot" } else { "delta" };
+    let kind = if is_snapshot(&header) {
+        "snapshot"
+    } else {
+        "delta"
+    };
     println!(
         "den: backed up session {sid} -> {} ({kind}, txid {}, {n_pages} pages of {ps} B, {size} bytes)",
         out.display(),
@@ -225,8 +228,12 @@ pub(crate) fn existing_chain_indices(base: &Path) -> Result<Vec<u32>> {
     for entry in std::fs::read_dir(dir)? {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().to_string();
-        let Some(rest) = name.strip_prefix(&prefix) else { continue };
-        let Some(num) = rest.strip_suffix(&ext) else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(num) = rest.strip_suffix(&ext) else {
+            continue;
+        };
         if num.len() >= 4 && num.chars().all(|c| c.is_ascii_digit()) {
             idxs.push(num.parse().unwrap_or(0));
         }
@@ -431,7 +438,10 @@ fn write_delta(
     let prev_checksums: HashMap<u32, Checksum> = ppages
         .iter()
         .map(|(pgno, data)| {
-            (*pgno, data.page_checksum(PageNum::new(*pgno).expect("pgno > 0")))
+            (
+                *pgno,
+                data.page_checksum(PageNum::new(*pgno).expect("pgno > 0")),
+            )
         })
         .collect();
 
@@ -593,7 +603,11 @@ fn restore_delta(
 pub fn cmd_ltx_info(path: &Path) -> Result<()> {
     let (header, pages, trailer) = read_ltx(path)?; // verifies the file checksum
     let size = std::fs::metadata(path)?.len();
-    let kind = if is_snapshot(&header) { "snapshot" } else { "delta" };
+    let kind = if is_snapshot(&header) {
+        "snapshot"
+    } else {
+        "delta"
+    };
     println!("file: {} ({size} bytes)", path.display());
     println!(
         "  {kind}: page size {}, commit {} pages, txid {} -> {}, flags {:#x}",
@@ -744,7 +758,10 @@ mod tests {
     /// Reopen a session's DB and add one file (mutates the fs.db).
     fn mutate_session(sid: &str, base: &str, name: &str) {
         std::fs::create_dir_all(base).unwrap();
-        let db = crate::session_db_path(sid).unwrap().to_string_lossy().to_string();
+        let db = crate::session_db_path(sid)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let agent = AgentFS::open(AgentFSOptions::with_path(&db).with_base(base))
@@ -822,7 +839,7 @@ mod tests {
         build_session(sid, home.dir.0.join("base").to_str().unwrap());
         let out = home.dir.0.join("test-proj.ltx");
         cmd_backup(sid, None, &out, true).unwrap(); // compressed
-        // decoding verifies the file checksum — no panic/err means it's valid
+                                                    // decoding verifies the file checksum — no panic/err means it's valid
         cmd_ltx_info(&out).unwrap();
     }
 

@@ -20,8 +20,8 @@ use fuser::{
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
@@ -94,7 +94,10 @@ pub(crate) struct DeferredNotifier {
 
 #[derive(Debug)]
 pub(crate) enum NotifyOp {
-    InvalEntry { parent: u64, name: std::ffi::OsString },
+    InvalEntry {
+        parent: u64,
+        name: std::ffi::OsString,
+    },
 }
 
 impl DeferredNotifier {
@@ -472,9 +475,10 @@ impl Filesystem for AgentFSFuse {
         let gid = req.gid();
         let fs = self.fs.clone();
         let name_owned = name_str.to_string();
-        match self.runtime.block_on(async move {
-            fs.mkdir(parent as i64, &name_owned, mode, uid, gid).await
-        }) {
+        match self
+            .runtime
+            .block_on(async move { fs.mkdir(parent as i64, &name_owned, mode, uid, gid).await })
+        {
             Ok(stats) => reply.entry(&TTL, &fillattr(&stats), 0),
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -520,12 +524,16 @@ impl Filesystem for AgentFSFuse {
         let fs = self.fs.clone();
         let name_owned = name_str.to_string();
         match self.runtime.block_on(async move {
-            fs.create_file(parent as i64, &name_owned, mode, uid, gid).await
+            fs.create_file(parent as i64, &name_owned, mode, uid, gid)
+                .await
         }) {
             Ok((stats, file)) => {
                 let attr = fillattr(&stats);
                 let fh = self.alloc_fh();
-                self.open_files.lock().unwrap().insert(fh, OpenFile { file });
+                self.open_files
+                    .lock()
+                    .unwrap()
+                    .insert(fh, OpenFile { file });
                 reply.created(&TTL, &attr, 0, fh, 0);
             }
             Err(e) => reply.error(error_to_errno(&e)),
@@ -550,7 +558,8 @@ impl Filesystem for AgentFSFuse {
         let name_owned = name_str.to_string();
         let target_owned = target_str.to_string();
         match self.runtime.block_on(async move {
-            fs.symlink(parent as i64, &name_owned, &target_owned, uid, gid).await
+            fs.symlink(parent as i64, &name_owned, &target_owned, uid, gid)
+                .await
         }) {
             Ok(stats) => reply.entry(&TTL, &fillattr(&stats), 0),
             Err(e) => reply.error(error_to_errno(&e)),
@@ -571,9 +580,10 @@ impl Filesystem for AgentFSFuse {
         };
         let fs = self.fs.clone();
         let name_owned = name_str.to_string();
-        match self.runtime.block_on(async move {
-            fs.link(ino as i64, newparent as i64, &name_owned).await
-        }) {
+        match self
+            .runtime
+            .block_on(async move { fs.link(ino as i64, newparent as i64, &name_owned).await })
+        {
             Ok(stats) => reply.entry(&TTL, &fillattr(&stats), 0),
             Err(e) => reply.error(error_to_errno(&e)),
         }
@@ -643,7 +653,10 @@ impl Filesystem for AgentFSFuse {
         {
             Ok(file) => {
                 let fh = self.alloc_fh();
-                self.open_files.lock().unwrap().insert(fh, OpenFile { file });
+                self.open_files
+                    .lock()
+                    .unwrap()
+                    .insert(fh, OpenFile { file });
                 reply.opened(fh, 0);
             }
             Err(e) => reply.error(error_to_errno(&e)),
@@ -710,7 +723,14 @@ impl Filesystem for AgentFSFuse {
     }
 
     /// Writes go straight to the DB, so flush is a no-op.
-    fn flush(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
         if self.open_files.lock().unwrap().contains_key(&fh) {
             reply.ok();
         } else {
@@ -718,7 +738,14 @@ impl Filesystem for AgentFSFuse {
         }
     }
 
-    fn fsync(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _datasync: bool, reply: ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
         let file = {
             let open_files = self.open_files.lock().unwrap();
             match open_files.get(&fh) {
@@ -790,10 +817,8 @@ impl Filesystem for AgentFSFuse {
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuse_forget_one]) {
         let fs = self.fs.clone();
-        let nodes_vec: Vec<(i64, u64)> = nodes
-            .iter()
-            .map(|n| (n.nodeid as i64, n.nlookup))
-            .collect();
+        let nodes_vec: Vec<(i64, u64)> =
+            nodes.iter().map(|n| (n.nodeid as i64, n.nlookup)).collect();
         self.runtime.block_on(async move {
             for (ino, nlookup) in nodes_vec {
                 fs.forget(ino, nlookup).await;
@@ -927,5 +952,7 @@ pub(crate) fn mount(
     });
 
     let _ = ready_tx.send(Ok(()));
-    session.run().map_err(|e| anyhow::anyhow!("FUSE session ended with error: {e}"))
+    session
+        .run()
+        .map_err(|e| anyhow::anyhow!("FUSE session ended with error: {e}"))
 }
