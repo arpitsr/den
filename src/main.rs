@@ -61,6 +61,7 @@ mod mount;
 #[cfg(target_os = "linux")]
 mod policy;
 mod proxy;
+pub(crate) mod push;
 #[cfg(target_os = "linux")]
 mod sandbox;
 
@@ -229,7 +230,7 @@ fn cwd_string() -> String {
 
 /// Run one future on a throwaway runtime (sync CLI entry points).
 /// Note: if the future itself returns Result, you need `??` at the call site.
-fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
+pub(crate) fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
     Ok(tokio::runtime::Runtime::new()?.block_on(f))
 }
 
@@ -403,7 +404,11 @@ const SEED_EXCLUDES: &[&str] = &[".git", "node_modules", "target"];
 /// session; the host repo is never touched. The copy ships with backup/
 /// replicate like everything else in the session DB.
 /// ponytail: whole-file reads; chunk pwrite if giant binaries ever matter.
-async fn seed_session(agent: &AgentFS, dir: &Path, git_dir: Option<&Path>) -> Result<u64> {
+pub(crate) async fn seed_session(
+    agent: &AgentFS,
+    dir: &Path,
+    git_dir: Option<&Path>,
+) -> Result<u64> {
     let mut count = seed_tree(agent, dir, PathBuf::new()).await?;
     if let Some(g) = git_dir {
         count += seed_tree(agent, g, PathBuf::from(".git")).await?;
@@ -472,7 +477,7 @@ fn scrub_url_creds(line: &str) -> Option<String> {
 /// The walk only creates children — a non-empty `rel0` mountpoint must be
 /// mkdir'd here first, or its first child create fails.
 /// ponytail: whole-file reads; chunk pwrite if giant binaries ever matter.
-async fn seed_tree(agent: &AgentFS, host_root: &Path, rel0: PathBuf) -> Result<u64> {
+pub(crate) async fn seed_tree(agent: &AgentFS, host_root: &Path, rel0: PathBuf) -> Result<u64> {
     use std::os::unix::fs::MetadataExt;
     let mut count = 0u64;
     let mut stack = vec![(host_root.to_path_buf(), rel0)]; // (host dir, vfs-relative)
@@ -729,7 +734,7 @@ fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
 
 /// path -> (mtime, mtime_nsec, size) for every entry in the virtual FS.
 /// Comparing two snapshots tells you what a run touched.
-async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i64)> {
+pub(crate) async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i64)> {
     let mut out = HashMap::new();
     let mut stack = vec![(String::new(), 1i64)]; // (path, ino); root ino = 1
     while let Some((path, ino)) = stack.pop() {
@@ -808,8 +813,8 @@ fn cmd_run(
     // (optionally seeded from a dir); later runs use the DB alone — the host
     // tree is irrelevant. Snapshot before/after for the touched-this-run diff.
     let db = session_db_path(sid)?;
+    let fresh = !db.exists();
     let before = block_on(async {
-        let fresh = !db.exists();
         if fresh {
             std::fs::create_dir_all(db.parent().unwrap_or(Path::new(".")))?;
         }
@@ -841,6 +846,13 @@ fn cmd_run(
         }
         anyhow::Ok(snapshot_fs(&agent).await)
     })??;
+    // Seed baseline for `den push`: a snapshot of exactly what was seeded
+    // (repo + /.git, before any agent or sandbox-setup writes). Written once
+    // at session creation; push diffs the VFS against this.
+    if fresh && seed.is_some() {
+        let sd = db.parent().context("session dir")?;
+        std::fs::write(sd.join("seed.snapshot"), push::snapshot_to_tsv(&before))?;
+    }
     let mut argv = build_argv(profile_name, passthrough)?;
     // Resolve the command on the host PATH before entering the sandbox, so a
     // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
@@ -1610,6 +1622,8 @@ fn usage() -> String {
                                  new session, --autostart streams a backup watch\n  \
      den dump <cmd> [args...]    print the resolved sandbox plan (no exec)\n  \
      den inspect [session-id]     list a session's virtual FS + timeline\n  \
+     den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run]\n  \
+                [--keep] [--pr]  land a session's changes as a git branch on the host\n  \
      den sessions [--select]      list persisted sessions, optionally choose one\n  \
      den rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
      den replicate [sid] [url]    stream a session's fs.db to S3 via litestream (daemon)
@@ -1666,6 +1680,7 @@ fn main() -> Result<()> {
             cmd_inspect(&sid)
         }
         [c, rest @ ..] if c == "backup" => cmd_backup_args(rest),
+        [c, rest @ ..] if c == "push" => cmd_push_args(rest),
         [c, rest @ ..] if c == "replicate" => cmd_replicate_args(rest),
         [c, rest @ ..] if c == "pull" => cmd_pull_args(rest),
         [c, rest @ ..] if c == "restore" => cmd_restore_args(rest),
@@ -1735,6 +1750,114 @@ fn take_value(rest: &[String], i: &mut usize, flag: &str) -> Result<PathBuf> {
         .with_context(|| format!("{flag} needs a path"))?;
     *i += 2;
     Ok(PathBuf::from(v))
+}
+
+/// `den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run]
+/// [--keep] [--pr]` — diff the session VFS against its seed baseline and land
+/// the delta as a git branch on the host. The push runs here, outside the
+/// sandbox, at the trust boundary: the agent never sees git credentials.
+fn cmd_push_args(rest: &[String]) -> Result<()> {
+    let mut sid: Option<String> = None;
+    let mut o = push::PushOpts {
+        branch: None,
+        to: None,
+        remote: None,
+        message: None,
+        dry_run: false,
+        keep: false,
+        pr: false,
+    };
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        let value = |i: &mut usize, flag: &str| -> Result<String> {
+            let v = rest
+                .get(*i + 1)
+                .with_context(|| format!("{flag} needs a value"))?
+                .clone();
+            *i += 2;
+            Ok(v)
+        };
+        match a {
+            "--branch" => o.branch = Some(value(&mut i, a)?),
+            "--to" => o.to = Some(PathBuf::from(value(&mut i, a)?)),
+            "--remote" => o.remote = Some(value(&mut i, a)?),
+            "--message" | "-m" => o.message = Some(value(&mut i, a)?),
+            "--dry-run" => {
+                o.dry_run = true;
+                i += 1;
+            }
+            "--keep" => {
+                o.keep = true;
+                i += 1;
+            }
+            "--pr" => {
+                o.pr = true;
+                i += 1;
+            }
+            _ if a.starts_with('-') => bail!("unknown flag '{a}'"),
+            _ => {
+                if sid.is_some() {
+                    bail!("unexpected argument '{a}'");
+                }
+                sid = Some(a.to_string());
+                i += 1;
+            }
+        }
+    }
+    let sid = match sid {
+        Some(s) => s,
+        None => select_session()?,
+    };
+    let sdir = run_dir()?.join(&sid);
+    let out = block_on(push::push_session(&sid, &sdir, &o))??;
+
+    println!(
+        "den: session {sid} — {} changed, {} deleted{}",
+        out.changed.len(),
+        out.deleted.len(),
+        if out.ignored > 0 {
+            format!(", {} non-file ignored", out.ignored)
+        } else {
+            String::new()
+        }
+    );
+    for (mark, list) in [("M", &out.changed), ("D", &out.deleted)] {
+        for p in list.iter().take(20) {
+            println!("  {mark} {p}");
+        }
+        if list.len() > 20 {
+            println!("  … {} more", list.len() - 20);
+        }
+    }
+    if !out.status.trim().is_empty() {
+        println!("den: worktree status:");
+        for l in out.status.lines() {
+            println!("  {l}");
+        }
+    }
+    if o.dry_run {
+        match &out.worktree {
+            Some(w) => println!("den: dry-run — worktree kept at {}", w.display()),
+            None => println!("den: dry-run — worktree discarded (pass --keep to inspect it)"),
+        }
+        return Ok(());
+    }
+    if out.pushed {
+        println!("den: pushed {} ({})", out.branch, out.repo.display());
+    }
+    if !out.push_note.trim().is_empty() {
+        println!("{}", out.push_note.trim());
+    }
+    if !o.pr {
+        let gh = Command::new("gh").arg("--version").output().is_ok();
+        if gh {
+            println!("next: gh pr create --fill --head {}", out.branch);
+        } else {
+            println!("next: open a PR for branch {}", out.branch);
+        }
+    }
+    Ok(())
 }
 
 /// `den backup [sid] [--from <prev.ltx>] [--out <path>] [-c] [--watch]` — sid

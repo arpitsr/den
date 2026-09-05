@@ -109,6 +109,8 @@ den dump codex exec --json    # print the exact run argv (no exec)
 den sessions                  # list persisted sessions with entry counts
 den sessions --select         # show numbered sessions, choose one, print its id
 den inspect [session-id]      # open a session's fs.db; omit id to choose interactively
+den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run] [--keep] [--pr]
+                              # land a session's changes as a git branch on the host
 den backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's fs.db
 den restore <file.ltx> [--to db]                      # apply an LTX backup (and chain) back
 den ltx <file.ltx>            # inspect/verify a backup file
@@ -134,6 +136,27 @@ the exact environment on another machine or VM — no host checkout needed.
 Note: because resumed sessions see only the DB, host-side changes (`git pull`,
 IDE edits) are invisible to an existing session. Start a fresh one
 (`DEN_NEW=1`) when the world outside changes.
+
+### Landing changes as a branch (`den push`)
+
+The agent's writes live only in the session DB — and that's where they should
+land from. `den push` (the host process, which never shows the sandbox its git
+credentials — the seeded `/.git/config` is scrubbed at seed time) diffs the
+session VFS against its seed baseline, applies the delta to a throwaway
+worktree of the host repo, commits, and pushes a branch:
+
+```bash
+den claude --seed . "fix the flaky test"     # agent works in its private sandbox
+den push                                     # -> branch den/claude-myproject, pushed to origin
+den push mysession --branch den/agent-2 -m "flaky: retry on timeout" --pr
+den push --dry-run --keep                    # apply to a kept worktree, commit nothing
+```
+
+The result is a reviewable PR: fan out N sessions on N tasks, push each to its
+own branch, review, merge. The sandbox itself never gains push power — no
+credentials inside the VFS, no egress needed; the push runs at the trust
+boundary, on the host. Changes under system dirs (`/etc`, `/tmp`, `/.git`, …)
+are never pushed; the session's `.git` is its own private history.
 
 ### Resume / fresh / quiet
 
