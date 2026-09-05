@@ -1,14 +1,14 @@
-//! Host-side allowlist HTTP proxy for the sandbox (PIT_NET=proxy).
+//! Host-side allowlist HTTP proxy for the sandbox (DEN_NET=proxy).
 //!
-//! M binds a listener on 127.0.0.1:<ephemeral> and spawns `pit proxy` with
+//! M binds a listener on 127.0.0.1:<ephemeral> and spawns `den proxy` with
 //! the listener on fd 3. The sandbox reaches it at 10.0.2.2 (slirp's alias
 //! for the host loopback); nft inside the sandbox allows TCP to 10.0.2.2 and
 //! nothing else, so all egress funnels through here.
 //!
 //! Supports CONNECT (the bulk of agent traffic) and absolute-form HTTP.
 //! Hosts are checked against the egress policy (see policy.rs: built-in
-//! defaults + PIT_PROXY_POLICY yaml + PIT_PROXY_ALLOW). If
-//! PIT_PROXY_UPSTREAM is set (the host's own proxy), requests chain
+//! defaults + DEN_PROXY_POLICY yaml + DEN_PROXY_ALLOW). If
+//! DEN_PROXY_UPSTREAM is set (the host's own proxy), requests chain
 //! through it.
 
 use crate::policy::{self, EgressPolicy};
@@ -35,9 +35,9 @@ pub fn run(listen_fd: libc::c_int) -> Result<()> {
         }
     }
 
-    // SAFETY: fd 3 was dup2'd by the parent before exec. PIT_PROXY_LISTEN_PORT
+    // SAFETY: fd 3 was dup2'd by the parent before exec. DEN_PROXY_LISTEN_PORT
     // is a debug/testing override that binds internally instead.
-    let listener = match std::env::var("PIT_PROXY_LISTEN_PORT") {
+    let listener = match std::env::var("DEN_PROXY_LISTEN_PORT") {
         Ok(port) => match port.parse::<u16>() {
             Ok(p) => TcpListener::bind(("127.0.0.1", p))?,
             Err(_) => unsafe { TcpListener::from_raw_fd(listen_fd) },
@@ -47,7 +47,7 @@ pub fn run(listen_fd: libc::c_int) -> Result<()> {
     listener.set_nonblocking(false)?;
 
     let source = policy::local();
-    let upstream = std::env::var("PIT_PROXY_UPSTREAM").ok();
+    let upstream = std::env::var("DEN_PROXY_UPSTREAM").ok();
 
     for conn in listener.incoming() {
         match conn {
@@ -345,7 +345,7 @@ fn check_allowed(host: &str, policy: &EgressPolicy) -> Result<()> {
     let already = approved().lock().unwrap().contains(&normalized);
     if !already && !prompt_and_persist(&normalized)? {
         bail!(
-            "host {} denied by egress policy (extend: PIT_PROXY_ALLOW=comma,list or PIT_PROXY_POLICY=allow-deny.yaml)",
+            "host {} denied by egress policy (extend: DEN_PROXY_ALLOW=comma,list or DEN_PROXY_POLICY=allow-deny.yaml)",
             host
         );
     }
@@ -381,11 +381,11 @@ fn prompt_and_persist(host: &str) -> Result<bool> {
     let yes = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
     if yes {
         match crate::policy::persist_allow(host) {
-            Ok(path) => eprintln!("pit: added {} to {}", host, path.display()),
+            Ok(path) => eprintln!("den: added {} to {}", host, path.display()),
             Err(e) => {
                 // Session-scoped approval still applies via `approved()` +
                 // the fresh-policy bypass below; surface why it didn't stick.
-                eprintln!("pit: warning: could not persist allowlist entry: {}", e);
+                eprintln!("den: warning: could not persist allowlist entry: {}", e);
             }
         }
     }

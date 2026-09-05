@@ -1,10 +1,10 @@
-//! Throwaway: build a session fs.db that looks like what `pit run` would
-//! leave behind, so we can exercise `pit inspect` / `pit sessions` (and the
+//! Throwaway: build a session fs.db that looks like what `den run` would
+//! leave behind, so we can exercise `den inspect` / `den sessions` (and the
 //! post-run summary) without installing a real agent CLI.
 //!
 //!   cargo run --example mkdelta -- <session-id> [base-dir]
 //!
-//! Creates `~/.pit/sessions/<session-id>/fs.db` with one file `/hello.txt`,
+//! Creates `~/.den/sessions/<session-id>/fs.db` with one file `/hello.txt`,
 //! one dir `/out`, and one whiteout `README.md`. Then print the sid.
 
 use agentfs_sdk::{AgentFS, AgentFSOptions, DEFAULT_FILE_MODE};
@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&base)?;
 
     let home = std::env::var("HOME")?;
-    let dir = format!("{home}/.pit/sessions/{sid}");
+    let dir = format!("{home}/.den/sessions/{sid}");
     std::fs::create_dir_all(&dir)?;
     let db = format!("{dir}/fs.db");
     // start clean so re-runs are idempotent

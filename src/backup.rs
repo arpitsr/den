@@ -2,13 +2,13 @@
 //! port of https://github.com/superfly/ltx-rs — the Lite Transaction File
 //! format for SQLite backup).
 //!
-//!   pit backup <sid> [--from <prev.ltx>] [--out <path>] [-c] [--watch]
+//!   den backup <sid> [--from <prev.ltx>] [--out <path>] [-c] [--watch]
 //!     snapshot (or delta from the previous file in the chain) of
-//!     ~/.pit/sessions/<sid>/fs.db; --watch keeps appending chained deltas
+//!     ~/.den/sessions/<sid>/fs.db; --watch keeps appending chained deltas
 //!     while the session is written (Litestream-style streaming)
-//!   pit restore <file.ltx> [--to <db>]
+//!   den restore <file.ltx> [--to <db>]
 //!     apply an LTX file (and any chain siblings) back into a session fs.db
-//!   pit ltx <file.ltx>
+//!   den ltx <file.ltx>
 //!     inspect a backup file: header, page count, checksums (verifies them)
 //!
 //! The fs.db is a plain SQLite file that the agentfs SDK leaves in WAL mode
@@ -167,7 +167,7 @@ fn cmd_backup_inner(
     let size = std::fs::metadata(out)?.len();
     let kind = if is_snapshot(&header) { "snapshot" } else { "delta" };
     println!(
-        "pit: backed up session {sid} -> {} ({kind}, txid {}, {n_pages} pages of {ps} B, {size} bytes)",
+        "den: backed up session {sid} -> {} ({kind}, txid {}, {n_pages} pages of {ps} B, {size} bytes)",
         out.display(),
         header.min_txid
     );
@@ -178,7 +178,7 @@ fn cmd_backup_inner(
     Ok(true)
 }
 
-/// `pit backup <sid> [--from <prev.ltx>] [--out <path>] [-c]`
+/// `den backup <sid> [--from <prev.ltx>] [--out <path>] [-c]`
 pub fn cmd_backup(sid: &str, from: Option<&Path>, out: &Path, compress: bool) -> Result<()> {
     cmd_backup_inner(sid, from, out, compress, true)?;
     Ok(())
@@ -293,15 +293,15 @@ impl Watch {
     }
 }
 
-/// `pit backup --watch <sid> [--out <base>.ltx]` — Litestream-style
+/// `den backup --watch <sid> [--out <base>.ltx]` — Litestream-style
 /// streaming: write a snapshot, then keep appending chained deltas while the
 /// session's DB changes, until interrupted. Every file is written complete,
 /// so Ctrl-C (or a crash) always leaves the chain restorable up to the last
-/// tick, and restarting resumes from the newest file. `pit restore <base>.ltx`
+/// tick, and restarting resumes from the newest file. `den restore <base>.ltx`
 /// replays the whole chain.
 /// One watcher per session: hold an exclusive flock on a lock file next to
 /// the fs.db for the process lifetime, so a second `--watch` on the same
-/// session (e.g. a duplicate `pit <profile> --autostart`) refuses instead of
+/// session (e.g. a duplicate `den <profile> --autostart`) refuses instead of
 /// racing on the chain files. The lock dies with the process — no stale-pid
 /// bookkeeping.
 fn lock_watch(sid: &str) -> Result<File> {
@@ -317,13 +317,13 @@ fn lock_watch(sid: &str) -> Result<File> {
     Ok(f)
 }
 
-/// `pit backup --watch <sid> [--out <base>.ltx]` — Litestream-style
+/// `den backup --watch <sid> [--out <base>.ltx]` — Litestream-style
 /// streaming: write a snapshot, then keep appending chained deltas while the
 /// session's DB changes, until interrupted. Every file is written complete,
 /// so Ctrl-C (or a crash) always leaves the chain restorable up to the last
-/// tick, and restarting resumes from the newest file. `pit restore <base>.ltx`
+/// tick, and restarting resumes from the newest file. `den restore <base>.ltx`
 /// replays the whole chain. Waits up to 30s for the session DB to appear, so
-/// `pit <profile> --autostart` works on the very first run of a profile.
+/// `den <profile> --autostart` works on the very first run of a profile.
 pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
     let db = crate::session_db_path(sid)?;
     let mut waited = 0;
@@ -337,8 +337,8 @@ pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
         std::thread::sleep(WATCH_POLL);
         waited += 1;
     }
-    // Spawned from `pit <profile> --autostart`, SIGINT/SIGTERM arrive
-    // SIG_IGN (inherited from `pit run`): keep the INT-ignore so the stream
+    // Spawned from `den <profile> --autostart`, SIGINT/SIGTERM arrive
+    // SIG_IGN (inherited from `den run`): keep the INT-ignore so the stream
     // survives Ctrl-C on the run, but restore TERM so `kill` can stop us.
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
     sa.sa_sigaction = libc::SIG_DFL;
@@ -367,7 +367,7 @@ pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
         }
     } else {
         eprintln!(
-            "pit: resuming chain at {}",
+            "den: resuming chain at {}",
             chain_path(out, watch.n).display()
         );
     }
@@ -468,8 +468,8 @@ fn write_delta(
     Ok((header, n_pages, post_apply))
 }
 
-/// `pit restore <file.ltx> [--to <db>]` — target defaults to the session
-/// named by the file (codex-foo.ltx -> ~/.pit/sessions/codex-foo/fs.db).
+/// `den restore <file.ltx> [--to <db>]` — target defaults to the session
+/// named by the file (codex-foo.ltx -> ~/.den/sessions/codex-foo/fs.db).
 pub fn cmd_restore(ltx: &Path, to: &Path) -> Result<()> {
     let (header, pages, trailer) = read_ltx(ltx)?;
     if is_snapshot(&header) {
@@ -479,7 +479,7 @@ pub fn cmd_restore(ltx: &Path, to: &Path) -> Result<()> {
     }
     integrity_check(to)?;
     println!(
-        "pit: restored {} -> {} (txid {}-{}, post-apply checksum {})",
+        "den: restored {} -> {} (txid {}-{}, post-apply checksum {})",
         ltx.display(),
         to.display(),
         header.min_txid,
@@ -589,7 +589,7 @@ fn restore_delta(
     Ok(())
 }
 
-/// `pit ltx <file.ltx>` — inspect and verify a backup file.
+/// `den ltx <file.ltx>` — inspect and verify a backup file.
 pub fn cmd_ltx_info(path: &Path) -> Result<()> {
     let (header, pages, trailer) = read_ltx(path)?; // verifies the file checksum
     let size = std::fs::metadata(path)?.len();
@@ -637,7 +637,7 @@ fn integrity_check(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Default restore target: codex-foo.ltx -> ~/.pit/sessions/codex-foo/fs.db.
+/// Default restore target: codex-foo.ltx -> ~/.den/sessions/codex-foo/fs.db.
 /// Chain deltas are numbered codex-foo.NNNN.ltx; strip the number so a
 /// numbered file still resolves to the session it belongs to (session ids
 /// never contain '.', so the suffix is unambiguous).
@@ -680,7 +680,7 @@ mod tests {
     impl TempDir {
         fn new() -> Self {
             let p = std::env::temp_dir().join(format!(
-                "pit-test-{}-{:x}",
+                "den-test-{}-{:x}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
