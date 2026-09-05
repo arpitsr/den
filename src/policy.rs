@@ -141,8 +141,7 @@ pub fn persist_allow(host: &str) -> Result<PathBuf> {
         }
         out.push_str(&format!("allow:\n  - {}\n", host));
     }
-    std::fs::write(&path, out)
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 

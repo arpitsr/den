@@ -77,7 +77,11 @@ pub fn run(listen_fd: libc::c_int) -> Result<()> {
     Ok(())
 }
 
-fn handle_connection(client: TcpStream, policy: &EgressPolicy, upstream: Option<&str>) -> Result<()> {
+fn handle_connection(
+    client: TcpStream,
+    policy: &EgressPolicy,
+    upstream: Option<&str>,
+) -> Result<()> {
     let mut reader = BufReader::new(client.try_clone()?);
     let head = read_head(&mut reader)?;
     let first = head.lines().next().context("empty request")?.to_string();
@@ -112,9 +116,8 @@ fn handle_connect(
 ) -> Result<()> {
     let (host, port) = parse_authority(&target)?;
     if let Err(e) = check_allowed(&host, policy) {
-        let _ = client.write_all(
-            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        let _ = client
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         bail!("{}", e);
     }
 
@@ -124,9 +127,7 @@ fn handle_connect(
     let (mut upstream_r, upstream_w) = if let Some(up) = upstream {
         let mut u = TcpStream::connect(upstream_hostport(up))
             .with_context(|| format!("upstream {}", up))?;
-        u.write_all(
-            format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target).as_bytes(),
-        )?;
+        u.write_all(format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", target, target).as_bytes())?;
         let mut ureader = BufReader::new(u.try_clone()?);
         let resp = read_head(&mut ureader)?;
         let ok = resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200");
@@ -174,9 +175,8 @@ fn handle_http(
 ) -> Result<()> {
     let url = parse_absolute_url(&target)?;
     if let Err(e) = check_allowed(&url.host, policy) {
-        let _ = client.write_all(
-            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        );
+        let _ = client
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         bail!("{}", e);
     }
 
@@ -314,7 +314,8 @@ fn parse_absolute_url(url: &str) -> Result<Url> {
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
-            p.parse::<u16>().map_err(|_| anyhow::anyhow!("bad port in {}", url))?,
+            p.parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("bad port in {}", url))?,
         ),
         None => (authority.to_string(), 80),
     };

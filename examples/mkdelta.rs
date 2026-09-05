@@ -15,9 +15,12 @@ async fn main() -> Result<()> {
     let sid = std::env::args()
         .nth(1)
         .ok_or_else(|| anyhow::anyhow!("usage: mkdelta <session-id> [base-dir]"))?;
-    let base = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| std::env::temp_dir().join("mkdelta-base").to_string_lossy().to_string());
+    let base = std::env::args().nth(2).unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("mkdelta-base")
+            .to_string_lossy()
+            .to_string()
+    });
     std::fs::create_dir_all(&base)?;
 
     let home = std::env::var("HOME")?;
@@ -27,8 +30,7 @@ async fn main() -> Result<()> {
     // start clean so re-runs are idempotent
     let _ = std::fs::remove_file(&db);
 
-    let agent =
-        AgentFS::open(AgentFSOptions::with_path(&db).with_base(&base)).await?;
+    let agent = AgentFS::open(AgentFSOptions::with_path(&db).with_base(&base)).await?;
 
     // a created/modified file (shows up in get_delta_paths)
     let _ = agent

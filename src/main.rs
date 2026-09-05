@@ -126,7 +126,10 @@ fn new_uuid() -> String {
 fn random_suffix(len: usize) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut buf = vec![0u8; len];
-    if File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_err() {
+    if File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_err()
+    {
         // fallback: reuse the UUID hex (very unlikely on Linux)
         let hex = new_uuid().replace('-', "");
         return hex.chars().take(len).collect();
@@ -158,9 +161,8 @@ fn bin_found(bin: &str) -> bool {
     if bin.contains('/') {
         return Path::new(bin).exists();
     }
-    std::env::var_os("PATH").is_some_and(|p| {
-        std::env::split_paths(&p).any(|d| d.join(bin).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
 }
 
 /// Resolve a bare command name to the first executable found on PATH.
@@ -397,7 +399,9 @@ async fn seed_session(agent: &AgentFS, dir: &Path) -> Result<u64> {
     let mut count = 0u64;
     let mut stack = vec![(dir.to_path_buf(), PathBuf::new())]; // (host dir, vfs-relative)
     while let Some((host, rel)) = stack.pop() {
-        for entry in std::fs::read_dir(&host).with_context(|| format!("seed: read {}", host.display()))? {
+        for entry in
+            std::fs::read_dir(&host).with_context(|| format!("seed: read {}", host.display()))?
+        {
             let entry = entry?;
             let name = entry.file_name();
             if SEED_EXCLUDES.contains(&name.to_string_lossy().as_ref()) {
@@ -409,18 +413,34 @@ async fn seed_session(agent: &AgentFS, dir: &Path) -> Result<u64> {
             let (uid, gid) = (md.uid(), md.gid());
             let ft = entry.file_type()?;
             if ft.is_dir() {
-                agent.fs.mkdir(&vfs, uid, gid).await.with_context(|| format!("seed: mkdir {vfs}"))?;
+                agent
+                    .fs
+                    .mkdir(&vfs, uid, gid)
+                    .await
+                    .with_context(|| format!("seed: mkdir {vfs}"))?;
                 count += 1;
                 stack.push((entry.path(), child_rel));
             } else if ft.is_symlink() {
                 let target = std::fs::read_link(entry.path())?;
-                agent.fs.symlink(&target.to_string_lossy(), &vfs, uid, gid).await.with_context(|| format!("seed: symlink {vfs}"))?;
+                agent
+                    .fs
+                    .symlink(&target.to_string_lossy(), &vfs, uid, gid)
+                    .await
+                    .with_context(|| format!("seed: symlink {vfs}"))?;
                 count += 1;
             } else if ft.is_file() {
                 let data = std::fs::read(entry.path())?;
-                agent.fs.create_file(&vfs, md.mode(), uid, gid).await.with_context(|| format!("seed: create {vfs}"))?;
+                agent
+                    .fs
+                    .create_file(&vfs, md.mode(), uid, gid)
+                    .await
+                    .with_context(|| format!("seed: create {vfs}"))?;
                 if !data.is_empty() {
-                    agent.fs.pwrite(&vfs, 0, &data).await.with_context(|| format!("seed: write {vfs}"))?;
+                    agent
+                        .fs
+                        .pwrite(&vfs, 0, &data)
+                        .await
+                        .with_context(|| format!("seed: write {vfs}"))?;
                 }
                 count += 1;
             }
@@ -436,10 +456,18 @@ async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i64)> {
     let mut out = HashMap::new();
     let mut stack = vec![(String::new(), 1i64)]; // (path, ino); root ino = 1
     while let Some((path, ino)) = stack.pop() {
-        let names = agent.fs.readdir(ino).await.ok().flatten().unwrap_or_default();
+        let names = agent
+            .fs
+            .readdir(ino)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         for name in names {
             let child = format!("{path}/{name}");
-            let Some(st) = agent.fs.lstat(&child).await.ok().flatten() else { continue };
+            let Some(st) = agent.fs.lstat(&child).await.ok().flatten() else {
+                continue;
+            };
             out.insert(child.clone(), (st.mtime, st.mtime_nsec, st.size));
             if st.mode & S_IFMT == S_IFDIR {
                 stack.push((child, st.ino));
@@ -512,7 +540,10 @@ fn cmd_run(
         if fresh {
             if let Some(d) = &seed {
                 let n = seed_session(&agent, d).await?;
-                eprintln!("den: seeded session {sid} with {n} entries from {}", d.display());
+                eprintln!(
+                    "den: seeded session {sid} with {n} entries from {}",
+                    d.display()
+                );
             }
         } else if seed.is_some() {
             eprintln!("den: session {sid} already exists — --seed ignored (DEN_NEW=1 for a fresh session)");
@@ -539,8 +570,7 @@ fn cmd_run(
         sid.to_string(),
         PathBuf::from(&argv[0]),
         argv[1..].to_vec(),
-    ))
-    ??;
+    ))??;
     #[cfg(not(target_os = "linux"))]
     let code = {
         // ponytail: the macOS NFS+sandbox-exec path was not ported; the FUSE
@@ -1164,8 +1194,7 @@ fn selftest_sandbox() -> Result<()> {
             sid.clone(),
             "/bin/sh".into(),
             vec!["-c".into(), script.into()],
-        ))
-        ??;
+        ))??;
         check_sandbox(code == 0, true, "sandboxed script exit code")?;
 
         // Host tree untouched: README.md still here, created.txt never written.
@@ -1186,17 +1215,34 @@ fn selftest_sandbox() -> Result<()> {
         // the touched-this-run diff against the pre-run snapshot agrees.
         let sid_check = sid.clone();
         let after = block_on(async move {
-            let agent = open_session(&sid_check).await?.context("no session DB after run")?;
+            let agent = open_session(&sid_check)
+                .await?
+                .context("no session DB after run")?;
             anyhow::Ok(snapshot_fs(&agent).await)
-        })
-        ??;
+        })??;
         for p in ["/created.txt", "/dir1/f.txt"] {
-            check_sandbox(after.contains_key(p), true, &format!("session FS contains {p}"))?;
+            check_sandbox(
+                after.contains_key(p),
+                true,
+                &format!("session FS contains {p}"),
+            )?;
         }
-        check_sandbox(!after.contains_key("/README.md"), true, "/README.md removed from session FS")?;
-        check_sandbox(after.contains_key("/src/a.txt"), true, "untouched seed file survives")?;
+        check_sandbox(
+            !after.contains_key("/README.md"),
+            true,
+            "/README.md removed from session FS",
+        )?;
+        check_sandbox(
+            after.contains_key("/src/a.txt"),
+            true,
+            "untouched seed file survives",
+        )?;
         let touched: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
-        check_sandbox(touched.len() == 3, true, "3 added this run (created.txt, dir1, dir1/f.txt)")?;
+        check_sandbox(
+            touched.len() == 3,
+            true,
+            "3 added this run (created.txt, dir1, dir1/f.txt)",
+        )?;
 
         // Read-only enforcement: /etc is not writable from inside the sandbox.
         let diag = format!("/tmp/den-sandbox-diag-{}.txt", std::process::id());
@@ -1208,8 +1254,7 @@ fn selftest_sandbox() -> Result<()> {
                 "-c".into(),
                 format!("{{ ls -la; echo ---; cat created.txt; }} > {diag} 2>&1"),
             ],
-        ))
-        ??;
+        ))??;
         if let Ok(d) = std::fs::read_to_string(&diag) {
             println!("{d}");
         }
@@ -1221,8 +1266,7 @@ fn selftest_sandbox() -> Result<()> {
             sid.clone(),
             "/bin/sh".into(),
             vec!["-c".into(), "touch /etc/den-sandbox-evil".into()],
-        ))
-        ??;
+        ))??;
         check_sandbox(code != 0, true, "/etc write rejected (EROFS)")?;
 
         // Session join: second run with the same sid joins, fs.db survives.
@@ -1231,12 +1275,15 @@ fn selftest_sandbox() -> Result<()> {
             sid.clone(),
             "/bin/sh".into(),
             vec!["-c".into(), "echo more >> created.txt".into()],
-        ))
-        ??;
+        ))??;
         check_sandbox(code == 0, true, "join-session run exit code")?;
 
         std::fs::remove_dir_all(&dir)?;
-        let _ = std::fs::remove_dir_all(session_db_path(&sid)?.parent().unwrap_or(std::path::Path::new("")));
+        let _ = std::fs::remove_dir_all(
+            session_db_path(&sid)?
+                .parent()
+                .unwrap_or(std::path::Path::new("")),
+        );
         println!("sandbox selftest OK (seed, mount, vfs writes, ro-enforcement, join)");
     }
     Ok(())
@@ -1337,17 +1384,14 @@ fn main() -> Result<()> {
         [c, rest @ ..] if c == "raw" => {
             #[cfg(target_os = "linux")]
             {
-                let (cmd, args) = rest
-                    .split_first()
-                    .context("den raw <cmd> [args...]")?;
+                let (cmd, args) = rest.split_first().context("den raw <cmd> [args...]")?;
                 let sid = format!("raw-{}", std::process::id());
                 let code = block_on(sandbox::run_cmd(
                     Vec::new(),
                     sid.clone(),
                     std::path::PathBuf::from(cmd),
                     args.to_vec(),
-                ))
-                ??;
+                ))??;
                 std::process::exit(code)
             }
             #[cfg(not(target_os = "linux"))]
@@ -1374,7 +1418,9 @@ fn main() -> Result<()> {
 /// flag form backup/restore need — kept inline rather than a generic parser,
 /// which would hide the small shape behind indirection.
 fn take_value(rest: &[String], i: &mut usize, flag: &str) -> Result<PathBuf> {
-    let v = rest.get(*i + 1).with_context(|| format!("{flag} needs a path"))?;
+    let v = rest
+        .get(*i + 1)
+        .with_context(|| format!("{flag} needs a path"))?;
     *i += 2;
     Ok(PathBuf::from(v))
 }
