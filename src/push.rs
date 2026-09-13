@@ -639,15 +639,21 @@ mod tests {
     use super::*;
     use crate::{block_on, seed_session, seed_tree};
 
-    fn snap(pairs: &[(&str, (i64, u32, i64))]) -> Snap {
+    type Attr = (i64, u32, i64);
+    type Pair<'a> = (&'a str, Attr);
+    type OptPair<'a> = (&'a str, Option<Attr>);
+    type AttrMap = HashMap<String, Attr>;
+    type OptAttrMap = HashMap<String, Option<Attr>>;
+
+    fn snap(pairs: &[Pair<'_>]) -> Snap {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
-    fn hm(pairs: &[(&str, Option<(i64, u32, i64)>)]) -> HashMap<String, Option<(i64, u32, i64)>> {
+    fn hm(pairs: &[OptPair<'_>]) -> OptAttrMap {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
-    fn hmb(pairs: &[(&str, (i64, u32, i64))]) -> HashMap<String, (i64, u32, i64)> {
+    fn hmb(pairs: &[Pair<'_>]) -> AttrMap {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
