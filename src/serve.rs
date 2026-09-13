@@ -10,8 +10,8 @@
 
 use crate::registry::{self, NewRun, NewSession, Registry};
 use crate::{
-    bin_found, cmd_rm, delta_snapshot, diff_run_snap, headless_argv, open_session, random_suffix,
-    session_base_db, session_db_path, sessions_root, snapshot_fs, valid_sid,
+    bin_found, cmd_rm, delta_snapshot, diff_run_snap, open_session, random_suffix, session_base_db,
+    session_db_path, sessions_root, snapshot_fs, valid_sid,
 };
 use anyhow::{bail, Context, Result};
 use axum::extract::{Path as AxPath, Request, State};
@@ -25,10 +25,51 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd as _;
 // ExitStatusExt: signal() — did our SIGTERM/SIGKILL stop the child?
 use std::os::unix::process::ExitStatusExt as _;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+
+/// Per-profile headless invocation (platform-api.md §10): how a profile
+/// takes a prompt without a TTY, and how a follow-up turn resumes the same
+/// conversation. Serve builds agent argv from here instead of inheriting a
+/// TTY. Unknown profiles get the prompt bare — documented "unproven
+/// headless" (a CLI that autodetects piped stdio still works).
+///
+/// dex pre-assigns its journal inside the session VFS
+/// (`~/.local/share/dex/sessions/<cwd-slug>/den-<sid>.jsonl`) —
+/// Session::open_or_continue creates or resumes it, so turn N+1 continues
+/// turn N with no capture step. Other profiles keep a bare turn here;
+/// capture-based resume (`<sid>/agent-session` + `claude --resume <id>`,
+/// `codex exec resume <id>`) is Phase 2 (platform-build-plan.md).
+fn headless_argv(profile_name: &str, sid: &str, prompt: &str) -> Result<Vec<String>> {
+    let p = crate::profile(profile_name);
+    let mut v = p.cmd.clone();
+    let turn: &[&str] = match profile_name {
+        "claude" | "gemini" | "dex" => &["-p"],
+        "codex" => &["exec"],
+        "opencode" => &["run"],
+        _ => &[],
+    };
+    if profile_name == "dex" {
+        v.push("--session".into());
+        v.push(dex_journal_path(sid));
+    }
+    v.extend(turn.iter().map(|s| s.to_string()));
+    v.push(prompt.to_string());
+    Ok(v)
+}
+
+/// The dex journal for a den session, inside the session VFS (so it is
+/// durable + replicable with fs.db and survives daemon-less turn runs).
+fn dex_journal_path(sid: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!(
+        "{home}/.local/share/dex/sessions/{}/den-{sid}.jsonl",
+        crate::slug(&crate::cwd_string())
+    )
+}
 
 /// platform.db sits next to the sessions root: ~/.den/platform.db
 fn platform_db_path() -> Result<std::path::PathBuf> {
@@ -36,6 +77,16 @@ fn platform_db_path() -> Result<std::path::PathBuf> {
         .parent()
         .context("den state dir")?
         .join("platform.db"))
+}
+
+/// The runtime binary the control plane spawns. `DEN_RUNTIME_BIN` exists so
+/// the control plane and the runtime can become separate binaries without
+/// touching call sites (default: this process's own executable).
+fn runtime_bin() -> Result<std::path::PathBuf> {
+    match std::env::var("DEN_RUNTIME_BIN") {
+        Ok(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => std::env::current_exe().context("current exe"),
+    }
 }
 
 /// Lock file for a session's live child, next to the session dir.
@@ -480,7 +531,7 @@ async fn attach_session(
     // Child: `den dex serve --fd <n>` — a plain den run that joins the
     // session and execs the dex daemon inside the sandbox; the fd rides
     // along through the fork chain (nothing in it closes foreign fds).
-    let exe = match std::env::current_exe() {
+    let exe = match runtime_bin() {
         Ok(e) => e,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "exe", format!("{e}")),
     };
@@ -530,7 +581,9 @@ async fn attach_session(
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "log_fd", format!("{e}")),
     };
     let mut cmd = Command::new(exe);
-    cmd.arg(&sess.profile)
+    cmd.args(["exec", "--session", &sid])
+        .arg("--")
+        .arg(&sess.profile)
         .args(["serve", "--fd", &fd.to_string()])
         .env("DEN_SESSION", &sid)
         .env("DEX_DAEMON_TOKEN", &token)
@@ -853,13 +906,15 @@ async fn launch_run(
     };
     let tail = argv.split_off(1); // [--session, path, -p, prompt] (or [flags, prompt])
 
-    let exe = match std::env::current_exe() {
+    let exe = match runtime_bin() {
         Ok(e) => e,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "exe", format!("{e}")),
     };
     let mut cmd = Command::new(exe);
-    cmd.arg(&sess.profile)
+    cmd.args(["exec", "--session", &sid])
         .args(seed_into_args(sess.seed_json.as_deref(), &sid))
+        .arg("--")
+        .arg(&sess.profile)
         .args(&tail)
         .env("DEN_SESSION", &sid)
         .env_remove("DEN_NEW")
@@ -1152,4 +1207,49 @@ pub fn cmd_serve() -> Result<()> {
         axum::serve(listener, router(st)).await?;
         anyhow::Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// env vars are process-global (dex_journal_path reads HOME)
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn headless_argv_known_profiles() {
+        // flags + prompt assembly; path details stay out (cwd-dependent)
+        let codex = headless_argv("codex", "s1", "touch /hello.txt").unwrap();
+        assert_eq!(codex[0], "codex");
+        assert_eq!(codex[1], "exec");
+        assert_eq!(codex[codex.len() - 1], "touch /hello.txt");
+
+        for (name, flag) in [("claude", "-p"), ("gemini", "-p"), ("opencode", "run")] {
+            let v = headless_argv(name, "s1", "hi").unwrap();
+            assert_eq!(v[0], name);
+            assert!(v.contains(&flag.to_string()), "{name}: {v:?}");
+            assert_eq!(v[v.len() - 1], "hi");
+        }
+    }
+
+    #[test]
+    fn headless_argv_dex_preassigns_journal() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let v = headless_argv("dex", "sess-42", "explain this repo").unwrap();
+        assert_eq!(v[0], "dex");
+        // journal path sits between --session and the -p flag; it must land
+        // inside the session VFS and carry the den session id
+        assert_eq!(v[1], "--session");
+        let jp = &v[2];
+        assert!(jp.contains("/.local/share/dex/sessions/"), "{jp}");
+        assert!(jp.ends_with("den-sess-42.jsonl"), "{jp}");
+        assert_eq!(v[3], "-p");
+        assert_eq!(v[v.len() - 1], "explain this repo");
+    }
+
+    #[test]
+    fn headless_argv_unknown_profile_runs_prompt_bare() {
+        let v = headless_argv("some-future-agent", "s1", "do the thing").unwrap();
+        assert_eq!(v, vec!["some-future-agent", "do the thing"]);
+    }
 }

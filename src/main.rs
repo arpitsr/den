@@ -424,46 +424,6 @@ fn build_argv(profile_name: &str, passthrough: &[String]) -> Result<Vec<String>>
     Ok(v)
 }
 
-/// Per-profile headless invocation (platform-api.md §10): how a profile
-/// takes a prompt without a TTY, and how a follow-up turn resumes the same
-/// conversation. Serve builds agent argv from here instead of inheriting a
-/// TTY. Unknown profiles get the prompt bare — documented "unproven
-/// headless" (a CLI that autodetects piped stdio still works).
-///
-/// dex pre-assigns its journal inside the session VFS
-/// (`~/.local/share/dex/sessions/<cwd-slug>/den-<sid>.jsonl`) —
-/// Session::open_or_continue creates or resumes it, so turn N+1 continues
-/// turn N with no capture step. Other profiles keep a bare turn here;
-/// capture-based resume (`<sid>/agent-session` + `claude --resume <id>`,
-/// `codex exec resume <id>`) is Phase 2 (platform-build-plan.md).
-fn headless_argv(profile_name: &str, sid: &str, prompt: &str) -> Result<Vec<String>> {
-    let p = profile(profile_name);
-    let mut v = p.cmd.clone();
-    let turn: &[&str] = match profile_name {
-        "claude" | "gemini" | "dex" => &["-p"],
-        "codex" => &["exec"],
-        "opencode" => &["run"],
-        _ => &[],
-    };
-    if profile_name == "dex" {
-        v.push("--session".into());
-        v.push(dex_journal_path(sid));
-    }
-    v.extend(turn.iter().map(|s| s.to_string()));
-    v.push(prompt.to_string());
-    Ok(v)
-}
-
-/// The dex journal for a den session, inside the session VFS (so it is
-/// durable + replicable with fs.db and survives daemon-less turn runs).
-fn dex_journal_path(sid: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!(
-        "{home}/.local/share/dex/sessions/{}/den-{sid}.jsonl",
-        slug(&cwd_string())
-    )
-}
-
 // ---- AgentFS SDK: open a persisted session fs.db --------------------------
 /// ~/.den/sessions/<sid>/fs.db — the session's persisted virtual filesystem
 pub(crate) fn session_db_path(sid: &str) -> Result<PathBuf> {
@@ -1350,20 +1310,22 @@ async fn snapshot_merged(session_dir: &Path) -> Result<HashMap<String, (i64, u32
 }
 
 fn cmd_run(
-    profile_name: &str,
+    argv: Vec<String>,
     sid: &str,
-    passthrough: &[String],
     autostart: bool,
     auto_out: Option<PathBuf>,
     seed: Option<PathBuf>,
     dirty: DirtyMode,
 ) -> Result<i32> {
+    // Allows policy is keyed by the command name (argv[0]) — known agents
+    // get extra host dirs kept writable; unknown names run bare.
+    let profile_name = argv[0].clone();
     // full-vfs: layered sessions mount base+delta (§3); the delta starts
     // empty and holds only the session's changes. Legacy mode (DEN_LAYER=0,
     // or a pre-layer session dir without a `base` file) seeds fs.db itself.
     let db = session_db_path(sid)?;
     let fresh = !db.exists();
-    let allows = effective_allows(&profile(profile_name));
+    let allows = effective_allows(&profile(&profile_name));
     // Nested runs (§7 step 2): no --seed — the subagent inherits the outer
     // session's pinned base (its delta lives inside the outer VFS at
     // <cwd>/.den/<sid>/fs.db).
@@ -1467,7 +1429,7 @@ fn cmd_run(
         };
         anyhow::Ok(snap)
     })??;
-    let mut argv = build_argv(profile_name, passthrough)?;
+    let mut argv = argv;
     // Resolve the command on the host PATH before entering the sandbox, so a
     // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
     // shadow the real agent binary via PATH ordering inside the sandbox.
@@ -2113,6 +2075,87 @@ fn cmd_attach(rest: &[String]) -> Result<()> {
     Err(err).with_context(|| format!("exec dex connect {url}"))
 }
 
+/// [--out <base.ltx>]] -- <cmd> [args...]` — the runtime's stable verb for -- <cmd> [args...]` — the runtime's stable verb for
+/// platform-driven launches (docs/runtime-contract.md): same prepare/run/
+/// reap path as a normal run, but the command argv after `--` is taken
+/// verbatim (no profile argv assembly — the caller owns that) and the
+/// session id is explicit. Host-PATH resolution stays here (den), so a
+/// file planted in the session overlay can't shadow the real agent binary.
+fn cmd_exec(rest: &[String]) -> Result<i32> {
+    let (sid, autostart, auto_out, seed, dirty_raw, argv) = parse_exec_args(rest)?;
+    valid_sid(&sid)?;
+    let dirty = match dirty_raw.as_deref() {
+        None => DirtyMode::Ask,
+        Some(s) => parse_dirty_mode(s)?,
+    };
+    cmd_run(argv, &sid, autostart, auto_out, seed, dirty)
+}
+
+/// (sid, autostart, autostart --out, --seed, --seed-dirty, command argv)
+type ExecParse = (
+    String,
+    bool,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<String>,
+    Vec<String>,
+);
+
+/// Strict parser for `den exec`: everything before ` -- ` must be a known
+/// den flag; everything after is the command, never flag-stripped.
+fn parse_exec_args(rest: &[String]) -> Result<ExecParse> {
+    let mut sid = None;
+    let mut autostart = false;
+    let mut out = None;
+    let mut seed = None;
+    let mut dirty = None;
+    let mut cmd: Option<Vec<String>> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--session" => {
+                sid = Some(rest.get(i + 1).context("--session needs a value")?.clone());
+                i += 2;
+            }
+            "--seed" => {
+                seed = Some(PathBuf::from(
+                    rest.get(i + 1).context("--seed needs a dir")?.clone(),
+                ));
+                i += 2;
+            }
+            "--seed-dirty" => {
+                dirty = Some(
+                    rest.get(i + 1)
+                        .context("--seed-dirty needs a mode")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--autostart" => {
+                autostart = true;
+                i += 1;
+            }
+            "--out" if autostart => {
+                out = Some(PathBuf::from(
+                    rest.get(i + 1).context("--out needs a path")?.clone(),
+                ));
+                i += 2;
+            }
+            "--" => {
+                cmd = Some(rest[i + 1..].to_vec());
+                break;
+            }
+            other => bail!("den exec: unexpected argument '{other}' before ' -- '"),
+        }
+    }
+    let sid = sid.context("--session <sid> is required")?;
+    let cmd = cmd.context("den exec requires ' -- ' before the command")?;
+    if cmd.is_empty() {
+        bail!("den exec: empty command after ' -- '");
+    }
+    Ok((sid, autostart, out, seed, dirty, cmd))
+}
+
 fn cmd_selftest(rest: &[String]) -> Result<()> {
     if rest.iter().any(|a| a == "--sandbox") {
         selftest_sandbox()?;
@@ -2487,6 +2530,8 @@ fn usage() -> String {
      den ltx <file.ltx>         inspect/verify a backup file\n  \
      den list                     list known profiles (any other cmd works too)\n  \
      den attach <sid>             open the dex TUI against a running daemon session\n  \
+     den exec --session <sid> -- <cmd>...   run a command in a session (runtime verb;\n  \
+                                  docs/runtime-contract.md)\n  \
      den selftest                 sanity check\n\n\
 env: DEN_NET=proxy|none|full  DEN_PROXY_ALLOW/DEN_PROXY_POLICY  DEN_HIDE/DEN_NO_HIDE  DEN_LIMIT_*  DEN_SECCOMP\n"
         .to_string()
@@ -2545,6 +2590,10 @@ fn main() -> Result<()> {
             backup::cmd_ltx_info(Path::new(path))
         }
         [c] if c == "serve" => crate::serve::cmd_serve(),
+        [c, rest @ ..] if c == "exec" => {
+            let code = cmd_exec(rest)?;
+            std::process::exit(code)
+        }
         [c, rest @ ..] if c == "attach" => cmd_attach(rest),
         // Internal: the sandbox proxy child (spawned by M with fd 3 as the
         // listener). Not a user-facing command.
@@ -2579,6 +2628,8 @@ fn main() -> Result<()> {
         }
         [pname, passthrough @ ..] => {
             // "run" is not a command name; the run is implicit (`den claude`).
+            // exec/serve/attach ARE commands now — they're caught above; the
+            // message below is only for `run` (and safety for future names).
             if pname == "run" {
                 bail!("den run isn't a command — the run is implicit: den <cmd> [args...]");
             }
@@ -2590,7 +2641,8 @@ fn main() -> Result<()> {
             let sid = session_id(pname);
             let allows = effective_allows(&profile(pname));
             drop_stale_session(&sid, &allows)?;
-            let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out, seed, dirty)?;
+            let argv = build_argv(pname, &passthrough)?;
+            let code = cmd_run(argv, &sid, autostart, auto_out, seed, dirty)?;
             std::process::exit(code);
         }
     }
@@ -2838,6 +2890,44 @@ mod tests {
     /// env vars are process-global; serialize the tests that swap them
     /// (mirrors backup.rs's HOME_LOCK).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn exec_parse_requires_session_and_separator() {
+        let s = |v: &str| String::from(v);
+        // --session is required
+        assert!(parse_exec_args(&[]).is_err());
+        // -- separator is required, and the command must be non-empty
+        assert!(parse_exec_args(&[s("--session"), s("s1")]).is_err());
+        assert!(parse_exec_args(&[s("--session"), s("s1"), s("--")]).is_err());
+        // unknown den flags before -- are rejected, never eaten silently
+        assert!(parse_exec_args(&[s("--session"), s("s1"), s("--wat"), s("--"), s("sh")]).is_err());
+        let (sid, autostart, out, seed, dirty, cmd) = parse_exec_args(&[
+            s("--session"),
+            s("s1"),
+            s("--seed"),
+            s("/repo"),
+            s("--seed-dirty"),
+            s("all"),
+            s("--autostart"),
+            s("--out"),
+            s("base.ltx"),
+            s("--"),
+            s("codex"),
+            s("exec"),
+            s("hi"),
+        ])
+        .unwrap();
+        assert_eq!(sid, "s1");
+        assert!(autostart);
+        assert_eq!(out, Some(PathBuf::from("base.ltx")));
+        assert_eq!(seed, Some(PathBuf::from("/repo")));
+        assert_eq!(dirty.as_deref(), Some("all"));
+        assert_eq!(cmd, vec!["codex", "exec", "hi"]);
+        // missing flag values are errors
+        assert!(
+            parse_exec_args(&[s("--session"), s("s1"), s("--seed"), s("--"), s("sh")]).is_err()
+        );
+    }
 
     #[test]
     fn session_rows_include_numbered_choices() {
@@ -3104,42 +3194,5 @@ mod tests {
         std::env::remove_var("LITESTREAM_BUCKET");
         std::env::remove_var("DEN_LITESTREAM");
         assert!(!litestream_autostart("x")); // no replica -> LTX fallback
-    }
-
-    #[test]
-    fn headless_argv_known_profiles() {
-        // flags + prompt assembly; path details stay out (cwd-dependent)
-        let codex = headless_argv("codex", "s1", "touch /hello.txt").unwrap();
-        assert_eq!(codex[0], "codex");
-        assert_eq!(codex[1], "exec");
-        assert_eq!(codex[codex.len() - 1], "touch /hello.txt");
-
-        for (name, flag) in [("claude", "-p"), ("gemini", "-p"), ("opencode", "run")] {
-            let v = headless_argv(name, "s1", "hi").unwrap();
-            assert_eq!(v[0], name);
-            assert!(v.contains(&flag.to_string()), "{name}: {v:?}");
-            assert_eq!(v[v.len() - 1], "hi");
-        }
-    }
-
-    #[test]
-    fn headless_argv_dex_preassigns_journal() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let v = headless_argv("dex", "sess-42", "explain this repo").unwrap();
-        assert_eq!(v[0], "dex");
-        // journal path sits between --session and the -p flag; it must land
-        // inside the session VFS and carry the den session id
-        assert_eq!(v[1], "--session");
-        let jp = &v[2];
-        assert!(jp.contains("/.local/share/dex/sessions/"), "{jp}");
-        assert!(jp.ends_with("den-sess-42.jsonl"), "{jp}");
-        assert_eq!(v[3], "-p");
-        assert_eq!(v[v.len() - 1], "explain this repo");
-    }
-
-    #[test]
-    fn headless_argv_unknown_profile_runs_prompt_bare() {
-        let v = headless_argv("some-future-agent", "s1", "do the thing").unwrap();
-        assert_eq!(v, vec!["some-future-agent", "do the thing"]);
     }
 }

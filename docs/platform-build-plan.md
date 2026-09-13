@@ -125,7 +125,7 @@ Can start in parallel with Phase 1: the dex patch is a separate repo.
    `DEX_JSON` if dex gains one) into runs; webhook/SSE on run completion.
 19. [ ] TOML config for profiles/limits (README "when to grow it" trigger:
    several custom agents).
-20. [ ] **Control-plane seam (Phase A)**: `den exec --session <sid>
+20. [x] **Control-plane seam (Phase A)**: `den exec --session <sid>
    [--seed …] [--autostart] -- <cmd>…` — stable runtime verb for platform
    launches (host-PATH resolution stays in den; argv assembly moves to the
    platform side); serve checks `den --version` at boot; document the
