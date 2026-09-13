@@ -64,8 +64,10 @@ mod mount;
 mod policy;
 mod proxy;
 pub(crate) mod push;
+mod registry;
 #[cfg(target_os = "linux")]
 mod sandbox;
+mod serve;
 
 #[derive(Clone)]
 struct Profile {
@@ -420,6 +422,46 @@ fn build_argv(profile_name: &str, passthrough: &[String]) -> Result<Vec<String>>
         v.push(a.clone());
     }
     Ok(v)
+}
+
+/// Per-profile headless invocation (platform-api.md §10): how a profile
+/// takes a prompt without a TTY, and how a follow-up turn resumes the same
+/// conversation. Serve builds agent argv from here instead of inheriting a
+/// TTY. Unknown profiles get the prompt bare — documented "unproven
+/// headless" (a CLI that autodetects piped stdio still works).
+///
+/// dex pre-assigns its journal inside the session VFS
+/// (`~/.local/share/dex/sessions/<cwd-slug>/den-<sid>.jsonl`) —
+/// Session::open_or_continue creates or resumes it, so turn N+1 continues
+/// turn N with no capture step. Other profiles keep a bare turn here;
+/// capture-based resume (`<sid>/agent-session` + `claude --resume <id>`,
+/// `codex exec resume <id>`) is Phase 2 (platform-build-plan.md).
+fn headless_argv(profile_name: &str, sid: &str, prompt: &str) -> Result<Vec<String>> {
+    let p = profile(profile_name);
+    let mut v = p.cmd.clone();
+    let turn: &[&str] = match profile_name {
+        "claude" | "gemini" | "dex" => &["-p"],
+        "codex" => &["exec"],
+        "opencode" => &["run"],
+        _ => &[],
+    };
+    if profile_name == "dex" {
+        v.push("--session".into());
+        v.push(dex_journal_path(sid));
+    }
+    v.extend(turn.iter().map(|s| s.to_string()));
+    v.push(prompt.to_string());
+    Ok(v)
+}
+
+/// The dex journal for a den session, inside the session VFS (so it is
+/// durable + replicable with fs.db and survives daemon-less turn runs).
+fn dex_journal_path(sid: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!(
+        "{home}/.local/share/dex/sessions/{}/den-{sid}.jsonl",
+        slug(&cwd_string())
+    )
 }
 
 // ---- AgentFS SDK: open a persisted session fs.db --------------------------
@@ -890,24 +932,33 @@ pub(crate) async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i
     out
 }
 
-/// compact post-run summary: what this run touched in the virtual FS
-/// (added/modified/removed vs the pre-run snapshot) + capped listing
-async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
-    if std::env::var("DEN_QUIET").as_deref() == Ok("1") {
-        return Ok(());
-    }
-    let agent = match open_session(sid).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(()), // no session DB — nothing to summarize
-        Err(e) => {
-            eprintln!("\nagentfs: {e}");
-            return Ok(());
-        }
-    };
+/// what one run touched in the session's virtual FS: sorted path lists so
+/// CLI output and API JSON are stable (platform-api.md §9)
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct RunDelta {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+fn sorted(set: HashSet<String>) -> Vec<String> {
+    let mut v: Vec<_> = set.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Diff the pre-run snapshot against the session's current state.
+/// Shared by the CLI summary and the platform API — errors propagate; the
+/// CLI's no-session/open-error soft-handling stays in print_run_summary.
+pub(crate) async fn diff_run_snap(
+    sid: &str,
+    agent: &AgentFS,
+    before: &RunSnap,
+) -> Result<RunDelta> {
     // (kind, path) triples: "+" added, "M" modified, "-" removed
     let (added, modified, removed) = match before {
         RunSnap::Legacy(b) => {
-            let after = snapshot_fs(&agent).await;
+            let after = snapshot_fs(agent).await;
             let added: HashSet<String> = after
                 .keys()
                 .filter(|k| !b.contains_key(*k))
@@ -926,7 +977,7 @@ async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
             (added, modified, removed)
         }
         RunSnap::Layered(b) => {
-            let after = delta_snapshot(&agent).await?;
+            let after = delta_snapshot(agent).await?;
             // Base attrs tell copy-ups from new files and no-ops from edits:
             // a delta entry whose attrs match the base is an unmodified
             // copy-up (mtime preserved), not a change.
@@ -976,6 +1027,32 @@ async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
             (added, modified, removed)
         }
     };
+    Ok(RunDelta {
+        added: sorted(added),
+        modified: sorted(modified),
+        removed: sorted(removed),
+    })
+}
+
+/// compact post-run summary: what this run touched in the virtual FS
+/// (added/modified/removed vs the pre-run snapshot) + capped listing
+async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
+    if std::env::var("DEN_QUIET").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let agent = match open_session(sid).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(()), // no session DB — nothing to summarize
+        Err(e) => {
+            eprintln!("\nagentfs: {e}");
+            return Ok(());
+        }
+    };
+    let RunDelta {
+        added,
+        modified,
+        removed,
+    } = diff_run_snap(sid, &agent, before).await?;
     eprintln!(
         "\nden: session {sid} — {} added, {} modified, {} removed this run",
         added.len(),
@@ -2429,6 +2506,7 @@ fn main() -> Result<()> {
             }
             backup::cmd_ltx_info(Path::new(path))
         }
+        [c] if c == "serve" => crate::serve::cmd_serve(),
         // Internal: the sandbox proxy child (spawned by M with fd 3 as the
         // listener). Not a user-facing command.
         [c] if c == "proxy" => {
@@ -2987,5 +3065,42 @@ mod tests {
         std::env::remove_var("LITESTREAM_BUCKET");
         std::env::remove_var("DEN_LITESTREAM");
         assert!(!litestream_autostart("x")); // no replica -> LTX fallback
+    }
+
+    #[test]
+    fn headless_argv_known_profiles() {
+        // flags + prompt assembly; path details stay out (cwd-dependent)
+        let codex = headless_argv("codex", "s1", "touch /hello.txt").unwrap();
+        assert_eq!(codex[0], "codex");
+        assert_eq!(codex[1], "exec");
+        assert_eq!(codex[codex.len() - 1], "touch /hello.txt");
+
+        for (name, flag) in [("claude", "-p"), ("gemini", "-p"), ("opencode", "run")] {
+            let v = headless_argv(name, "s1", "hi").unwrap();
+            assert_eq!(v[0], name);
+            assert!(v.contains(&flag.to_string()), "{name}: {v:?}");
+            assert_eq!(v[v.len() - 1], "hi");
+        }
+    }
+
+    #[test]
+    fn headless_argv_dex_preassigns_journal() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let v = headless_argv("dex", "sess-42", "explain this repo").unwrap();
+        assert_eq!(v[0], "dex");
+        // journal path sits between --session and the -p flag; it must land
+        // inside the session VFS and carry the den session id
+        assert_eq!(v[1], "--session");
+        let jp = &v[2];
+        assert!(jp.contains("/.local/share/dex/sessions/"), "{jp}");
+        assert!(jp.ends_with("den-sess-42.jsonl"), "{jp}");
+        assert_eq!(v[3], "-p");
+        assert_eq!(v[v.len() - 1], "explain this repo");
+    }
+
+    #[test]
+    fn headless_argv_unknown_profile_runs_prompt_bare() {
+        let v = headless_argv("some-future-agent", "s1", "do the thing").unwrap();
+        assert_eq!(v, vec!["some-future-agent", "do the thing"]);
     }
 }
