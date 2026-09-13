@@ -43,6 +43,7 @@ fn session_lock_path(sid: &str) -> Result<std::path::PathBuf> {
     Ok(sessions_root()?.join(format!("{sid}.lock")))
 }
 
+/// Delete a session's lock file after the child is gone (keep the tree tidy).
 struct Child {
     run_id: String,
     pid: u32,
@@ -374,10 +375,11 @@ async fn launch_run(
     }
 
     // One live process per session, enforced by an flock held for the
-    // child's lifetime (pattern: backup.rs watchers).
+    // child's lifetime (pattern: backup.rs watchers). API-created sessions
+    // may not have a dir yet — the sessions root must exist for the lock.
     let lock = {
-        let path = match session_lock_path(&sid) {
-            Ok(p) => p,
+        let root = match sessions_root() {
+            Ok(r) => r,
             Err(e) => {
                 return err_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -386,6 +388,14 @@ async fn launch_run(
                 )
             }
         };
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lock_path",
+                format!("{e}"),
+            );
+        }
+        let path = root.join(format!("{sid}.lock"));
         match std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -428,8 +438,15 @@ async fn launch_run(
     };
 
     let run_id = format!("r-{}", random_suffix(5));
-    let runs_dir = match sessions_root() {
-        Ok(root) => root.join(&sid).join("runs"),
+    // Run logs live in the platform state dir, NOT the session dir: a
+    // session dir can be recreated wholesale by a config change
+    // (drop_stale_session) — run history must survive that.
+    let runs_dir: std::path::PathBuf = match platform_db_path().and_then(|db| {
+        db.parent()
+            .map(|p| p.join("runs").join(&sid))
+            .context("platform state dir")
+    }) {
+        Ok(d) => d,
         Err(e) => {
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -655,6 +672,10 @@ async fn reap(
     let s2 = sid.clone();
     let _ = reg(&st.reg, move |r| r.set_session_status(&s2, sess_status)).await;
     st.children.lock().unwrap().remove(&sid);
+    // the child is reaped and the flock released — tidy the lock file
+    if let Ok(p) = session_lock_path(&sid) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 async fn get_run(State(st): State<Arc<ServeState>>, AxPath(rid): AxPath<String>) -> Response {
@@ -767,7 +788,7 @@ pub fn cmd_serve() -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
     let reg = Registry::open(&platform_db_path()?)?;
-    let moved = reg.sweep_orphans(pid_alive)?;
+    let moved = reg.sweep_orphans()?;
     if moved > 0 {
         eprintln!("den serve: marked {moved} run(s) orphaned from a previous serve");
     }
