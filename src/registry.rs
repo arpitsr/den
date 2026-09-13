@@ -19,7 +19,6 @@ use std::sync::{Mutex, MutexGuard};
 /// boot reconcile decides (relaunch, exited, or failed).
 pub const S_IDLE: &str = "idle";
 pub const S_RUNNING: &str = "running";
-#[allow(dead_code)] // daemon-kind sessions (Phase 2) set this
 pub const S_ATTACHED: &str = "attached";
 pub const S_EXITED: &str = "exited";
 pub const S_FAILED: &str = "failed";

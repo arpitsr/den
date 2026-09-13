@@ -2076,6 +2076,43 @@ fn cmd_rm(sid: &str) -> Result<()> {
     Ok(())
 }
 
+/// `den attach <sid>` — open the dex TUI against a running daemon session.
+/// Reads `<session>/attach.json` (written by POST /v1/sessions/:sid/attach)
+/// and execs `dex connect <url> --reattach <sid>` with the session-scoped
+/// token; exec replaces this process, so the TUI owns the terminal.
+fn cmd_attach(rest: &[String]) -> Result<()> {
+    let sid = rest
+        .first()
+        .filter(|s| *s != "--select")
+        .context("den attach <session-id>")?;
+    valid_sid(sid)?;
+    let path = crate::serve::attach_info_path(sid)?;
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no attach info for {sid} — launch it first: POST /v1/sessions/{sid}/attach (kind=daemon session)"
+        )
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&raw).context("parse attach.json")?;
+    let port = v
+        .get("port")
+        .and_then(|p| p.as_i64())
+        .context("attach.json: missing port")?;
+    let token = v
+        .get("token")
+        .and_then(|t| t.as_str())
+        .context("attach.json: missing token")?
+        .to_string();
+    let url = format!("http://127.0.0.1:{port}");
+    let mut cmd = Command::new(resolve_bin("dex"));
+    cmd.arg("connect")
+        .arg(&url)
+        .arg("--reattach")
+        .arg(sid)
+        .env("DEX_DAEMON_TOKEN", token);
+    let err = cmd.exec();
+    Err(err).with_context(|| format!("exec dex connect {url}"))
+}
+
 fn cmd_selftest(rest: &[String]) -> Result<()> {
     if rest.iter().any(|a| a == "--sandbox") {
         selftest_sandbox()?;
@@ -2449,6 +2486,7 @@ fn usage() -> String {
      den restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
      den ltx <file.ltx>         inspect/verify a backup file\n  \
      den list                     list known profiles (any other cmd works too)\n  \
+     den attach <sid>             open the dex TUI against a running daemon session\n  \
      den selftest                 sanity check\n\n\
 env: DEN_NET=proxy|none|full  DEN_PROXY_ALLOW/DEN_PROXY_POLICY  DEN_HIDE/DEN_NO_HIDE  DEN_LIMIT_*  DEN_SECCOMP\n"
         .to_string()
@@ -2507,6 +2545,7 @@ fn main() -> Result<()> {
             backup::cmd_ltx_info(Path::new(path))
         }
         [c] if c == "serve" => crate::serve::cmd_serve(),
+        [c, rest @ ..] if c == "attach" => cmd_attach(rest),
         // Internal: the sandbox proxy child (spawned by M with fd 3 as the
         // listener). Not a user-facing command.
         [c] if c == "proxy" => {
