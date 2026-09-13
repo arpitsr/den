@@ -312,7 +312,7 @@ impl Watch {
 /// racing on the chain files. The lock dies with the process — no stale-pid
 /// bookkeeping.
 fn lock_watch(sid: &str) -> Result<File> {
-    let path = crate::run_dir()?.join(sid).join("backup-watch.lock");
+    let path = crate::sessions_root()?.join(sid).join("backup-watch.lock");
     let f = File::create(&path)?;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {

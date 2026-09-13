@@ -40,6 +40,7 @@
 //!   DEN_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
 //!   DEN_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)
 
+use crate::layer::read_key_json;
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT};
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{bail, Context, Result};
@@ -56,6 +57,7 @@ use std::time::Duration;
 mod backup;
 #[cfg(target_os = "linux")]
 mod fuse;
+mod layer;
 #[cfg(target_os = "linux")]
 mod mount;
 #[cfg(target_os = "linux")]
@@ -149,7 +151,9 @@ fn session_id(profile: &str) -> String {
             return s;
         }
     }
-    if std::env::var("DEN_NEW").as_deref() == Ok("1") {
+    // DEN_NEW=1 — and every nested run (§7): a subagent spawning a subagent
+    // must not collide on the deterministic <profile>-<cwd-slug> id.
+    if std::env::var("DEN_NEW").as_deref() == Ok("1") || nested_run() {
         return format!("{}-{}-{}", profile, slug(&cwd_string()), random_suffix(5));
     }
     format!("{}-{}", profile, slug(&cwd_string()))
@@ -222,6 +226,36 @@ pub(crate) fn run_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".den/sessions"))
 }
 
+/// True inside a sandboxed agent that spawned another den (§7 nesting): the
+/// inner den keeps its session state inside the OUTER virtual filesystem.
+pub(crate) fn nested_run() -> bool {
+    std::env::var("AGENTFS").as_deref() == Ok("1")
+}
+
+/// Where session dirs live: ~/.den/sessions on the host, or `<cwd>/.den`
+/// inside the outer VFS for nested runs (the only writable tree there).
+pub(crate) fn sessions_root() -> Result<PathBuf> {
+    if nested_run() {
+        return Ok(std::env::current_dir()?.join(".den"));
+    }
+    run_dir()
+}
+
+/// DEN_LAYER=0 forces the legacy per-session seed path (§6 kill switch).
+pub(crate) fn layers_enabled() -> bool {
+    std::env::var("DEN_LAYER").as_deref() != Ok("0")
+}
+
+/// Where shared bases live: ~/.den/bases on the host, `<cwd>/.den/bases`
+/// inside the outer VFS for nested runs.
+pub(crate) fn bases_root() -> Result<PathBuf> {
+    if nested_run() {
+        return Ok(std::env::current_dir()?.join(".den/bases"));
+    }
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join(".den/bases"))
+}
+
 fn cwd_string() -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
@@ -250,16 +284,32 @@ pub(crate) fn block_on<F: std::future::Future>(f: F) -> Result<F::Output> {
 /// "Config" = cwd + effective --allow list, stamped to .stamps/<sid>.
 /// DEN_NO_DROP=1 keeps the old join-blind behaviour.
 fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
-    if std::env::var("DEN_NO_DROP").as_deref() == Ok("1") {
+    if std::env::var("DEN_NO_DROP").as_deref() == Ok("1") || nested_run() {
+        // nested sessions live inside the outer VFS (no host stamp, no
+        // archive-or-drop gate); they join blindly, like DEN_NO_DROP=1
         return Ok(());
     }
     let run_dir = run_dir()?;
     let dir = run_dir.join(sid);
-    let stamp = format!("{}\n{}", cwd_string(), allows.join("\n"));
+    // The stamp carries the pinned base key too: a config change that would
+    // seed a different base must archive the session (§3.7 join/resume).
+    let base_key = session_base_db(sid)?
+        .and_then(|p| {
+            p.parent()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().to_string()))
+        })
+        .unwrap_or_default();
+    let stamp = format!("{}\n{}\n{}", cwd_string(), allows.join("\n"), base_key);
     let stamp_path = run_dir.join(".stamps").join(sid);
 
     if dir.exists() {
-        if std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(stamp.as_str()) {
+        let stored = std::fs::read_to_string(&stamp_path).ok();
+        let same = stored.as_deref() == Some(stamp.as_str())
+            // pre-layer stamps ("cwd\nallows", no base line) match legacy
+            // sessions — don't archive them just for the format change
+            || (base_key.is_empty()
+                && stored.as_deref() == Some(format!("{}\n{}", cwd_string(), allows.join("\n")).as_str()));
+        if same {
             return Ok(()); // same config — join, keeping the previous fs.db
         }
         unmount_stale(&dir.join("mnt"));
@@ -270,10 +320,12 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let name = format!("{sid}.archived-{ts}");
+            unpin_session_base(sid);
             std::fs::rename(&dir, run_dir.join(&name))
                 .with_context(|| format!("archive session {sid}"))?;
             eprintln!("den: config changed — archived previous session as {name} (den inspect {name} to view)");
         } else {
+            unpin_session_base(sid);
             std::fs::remove_dir_all(&dir).with_context(|| format!("drop stale session {sid}"))?;
             eprintln!("den: dropped stale session {sid} (config changed, nothing to keep)");
         }
@@ -373,7 +425,16 @@ fn build_argv(profile_name: &str, passthrough: &[String]) -> Result<Vec<String>>
 // ---- AgentFS SDK: open a persisted session fs.db --------------------------
 /// ~/.den/sessions/<sid>/fs.db — the session's persisted virtual filesystem
 pub(crate) fn session_db_path(sid: &str) -> Result<PathBuf> {
-    Ok(run_dir()?.join(sid).join("fs.db"))
+    Ok(sessions_root()?.join(sid).join("fs.db"))
+}
+
+/// The session's pinned base DB, or None (legacy/delta-only session).
+pub(crate) fn session_base_db(sid: &str) -> Result<Option<PathBuf>> {
+    let p = sessions_root()?.join(sid).join("base");
+    match std::fs::read_to_string(&p) {
+        Ok(t) if !t.trim().is_empty() => Ok(Some(PathBuf::from(t.trim()))),
+        _ => Ok(None),
+    }
 }
 
 /// Open the session's virtual filesystem via the SDK. Returns None if the DB
@@ -831,25 +892,90 @@ pub(crate) async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i
 
 /// compact post-run summary: what this run touched in the virtual FS
 /// (added/modified/removed vs the pre-run snapshot) + capped listing
-async fn print_run_summary(sid: &str, before: &HashMap<String, (i64, u32, i64)>) {
+async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
     if std::env::var("DEN_QUIET").as_deref() == Ok("1") {
-        return;
+        return Ok(());
     }
     let agent = match open_session(sid).await {
         Ok(Some(a)) => a,
-        Ok(None) => return, // no session DB — nothing to summarize
+        Ok(None) => return Ok(()), // no session DB — nothing to summarize
         Err(e) => {
             eprintln!("\nagentfs: {e}");
-            return;
+            return Ok(());
         }
     };
-    let after = snapshot_fs(&agent).await;
-    let added: HashSet<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
-    let removed: HashSet<&String> = before.keys().filter(|k| !after.contains_key(*k)).collect();
-    let modified: HashSet<&String> = after
-        .keys()
-        .filter(|k| before.get(*k).is_some_and(|b| Some(b) != after.get(*k)))
-        .collect();
+    // (kind, path) triples: "+" added, "M" modified, "-" removed
+    let (added, modified, removed) = match before {
+        RunSnap::Legacy(b) => {
+            let after = snapshot_fs(&agent).await;
+            let added: HashSet<String> = after
+                .keys()
+                .filter(|k| !b.contains_key(*k))
+                .cloned()
+                .collect();
+            let removed: HashSet<String> = b
+                .keys()
+                .filter(|k| !after.contains_key(*k))
+                .cloned()
+                .collect();
+            let modified: HashSet<String> = after
+                .iter()
+                .filter(|(k, v)| b.get(*k).is_some_and(|bv| bv != *v))
+                .map(|(k, _)| k.clone())
+                .collect();
+            (added, modified, removed)
+        }
+        RunSnap::Layered(b) => {
+            let after = delta_snapshot(&agent).await?;
+            // Base attrs tell copy-ups from new files and no-ops from edits:
+            // a delta entry whose attrs match the base is an unmodified
+            // copy-up (mtime preserved), not a change.
+            let mut base_attrs: HashMap<String, (i64, u32, i64)> = HashMap::new();
+            if let Some(p) = session_base_db(sid)? {
+                if let Ok(base) =
+                    AgentFS::open(AgentFSOptions::with_path(p.to_string_lossy().to_string())).await
+                {
+                    for path in after.delta.keys() {
+                        if let Some(st) = base.fs.lstat(path).await.ok().flatten() {
+                            base_attrs.insert(path.clone(), (st.mtime, st.mtime_nsec, st.size));
+                        }
+                    }
+                }
+            }
+            let mut added: HashSet<String> = HashSet::new();
+            let mut modified: HashSet<String> = HashSet::new();
+            for (p, v) in &after.delta {
+                match b.delta.get(p) {
+                    // this run already knew the entry: report attr changes
+                    Some(bv) => {
+                        if bv != v {
+                            modified.insert(p.clone());
+                        }
+                    }
+                    None => match base_attrs.get(p) {
+                        Some(ba) if ba == v => {} // no-op copy-up: attrs identical
+                        Some(_) => {
+                            modified.insert(p.clone()); // copied up + written
+                        }
+                        None => {
+                            added.insert(p.clone()); // brand-new
+                        }
+                    },
+                }
+            }
+            let mut removed: HashSet<String> = after
+                .tombstones
+                .difference(&b.tombstones)
+                .cloned()
+                .collect();
+            for p in b.delta.keys() {
+                if !after.delta.contains_key(p) {
+                    removed.insert(p.clone());
+                }
+            }
+            (added, modified, removed)
+        }
+    };
     eprintln!(
         "\npit: session {sid} — {} added, {} modified, {} removed this run",
         added.len(),
@@ -866,9 +992,285 @@ async fn print_run_summary(sid: &str, before: &HashMap<String, (i64, u32, i64)>)
             eprintln!("  … {} more", list.len() - 20);
         }
     }
+    Ok(())
 }
 
 // ---- subcommands -------------------------------------------------------------
+
+// ---- layered sessions: shared base + per-session delta (§3.6) ---------------
+
+/// A resolved base: shared read-only DB + its content-identity key.
+struct PreparedBase {
+    key: String,
+    db_path: PathBuf,
+    /// Seed-time HEAD (git seeds) — echoed into the session's seed.sha.
+    head_sha: Option<String>,
+    note: Option<String>,
+    /// True when this call created the base (vs reused an existing one).
+    fresh_base: bool,
+}
+
+/// key.json content for a resolved seed source.
+async fn base_key_meta(
+    seed: &Path,
+    git: bool,
+    head_sha: Option<&str>,
+    digest: String,
+) -> layer::BaseKey {
+    let toplevel = if git {
+        git_seed_ctx(seed)
+            .map(|c| c.toplevel)
+            .unwrap_or_else(|| seed.to_path_buf())
+    } else {
+        seed.to_path_buf()
+    };
+    layer::BaseKey {
+        kind: if git { "git" } else { "dir" }.into(),
+        toplevel: toplevel.to_string_lossy().to_string(),
+        head_sha: head_sha.map(|s| s.to_string()),
+        digest,
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        refs: 0,
+    }
+}
+
+/// Create or open the shared base for a seed source (§3.6). The key is
+/// content-identity (worktree digest + git HEAD), so identical worktrees
+/// share one base. Reuses the existing seed machinery verbatim
+/// (resolve_seed_source / seed_session / scrub_git_config — the credential
+/// scrub now runs once per base instead of per session).
+async fn prepare_base(seed: &Path, dirty: DirtyMode) -> Result<PreparedBase> {
+    let rs = resolve_seed_source(seed, dirty)?;
+    let digest = layer::worktree_digest(&rs.src)?;
+    let key = layer::base_key(
+        rs.git_dir.is_some(),
+        &rs.src,
+        rs.head_sha.as_deref(),
+        &digest,
+    );
+    let dir = bases_root()?.join(&key);
+    std::fs::create_dir_all(&dir)?;
+    let db = dir.join("base.db");
+    // One creator per key; joiners wait for base.db (same-user single host).
+    // A stale .seed-lock (crashed creator) is removed by hand.
+    let guard = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(".seed-lock"))
+    {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(e) => return Err(e.into()),
+    };
+    if guard.is_none() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !db.exists() {
+            if std::time::Instant::now() > deadline {
+                bail!(
+                    "base {key} is being created elsewhere (if that failed, remove {} and retry)",
+                    dir.join(".seed-lock").display()
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    let mut fresh_base = false;
+    if !db.exists() {
+        let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+        let agent = AgentFS::open(opts).await.context("create base DB")?;
+        let seeded = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await;
+        if rs.temp {
+            // Clean up whether seeding succeeded or failed — a `?` would
+            // otherwise leak the HEAD-extract temp dir.
+            let _ = std::fs::remove_dir_all(&rs.src);
+        }
+        let n = seeded?;
+        eprintln!(
+            "den: seeded base {key} with {n} entries from {}",
+            seed.display()
+        );
+        if rs.git_dir.is_some() {
+            eprintln!("den: repo history seeded as /.git (shared; credentials scrubbed once)");
+        }
+        layer::write_key_json(
+            &dir.join("key.json"),
+            &base_key_meta(
+                seed,
+                rs.git_dir.is_some(),
+                rs.head_sha.as_deref(),
+                digest.clone(),
+            )
+            .await,
+        )?;
+        fresh_base = true;
+    }
+    // Self-heal a base whose key.json is missing (crash between seed and
+    // write): the key already carries the identity just computed.
+    if layer::read_key_json(&dir.join("key.json")).is_err() {
+        layer::write_key_json(
+            &dir.join("key.json"),
+            &base_key_meta(seed, rs.git_dir.is_some(), rs.head_sha.as_deref(), digest).await,
+        )?;
+    }
+    pin_base(&dir, 1)?;
+    Ok(PreparedBase {
+        key,
+        db_path: db,
+        head_sha: rs.head_sha,
+        note: rs.note,
+        fresh_base,
+    })
+}
+
+/// Adjust a base's pin count (advisory; v1 GC is manual): +1 on session
+/// creation, -1 when a session is rm'd or archived.
+fn pin_base(base_dir: &Path, delta: i64) -> Result<()> {
+    let p = base_dir.join("key.json");
+    let mut k = layer::read_key_json(&p)?;
+    k.refs = ((k.refs as i64) + delta).max(0) as u64;
+    layer::write_key_json(&p, &k)
+}
+
+/// The pinned base's seed-time HEAD (for `den push` baseline-drift checks);
+/// read from the base's key.json — a host file, opened read-only.
+fn base_head_sha(base_db: &Path) -> Option<String> {
+    layer::read_key_json(&base_db.parent()?.join("key.json"))
+        .ok()?
+        .head_sha
+}
+
+/// Unpin the base a session points at, if any (on rm / archive).
+fn unpin_session_base(sid: &str) {
+    if let Ok(Some(p)) = session_base_db(sid) {
+        if let Some(d) = p.parent() {
+            let _ = pin_base(d, -1);
+        }
+    }
+}
+
+/// Update the config stamp's base line after a fresh session pins its base
+/// (drop_stale_session wrote the stamp before the base existed).
+fn stamp_set_base(sid: &str, allows: &[String], base_key: &str) -> Result<()> {
+    if nested_run() {
+        return Ok(()); // nested sessions live in the outer VFS; no host stamp
+    }
+    let stamp_path = run_dir()?.join(".stamps").join(sid);
+    if let Some(parent) = stamp_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        &stamp_path,
+        format!("{}\n{}\n{}", cwd_string(), allows.join("\n"), base_key),
+    )?;
+    Ok(())
+}
+
+/// Create the session's delta DB and pin it to a prepared base (cmd_run's
+/// fresh-layered path; the sandbox selftest reuses it verbatim).
+async fn create_layered_session(sid: &str, p: &PreparedBase) -> Result<()> {
+    let db = session_db_path(sid)?;
+    std::fs::create_dir_all(db.parent().unwrap_or(Path::new(".")))?;
+    let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+    let delta = AgentFS::open(opts)
+        .await
+        .context("create session delta DB")?;
+    drop(delta);
+    let sd = db.parent().context("session dir")?;
+    std::fs::write(sd.join("base"), p.db_path.to_string_lossy().to_string())?;
+    if let Some(sha) = &p.head_sha {
+        std::fs::write(sd.join("seed.sha"), sha)?;
+    }
+    Ok(())
+}
+
+/// Pre/post-run snapshot of what the session OWNS: for layered sessions that
+/// is its delta + tombstones (small — the base is shared and read-only); for
+/// legacy/delta-only sessions it is the whole virtual-FS tree.
+enum RunSnap {
+    /// full virtual-FS path -> (mtime, mtime_nsec, size)
+    Legacy(HashMap<String, (i64, u32, i64)>),
+    Layered(DeltaSnap),
+}
+
+#[derive(Default)]
+struct DeltaSnap {
+    delta: HashMap<String, (i64, u32, i64)>,
+    tombstones: HashSet<String>,
+}
+
+/// path -> (mtime, nsec, size) for every entry in the session's DELTA (what
+/// it created, copied up, or tombstoned) — O(session changes), not O(repo).
+async fn delta_snapshot(agent: &AgentFS) -> Result<DeltaSnap> {
+    let mut snap = DeltaSnap::default();
+    for p in agent.get_delta_paths().await? {
+        if let Some(st) = agent.fs.lstat(&p).await.ok().flatten() {
+            snap.delta.insert(p, (st.mtime, st.mtime_nsec, st.size));
+        }
+    }
+    snap.tombstones = agent.get_whiteouts().await.unwrap_or_default();
+    Ok(snap)
+}
+
+/// path -> (mtime, nsec, size) for a whole layer tree. `filter` applies the
+/// tombstone ancestor check (base walks only — the delta namespace always
+/// wins, so delta walks are unfiltered).
+async fn walk_tree(
+    agent: &AgentFS,
+    out: &mut HashMap<String, (i64, u32, i64)>,
+    filter: Option<&HashSet<String>>,
+) {
+    let mut stack = vec![(String::new(), 1i64)]; // (path, ino); root ino = 1
+    while let Some((path, ino)) = stack.pop() {
+        let names = agent
+            .fs
+            .readdir(ino)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let names = match filter {
+            Some(ts) => layer::filter_base_children(&path, &names, ts),
+            None => names,
+        };
+        for name in names {
+            let child = format!("{path}/{name}");
+            let Some(st) = agent.fs.lstat(&child).await.ok().flatten() else {
+                continue;
+            };
+            if st.mode & S_IFMT == S_IFDIR {
+                stack.push((child.clone(), st.ino));
+            }
+            out.insert(child, (st.mtime, st.mtime_nsec, st.size));
+        }
+    }
+}
+
+/// The MERGED view of a layered session (§3.7 inspect): base ∪ delta, minus
+/// tombstoned base paths (and their subtrees). No FUSE, no merged-ino map —
+/// a plain union of both trees; delta attrs win on shared paths.
+async fn snapshot_merged(session_dir: &Path) -> Result<HashMap<String, (i64, u32, i64)>> {
+    let delta_path = session_dir.join("fs.db");
+    let delta = AgentFS::open(AgentFSOptions::with_path(
+        delta_path.to_string_lossy().to_string(),
+    ))
+    .await
+    .context("open session delta DB")?;
+    let tombstones = delta.get_whiteouts().await.unwrap_or_default();
+    let mut merged = HashMap::new();
+    if let Some(base_db) = std::fs::read_to_string(session_dir.join("base"))
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+    {
+        let base = AgentFS::open(AgentFSOptions::with_path(base_db)).await?;
+        walk_tree(&base, &mut merged, Some(&tombstones)).await;
+    }
+    walk_tree(&delta, &mut merged, None).await;
+    Ok(merged)
+}
 
 fn cmd_run(
     profile_name: &str,
@@ -879,66 +1281,124 @@ fn cmd_run(
     seed: Option<PathBuf>,
     dirty: DirtyMode,
 ) -> Result<i32> {
-    // full-vfs: the session DB is the whole filesystem. First run creates it
-    // (optionally seeded from a dir); later runs use the DB alone — the host
-    // tree is irrelevant. Snapshot before/after for the touched-this-run diff.
+    // full-vfs: layered sessions mount base+delta (§3); the delta starts
+    // empty and holds only the session's changes. Legacy mode (DEN_LAYER=0,
+    // or a pre-layer session dir without a `base` file) seeds fs.db itself.
     let db = session_db_path(sid)?;
     let fresh = !db.exists();
-    let before = block_on(async {
-        if fresh {
+    let allows = effective_allows(&profile(profile_name));
+    // Nested runs (§7 step 2): no --seed — the subagent inherits the outer
+    // session's pinned base (its delta lives inside the outer VFS at
+    // <cwd>/.den/<sid>/fs.db).
+    let nested_base: Option<PathBuf> = if fresh && seed.is_none() && nested_run() {
+        std::env::var("DEN_BASE_DB")
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty() && Path::new(p).is_file())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    let prepared = if fresh && seed.is_some() && layers_enabled() {
+        Some(block_on(prepare_base(
+            seed.as_deref().context("seed dir")?,
+            dirty,
+        ))??)
+    } else {
+        None
+    };
+    let before: RunSnap = block_on(async {
+        let snap: RunSnap = if fresh {
             std::fs::create_dir_all(db.parent().unwrap_or(Path::new(".")))?;
-        }
-        let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
-        let agent = AgentFS::open(opts).await.context("open session DB")?;
-        if fresh {
-            if let Some(d) = &seed {
-                let rs = resolve_seed_source(d, dirty)?;
-                let n = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await;
-                if rs.temp {
-                    // Clean up whether seeding succeeded or failed — a `?`
-                    // above would otherwise leak the HEAD-extract temp dir.
-                    let _ = std::fs::remove_dir_all(&rs.src);
+            match (&prepared, nested_base) {
+                (None, Some(b)) => {
+                    // Nested session (§7 step 2): delta empty inside the
+                    // outer VFS; base inherited from the outer session.
+                    let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+                    let delta = AgentFS::open(opts)
+                        .await
+                        .context("create nested session DB")?;
+                    drop(delta);
+                    let sd = db.parent().context("nested session dir")?;
+                    std::fs::write(sd.join("base"), b.to_string_lossy().to_string())?;
+                    // Echo the base's seed HEAD for push-drift (v2 push reads it).
+                    if let Some(sha) = base_head_sha(&b) {
+                        std::fs::write(sd.join("seed.sha"), sha)?;
+                    }
+                    RunSnap::Layered(DeltaSnap::default())
                 }
-                let n = n?;
-                eprintln!(
-                    "den: seeded session {sid} with {n} entries from {}",
-                    d.display()
-                );
-                if rs.git_dir.is_some() {
-                    eprintln!("den: repo history seeded as /.git (private to the session)");
+                (Some(p), _) => {
+                    // delta starts EMPTY; the session pins the shared base.
+                    create_layered_session(sid, p).await?;
+                    stamp_set_base(sid, &allows, &p.key)?;
+                    let what = if p.fresh_base { "new" } else { "reused" };
+                    eprintln!("den: session {sid} on {what} base {} — delta empty", p.key);
+                    if let Some(x) = &p.note {
+                        eprintln!("den: {x}");
+                    }
+                    RunSnap::Layered(DeltaSnap::default())
                 }
-                if let Some(x) = &rs.note {
-                    eprintln!("den: {x}");
-                }
-                if let Some(sha) = &rs.head_sha {
-                    // Seed-time HEAD: lets `den push` detect baseline drift
-                    // if the host repo advances between seed and push.
-                    let sd = db.parent().context("session dir")?;
-                    std::fs::write(sd.join("seed.sha"), sha)?;
+                (None, None) => {
+                    let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+                    let agent = AgentFS::open(opts).await.context("open session DB")?;
+                    if let Some(d) = &seed {
+                        let rs = resolve_seed_source(d, dirty)?;
+                        let seeded = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await;
+                        if rs.temp {
+                            // Clean up whether seeding succeeded or failed —
+                            // a `?` would leak the HEAD-extract temp dir.
+                            let _ = std::fs::remove_dir_all(&rs.src);
+                        }
+                        let n = seeded?;
+                        eprintln!(
+                            "den: seeded session {sid} with {n} entries from {}",
+                            d.display()
+                        );
+                        if rs.git_dir.is_some() {
+                            eprintln!("den: repo history seeded as /.git (private to the session)");
+                        }
+                        if let Some(x) = &rs.note {
+                            eprintln!("den: {x}");
+                        }
+                        if let Some(sha) = &rs.head_sha {
+                            let sd = db.parent().context("session dir")?;
+                            std::fs::write(sd.join("seed.sha"), sha)?;
+                        }
+                    }
+                    let snap = snapshot_fs(&agent).await;
+                    // Seed baseline for `den push` (legacy sessions only —
+                    // layered sessions diff against their base instead).
+                    if seed.is_some() {
+                        let sd = db.parent().context("session dir")?;
+                        std::fs::write(sd.join("seed.snapshot"), push::snapshot_to_tsv(&snap))?;
+                    }
+                    RunSnap::Legacy(snap)
                 }
             }
-        } else if seed.is_some() {
-            eprintln!("den: session {sid} already exists — --seed ignored (DEN_NEW=1 for a fresh session)");
-        }
-        anyhow::Ok(snapshot_fs(&agent).await)
+        } else {
+            if seed.is_some() {
+                eprintln!(
+                    "den: session {sid} already exists — --seed ignored (DEN_NEW=1 for a fresh session)"
+                );
+            }
+            let agent = open_session(sid).await?.context("no session DB")?;
+            if session_base_db(sid)?.is_some() {
+                RunSnap::Layered(delta_snapshot(&agent).await?)
+            } else {
+                RunSnap::Legacy(snapshot_fs(&agent).await)
+            }
+        };
+        anyhow::Ok(snap)
     })??;
-    // Seed baseline for `den push`: a snapshot of exactly what was seeded
-    // (repo + /.git, before any agent or sandbox-setup writes). Written once
-    // at session creation; push diffs the VFS against this.
-    if fresh && seed.is_some() {
-        let sd = db.parent().context("session dir")?;
-        std::fs::write(sd.join("seed.snapshot"), push::snapshot_to_tsv(&before))?;
-    }
     let mut argv = build_argv(profile_name, passthrough)?;
     // Resolve the command on the host PATH before entering the sandbox, so a
     // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
     // shadow the real agent binary via PATH ordering inside the sandbox.
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
-    let allows = effective_allows(&profile(profile_name));
     if autostart {
         spawn_watch(sid, auto_out.as_deref())?;
     }
-    // The sandbox is in-process: FUSE overlay + fork/unshare child. The child
+    // The sandbox is in-process: FUSE merge + fork/unshare child. The child
     // keeps the default signal dispositions (inherited across fork), and the
     // sandbox parent installs forward-to-child handlers itself, so Ctrl-C
     // reaches the agent directly — no wrapper in between to ignore it.
@@ -954,12 +1414,12 @@ fn cmd_run(
     let code = {
         // ponytail: the macOS NFS+sandbox-exec path was not ported; the FUSE
         // sandbox is Linux-only. Re-add when macOS matters (port cli/src/sandbox/darwin.rs).
-        let _ = (allows, &argv);
+        let _ = &argv;
         bail!("den's in-process sandbox is Linux-only; run den on Linux")
     };
-    // The agent has exited and the session DB is persisted — diff the
-    // virtual FS against the pre-run snapshot.
-    block_on(print_run_summary(sid, &before))?;
+    // The agent has exited and the session DB is persisted — diff what the
+    // session owns against the pre-run snapshot.
+    block_on(print_run_summary(sid, &before))??;
     Ok(code)
 }
 
@@ -1010,7 +1470,7 @@ fn split_run_args(
 /// SIGINT/SIGTERM, so it outlives Ctrl-C; subcommands restore TERM handling
 /// themselves so `kill` still stops them.
 fn spawn_detached(sid: &str, args: &[&str], log_name: &str) -> Result<u32> {
-    let log = crate::run_dir()?.join(sid).join(log_name);
+    let log = crate::sessions_root()?.join(sid).join(log_name);
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1056,14 +1516,17 @@ fn spawn_watch(sid: &str, out: Option<&Path>) -> Result<()> {
         eprintln!(
             "den: autostarted litestream for {sid} -> {} (pid {pid}, log: {})",
             replica_url(sid, None)?,
-            crate::run_dir()?.join(sid).join("replicate.log").display()
+            crate::sessions_root()?
+                .join(sid)
+                .join("replicate.log")
+                .display()
         );
         return Ok(());
     }
     let out = out
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from(format!("{sid}.ltx")));
-    let log = crate::run_dir()?.join(sid).join("backup-watch.log");
+    let log = crate::sessions_root()?.join(sid).join("backup-watch.log");
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1111,7 +1574,7 @@ unsafe fn ignore_int_term() {
 /// the process lifetime (mirrors the LTX watcher's lock_watch). The lock
 /// dies with the process — no stale-pid bookkeeping.
 fn replicate_lock(sid: &str) -> Result<File> {
-    let path = run_dir()?.join(sid).join("replicate.lock");
+    let path = sessions_root()?.join(sid).join("replicate.lock");
     let f = File::create(&path)?;
     let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
@@ -1191,7 +1654,7 @@ fn cmd_replicate(sid: &str, url_opt: Option<&str>) -> Result<()> {
              (or set DEN_LITESTREAM=/path/to/litestream)"
         );
     }
-    let session_dir = run_dir()?.join(sid);
+    let session_dir = sessions_root()?.join(sid);
     std::fs::create_dir_all(&session_dir)?;
     let db = session_dir.join("fs.db");
     let _lock = replicate_lock(sid)?;
@@ -1346,7 +1809,13 @@ fn cmd_inspect(sid: &str) -> Result<()> {
             Some(a) => a,
             None => bail!("no fs.db for session {sid} at {}", db_path.display()),
         };
-        let snap = snapshot_fs(&agent).await;
+        // Layered session: merged view = base ∪ delta − tombstones (§3.7).
+        // Legacy session: fs.db IS the tree, as before.
+        let snap = if session_base_db(sid)?.is_some() {
+            snapshot_merged(&sessions_root()?.join(sid)).await?
+        } else {
+            snapshot_fs(&agent).await
+        };
         let bytes: i64 = snap.values().map(|v| v.2).sum();
         println!("session {sid}: {} entries, {} bytes", snap.len(), bytes);
         let mut paths: Vec<_> = snap.keys().collect();
@@ -1398,10 +1867,18 @@ async fn collect_session_rows(run_dir: &Path) -> Result<Vec<SessionRow>> {
             .trim()
             .to_string();
         let entries = if db.exists() {
-            let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
-            match AgentFS::open(opts).await {
-                Ok(agent) => Some(snapshot_fs(&agent).await.len()),
-                Err(_) => Some(0),
+            // layered: merged view; legacy: the DB alone
+            if session_dir.join("base").exists() {
+                match snapshot_merged(&session_dir).await {
+                    Ok(snap) => Some(snap.len()),
+                    Err(_) => Some(0),
+                }
+            } else {
+                let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
+                match AgentFS::open(opts).await {
+                    Ok(agent) => Some(snapshot_fs(&agent).await.len()),
+                    Err(_) => Some(0),
+                }
             }
         } else {
             None
@@ -1461,7 +1938,7 @@ fn prompt_session_selection(rows: &[SessionRow]) -> Result<String> {
 }
 
 fn load_session_rows() -> Result<(PathBuf, Vec<SessionRow>)> {
-    let run_dir = run_dir()?;
+    let run_dir = sessions_root()?;
     if !run_dir.exists() {
         return Ok((run_dir, Vec::new()));
     }
@@ -1512,6 +1989,7 @@ fn cmd_rm(sid: &str) -> Result<()> {
         bail!("no session {} at {}", sid, run_dir.display());
     }
     unmount_stale(&dir.join("mnt"));
+    unpin_session_base(sid);
     std::fs::remove_dir_all(&dir).with_context(|| format!("rm session {sid}"))?;
     let stamp = run_dir.join(".stamps").join(sid);
     if stamp.exists() {
@@ -1682,7 +2160,191 @@ fn selftest_sandbox() -> Result<()> {
         );
         println!("sandbox selftest OK (seed, mount, vfs writes, ro-enforcement, join)");
     }
+    selftest_layered()?;
     Ok(())
+}
+
+/// Layered round-trip (docs/layered-sessions.md §9 selftest): shared base +
+/// per-session delta, base reuse on identical seed, join, RO enforcement.
+fn selftest_layered() -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    bail!("selftest --sandbox is Linux-only");
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::env::temp_dir().join(format!("den-layer-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("README.md"), "hello\n")?;
+        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::write(dir.join("src/a.txt"), "orig\n")?;
+        // The legacy selftest above left the process cwd on a deleted dir;
+        // every run_cmd below needs a valid cwd (it becomes the mount target).
+        std::env::set_current_dir(&dir).with_context(|| format!("chdir {}", dir.display()))?;
+
+        let sid = format!("selftest-layered-{}", std::process::id());
+        std::env::remove_var("DEN_LAYER");
+
+        // Fresh layered session: base seeded once, delta starts empty.
+        let (prep, before) = block_on(async {
+            let p = prepare_base(&dir, DirtyMode::All).await?;
+            create_layered_session(&sid, &p).await?;
+            let delta = open_session(&sid).await?.context("delta DB")?;
+            anyhow::Ok((p, delta_snapshot(&delta).await?))
+        })??;
+        let base_db = prep.db_path.clone();
+        let base_hash_before = hash_file(&base_db);
+        check_sandbox(before.delta.is_empty(), true, "fresh delta empty")?;
+        check_sandbox(before.tombstones.is_empty(), true, "fresh tombstones empty")?;
+
+        // Identical seed again → the SAME base is reused (key = content id).
+        let prep2 = block_on(prepare_base(&dir, DirtyMode::All))??;
+        check_sandbox(
+            prep2.db_path == prep.db_path,
+            true,
+            "identical seed reuses base",
+        )?;
+        let key_json = read_key_json(&base_db.parent().unwrap().join("key.json"))?;
+        check_sandbox(key_json.refs >= 2, true, "base refs counted both pins")?;
+
+        let script = "echo hi >> README.md; echo x > new.txt; rm src/a.txt";
+        let code = block_on(sandbox::run_cmd(
+            Vec::new(),
+            sid.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+        ))??;
+        check_sandbox(code == 0, true, "layered run exit code")?;
+
+        // The base DB never changed.
+        check_sandbox(
+            hash_file(&base_db) == base_hash_before,
+            true,
+            "base.db untouched by the run",
+        )?;
+
+        // The delta holds exactly this run's changes (host tree copied out
+        // into base.db at seed time, so none of it is in the delta).
+        let sid_c = sid.clone();
+        let after = block_on(async move {
+            let delta = open_session(&sid_c).await?.context("delta after run")?;
+            delta_snapshot(&delta).await
+        })??;
+        check_sandbox(
+            after.delta.contains_key("/README.md") && after.delta.contains_key("/new.txt"),
+            true,
+            "delta holds modified + added files",
+        )?;
+        check_sandbox(
+            !after.delta.contains_key("/src") && !after.delta.contains_key("/src/a.txt"),
+            true,
+            "untouched base subtree never copied into the delta",
+        )?;
+        check_sandbox(
+            after.tombstones.contains("/src/a.txt"),
+            true,
+            "deleted base file leaves a tombstone",
+        )?;
+
+        // Merged view: base ∪ delta − tombstones — all three effects visible.
+        let sdir = sessions_root()?.join(&sid);
+        let merged = block_on(snapshot_merged(&sdir))??;
+        check_sandbox(
+            merged.contains_key("/README.md") && merged.contains_key("/new.txt"),
+            true,
+            "merged shows modified + added",
+        )?;
+        check_sandbox(
+            merged.contains_key("/src/a.txt"),
+            false,
+            "merged hides deleted",
+        )?;
+        check_sandbox(
+            merged.contains_key("/src"),
+            true,
+            "merged still lists base dir",
+        )?;
+
+        // Join: a second run appends to the same delta.
+        let code = block_on(sandbox::run_cmd(
+            Vec::new(),
+            sid.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "echo more >> new.txt".into()],
+        ))??;
+        check_sandbox(code == 0, true, "join-run exit code")?;
+        let sid_c = sid.clone();
+        let after2 = block_on(async move {
+            let delta = open_session(&sid_c).await?.context("delta after join")?;
+            let snap = delta_snapshot(&delta).await?;
+            let bytes = delta.fs.read_file("/new.txt").await.ok().flatten();
+            anyhow::Ok((snap, bytes))
+        })??;
+        check_sandbox(
+            after2.0.delta.contains_key("/new.txt"),
+            true,
+            "delta survives join",
+        )?;
+        check_sandbox(
+            after2
+                .1
+                .is_some_and(|b| String::from_utf8_lossy(&b).contains("x\nmore\n")),
+            true,
+            "joined write landed in the delta",
+        )?;
+
+        // /etc stays read-only (RO sweep unchanged by layering).
+        let code = block_on(sandbox::run_cmd(
+            Vec::new(),
+            sid.clone(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "touch /etc/den-layer-evil".into()],
+        ))??;
+        check_sandbox(code != 0, true, "/etc write rejected (EROFS)")?;
+
+        // DEN_LAYER=0 escape hatch: fs.db seeded directly, no base pointer.
+        let legacy_sid = format!("selftest-legacy-{}", std::process::id());
+        std::env::set_var("DEN_LAYER", "0");
+        let legacy_fresh = {
+            let dbp = session_db_path(&legacy_sid)?;
+            let created = block_on(async {
+                std::fs::create_dir_all(dbp.parent().unwrap_or(Path::new(".")))?;
+                let opts = AgentFSOptions::with_path(dbp.to_string_lossy().to_string());
+                let agent = AgentFS::open(opts).await?;
+                let n = seed_session(&agent, &dir, None).await?;
+                anyhow::Ok(n)
+            })??;
+            check_sandbox(created == 3, true, "legacy seed copied 3 entries")?;
+            !session_base_db(&legacy_sid)?.is_some()
+        };
+        check_sandbox(legacy_fresh, true, "DEN_LAYER=0 session has no base")?;
+        check_sandbox(
+            session_db_path(&legacy_sid)?.exists(),
+            true,
+            "legacy session DB seeded in place",
+        )?;
+
+        // Cleanup: sessions + the base the selftest created (2 pins).
+        unpin_session_base(&sid);
+        let _ = std::fs::remove_dir_all(sessions_root()?.join(&sid));
+        let _ = std::fs::remove_dir_all(sessions_root()?.join(&legacy_sid));
+        let _ = std::fs::remove_file(sessions_root()?.join(".stamps").join(&sid));
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Ok(key_json) = read_key_json(&base_db.parent().unwrap().join("key.json")) {
+            if key_json.refs == 0 {
+                let _ = std::fs::remove_dir_all(base_db.parent().unwrap());
+            }
+        }
+        println!("layered selftest OK (base, delta, tombstone, merge, join, DEN_LAYER=0)");
+    }
+    Ok(())
+}
+
+fn hash_file(p: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(bytes) = std::fs::read(p) {
+        bytes.iter().for_each(|b| b.hash(&mut h));
+    }
+    h.finish()
 }
 
 fn check_sandbox(cond: bool, expected: bool, what: &str) -> Result<()> {
@@ -1885,7 +2547,7 @@ fn cmd_push_args(rest: &[String]) -> Result<()> {
         Some(s) => s,
         None => select_session()?,
     };
-    let sdir = run_dir()?.join(&sid);
+    let sdir = sessions_root()?.join(&sid);
     let out = block_on(push::push_session(&sid, &sdir, &o))??;
 
     println!(
