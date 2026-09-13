@@ -977,7 +977,7 @@ async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
         }
     };
     eprintln!(
-        "\npit: session {sid} — {} added, {} modified, {} removed this run",
+        "\nden: session {sid} — {} added, {} modified, {} removed this run",
         added.len(),
         modified.len(),
         removed.len()
