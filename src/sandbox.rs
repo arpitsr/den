@@ -40,8 +40,10 @@
 //! and the proxy itself enforces an allowlist. DEN_NET=none keeps the netns
 //! but no slirp/nft; DEN_NET=full keeps the legacy behaviour (host network).
 
+use crate::layer::LayeredFS;
 use crate::mount::{mount_fs, MountOpts};
 use crate::run_dir;
+use agentfs_sdk::filesystem::FileSystem;
 use agentfs_sdk::{AgentFS, AgentFSOptions};
 use anyhow::{bail, Context, Result};
 use std::cmp::Reverse;
@@ -82,6 +84,11 @@ impl NetMode {
                 NetMode::Proxy
             }
             Err(_) => {
+                // Nested runs (a subagent's den inside the sandbox, §7.4):
+                // no egress by default — `none` skips slirp + proxy entirely.
+                if crate::nested_run() {
+                    return NetMode::None;
+                }
                 if bin_found("slirp4netns") && bin_found("nft") {
                     NetMode::Proxy
                 } else {
@@ -284,7 +291,7 @@ pub async fn run_cmd(
         .db_path
         .to_str()
         .context("Database path contains non-UTF8 characters")?;
-    let agentfs = AgentFS::open(AgentFSOptions::with_path(db_path_str.to_string()))
+    let delta = AgentFS::open(AgentFSOptions::with_path(db_path_str.to_string()))
         .await
         .context("Failed to open session AgentFS")?;
 
@@ -305,11 +312,26 @@ pub async fn run_cmd(
         timeout: FUSE_MOUNT_TIMEOUT,
     };
 
-    let mount_handle = mount_fs(
-        std::sync::Arc::new(tokio::sync::Mutex::new(agentfs.fs)),
-        mount_opts,
-    )
-    .await?;
+    // Layered sessions (docs/layered-sessions.md §3): a shared read-only
+    // base DB + this session's sparse delta, merged by LayeredFS. Legacy
+    // sessions (no `base` pointer) mount fs.db directly — full-vfs model,
+    // exactly the old behavior.
+    let delta_fs = delta.fs.clone();
+    let fs: std::sync::Arc<tokio::sync::Mutex<dyn FileSystem + Send>> =
+        match crate::session_base_db(&session_id)? {
+            Some(base_db) => {
+                let base = AgentFS::open(AgentFSOptions::with_path(
+                    base_db.to_string_lossy().to_string(),
+                ))
+                .await
+                .with_context(|| format!("open base {}", base_db.display()))?;
+                let layered = LayeredFS::open(Some(base.fs.clone()), delta_fs).await?;
+                std::sync::Arc::new(tokio::sync::Mutex::new(layered))
+            }
+            None => std::sync::Arc::new(tokio::sync::Mutex::new(delta_fs)),
+        };
+
+    let mount_handle = mount_fs(fs, mount_opts).await?;
 
     let net = NetMode::from_env();
     let exit_code = run_chain(
@@ -1132,6 +1154,9 @@ fn setup_dev() {
     }
     let pts_fd = fs::File::open("/dev/pts").ok();
     let tun_fd = fs::File::open("/dev/net/tun").ok();
+    // /dev/fuse lets a nested den (§7) mount its own session — without it
+    // the inner FUSE daemon fails with ENODEV.
+    let fuse_fd = fs::File::open("/dev/fuse").ok();
 
     // SAFETY: mount tmpfs over /dev.
     let dev_cstr = CString::new("/dev").unwrap();
@@ -1169,6 +1194,10 @@ fn setup_dev() {
     // Same for /dev/net/tun if the host has it.
     if let Some(f) = &tun_fd {
         bind_mount_fd(f.as_raw_fd(), "/dev/net/tun");
+    }
+    // Same for /dev/fuse if the host has it (nested den mounts, §7).
+    if let Some(f) = &fuse_fd {
+        bind_mount_fd(f.as_raw_fd(), "/dev/fuse");
     }
 
     // /dev/shm as tmpfs.
@@ -1656,6 +1685,12 @@ fn setup_env_vars(session_id: &str) {
     std::env::set_var("AGENTFS", "1");
     std::env::set_var("AGENTFS_SANDBOX", "linux-namespace");
     std::env::set_var("AGENTFS_SESSION", session_id);
+
+    // Nested runs (§7): a subagent's den inherits this session's pinned
+    // base DB (host path — readable, never written inside the sandbox).
+    if let Ok(Some(base)) = crate::session_base_db(session_id) {
+        std::env::set_var("DEN_BASE_DB", base.to_string_lossy().to_string());
+    }
     std::env::set_var("PS1", "🤖 \\u@\\h:\\w\\$ ");
 
     // DEN_PROXY_UPSTREAM holds the host's own proxy URL (possibly with
