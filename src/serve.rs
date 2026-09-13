@@ -427,6 +427,8 @@ async fn delete_session(
 
 /// Owner check for every session-scoped route: root sees all, a minted
 /// key only its own sessions. Returns the row or an error response.
+// Response<Body> is bulky; boxing the error would touch every call site.
+#[allow(clippy::result_large_err)]
 async fn authorize(
     st: &Arc<ServeState>,
     ctx: &AuthContext,

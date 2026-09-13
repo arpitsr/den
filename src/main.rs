@@ -1498,16 +1498,17 @@ fn cmd_run(
 /// agent): `--seed <dir>` and `--seed-dirty <mode>` always, `--autostart
 /// [--out <base.ltx>]` only when --autostart is present, so plain agent args
 /// are never eaten.
-fn split_run_args(
-    rest: &[String],
-) -> (
-    bool,
-    Option<PathBuf>,
-    Option<PathBuf>,
-    Option<String>,
-    Option<String>,
-    Vec<String>,
-) {
+#[derive(Debug, Default, PartialEq)]
+struct SplitRunArgs {
+    autostart: bool,
+    out: Option<PathBuf>,
+    seed: Option<PathBuf>,
+    git: Option<String>,
+    dirty: Option<String>,
+    passthrough: Vec<String>,
+}
+
+fn split_run_args(rest: &[String]) -> SplitRunArgs {
     let autostart = rest.iter().any(|a| a == "--autostart");
     let mut out = None;
     let mut seed = None;
@@ -1538,7 +1539,14 @@ fn split_run_args(
         }
         i += 1;
     }
-    (autostart, out, seed, git, dirty, pass)
+    SplitRunArgs {
+        autostart,
+        out,
+        seed,
+        git,
+        dirty,
+        passthrough: pass,
+    }
 }
 
 /// Spawn a detached `den` subcommand for this session: stdin null, output to
@@ -1863,7 +1871,7 @@ fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
     let sid = session_id(profile_name);
     // Run strips den's own flags (--seed/--seed-dirty/--autostart...); dump
     // must preview the same argv the agent will actually get.
-    let (_, _, _, _, _, passthrough) = split_run_args(passthrough);
+    let passthrough = split_run_args(passthrough).passthrough;
     let mut argv = build_argv(profile_name, &passthrough)?;
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
     let allows = effective_allows(&profile(profile_name));
@@ -2691,8 +2699,15 @@ fn main() -> Result<()> {
             if pname == "run" {
                 bail!("den run isn't a command — the run is implicit: den <cmd> [args...]");
             }
-            let (autostart, auto_out, seed, seed_git, dirty_raw, passthrough) =
-                split_run_args(passthrough);
+            let args = split_run_args(passthrough);
+            let SplitRunArgs {
+                autostart,
+                out: auto_out,
+                seed,
+                git: seed_git,
+                dirty: dirty_raw,
+                passthrough,
+            } = args;
             let dirty = match dirty_raw.as_deref() {
                 None => DirtyMode::Ask,
                 Some(s) => parse_dirty_mode(s)?,
@@ -3063,23 +3078,39 @@ mod tests {
     fn split_run_args_extracts_autostart() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        let (auto, out, seed, _, dirty, pass) =
-            split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
+        let SplitRunArgs {
+            autostart: auto,
+            out,
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
         assert!(auto);
         assert_eq!(out.unwrap().to_str().unwrap(), "s.ltx");
         assert!(seed.is_none() && dirty.is_none());
         assert_eq!(pass, v(&["-y"]));
 
         // without --autostart, --out is not stripped (but --seed always is)
-        let (auto, out, seed, _, dirty, pass) =
-            split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
+        let SplitRunArgs {
+            autostart: auto,
+            out,
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
         assert!(!auto && out.is_none());
         assert_eq!(seed.unwrap().to_str().unwrap(), ".");
         assert!(dirty.is_none());
         assert_eq!(pass, v(&["--out", "s.ltx"]));
 
         // flags may come after positional args
-        let (auto, _, _, _, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
+        let SplitRunArgs {
+            autostart: auto,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["-y", "--autostart"]));
         assert!(auto);
         assert_eq!(pass, v(&["-y"]));
     }
@@ -3088,14 +3119,23 @@ mod tests {
     fn split_run_args_extracts_seed_dirty() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        let (_, _, seed, _, dirty, pass) =
-            split_run_args(&v(&["--seed", ".", "--seed-dirty", "all", "-y"]));
+        let SplitRunArgs {
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed", ".", "--seed-dirty", "all", "-y"]));
         assert_eq!(seed.unwrap().to_str().unwrap(), ".");
         assert_eq!(dirty.as_deref(), Some("all"));
         assert_eq!(pass, v(&["-y"]));
 
         // --seed-dirty without --seed is still stripped (harmless, ignored later)
-        let (_, _, seed, _, dirty, pass) = split_run_args(&v(&["--seed-dirty", "head", "task"]));
+        let SplitRunArgs {
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed-dirty", "head", "task"]));
         assert!(seed.is_none() && dirty.as_deref() == Some("head"));
         assert_eq!(pass, v(&["task"]));
     }
@@ -3104,16 +3144,25 @@ mod tests {
     fn split_run_args_extracts_seed_git() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        let (_, _, seed, git, dirty, pass) =
-            split_run_args(&v(&["--seed-git", "https://github.com/x/y", "-y"]));
+        let SplitRunArgs {
+            seed,
+            git,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed-git", "https://github.com/x/y", "-y"]));
         assert!(seed.is_none());
         assert_eq!(git.as_deref(), Some("https://github.com/x/y"));
         assert!(dirty.is_none());
         assert_eq!(pass, v(&["-y"]));
 
         // --seed-git strips itself like --seed; unknown flags pass through
-        let (_, _, seed, git, _, pass) =
-            split_run_args(&v(&["--seed-git", "git@host:org/repo.git", "task"]));
+        let SplitRunArgs {
+            seed,
+            git,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed-git", "git@host:org/repo.git", "task"]));
         assert!(seed.is_none() && git.is_some());
         assert_eq!(pass, v(&["task"]));
     }
