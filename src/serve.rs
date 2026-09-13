@@ -128,6 +128,8 @@ fn router(st: Arc<ServeState>) -> Router {
         .route("/health", get(health))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/{sid}", get(get_session).delete(delete_session))
+        .route("/sessions/{sid}/attach", post(attach_session))
+        .route("/sessions/{sid}/stop", post(stop_session))
         .route(
             "/sessions/{sid}/runs",
             post(launch_run).get(list_session_runs),
@@ -305,6 +307,347 @@ async fn delete_session(
         ),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, "rm_task", format!("{e}")),
     }
+}
+
+// ---- daemon sessions (attachable; platform-api.md §3) ----------------------
+
+/// `<platform>/attach/<sid>.json` — port + session-scoped token written by
+/// /attach so `den attach <sid>` and API reconnects can find the daemon.
+/// Lives in the platform dir, NOT the session dir: a session dir is
+/// recreated wholesale by drop_stale_session (den core) — attach info must
+/// survive that, like the run logs.
+pub(crate) fn attach_info_path(sid: &str) -> Result<std::path::PathBuf> {
+    let db = platform_db_path()?;
+    let dir = db
+        .parent()
+        .context("platform state dir")?
+        .join("attach")
+        .join(sid);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("attach.json"))
+}
+
+async fn attach_session(
+    State(st): State<Arc<ServeState>>,
+    AxPath(sid): AxPath<String>,
+) -> Response {
+    if let Err(e) = valid_sid(&sid) {
+        return err_json(StatusCode::BAD_REQUEST, "invalid_sid", e);
+    }
+    let Some(sess) = (match reg(&st.reg, {
+        let sid = sid.clone();
+        move |r| r.get_session(&sid)
+    })
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "registry",
+                format!("{e:#}"),
+            )
+        }
+    }) else {
+        return err_json(StatusCode::NOT_FOUND, "unknown_session", "no such session");
+    };
+    if sess.kind != "daemon" {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "wrong_kind",
+            format!(
+                "session kind '{}' has no daemon — create a kind=daemon session",
+                sess.kind
+            ),
+        );
+    }
+    if sess.profile != "dex" {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "unsupported_daemon",
+            format!(
+                "profile '{}' has no daemon mode yet (bridge: platform-api.md §3)",
+                sess.profile
+            ),
+        );
+    }
+    // Live child -> idempotent reconnect: hand back the same port + token.
+    if st.children.lock().unwrap().contains_key(&sid) {
+        let info = attach_info_path(&sid)
+            .and_then(|p| std::fs::read_to_string(p).map_err(anyhow::Error::from));
+        return match info
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(anyhow::Error::from))
+        {
+            Ok(v) => Json(json!({
+                "attach_url": format!("http://127.0.0.1:{}", v["port"]),
+                "attach_token": v["token"],
+            }))
+            .into_response(),
+            Err(e) => err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "attach_info",
+                format!("live daemon but no attach info: {e}"),
+            ),
+        };
+    }
+
+    // One live process per session — same flock rule as turn runs.
+    let lock = {
+        let root = match sessions_root() {
+            Ok(r) => r,
+            Err(e) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "lock_path",
+                    format!("{e:#}"),
+                )
+            }
+        };
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "lock_path",
+                format!("{e}"),
+            );
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(format!("{sid}.lock")))
+        {
+            Ok(f) => f,
+            Err(e) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "lock_open",
+                    format!("{e}"),
+                )
+            }
+        }
+    };
+    // SAFETY: flock with a valid fd; LOCK_NB makes contention fail, not hang.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        let code = if e.kind() == std::io::ErrorKind::WouldBlock {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return err_json(code, "session_busy", format!("session lock: {e}"));
+    }
+
+    // The host listener: bound here (no window for a port squatter), then
+    // handed into the sandboxed dex daemon via fd inheritance — CLOEXEC is
+    // cleared so it survives den's exec chain, and dex re-arms CLOEXEC on
+    // adoption so agent-spawned tools never see it (platform-api.md §3).
+    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "bind", format!("{e}")),
+    };
+    let fd = listener.as_raw_fd();
+    // SAFETY: clear CLOEXEC on the fd we own so it crosses exec into dex.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+    let port = match listener.local_addr() {
+        Ok(a) => a.port() as i64,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "bind", format!("{e}")),
+    };
+    let token = format!("dxt-{}", random_suffix(32));
+
+    // Persist attach info for `den attach` and API reconnects (platform
+    // dir — survives the child's drop_stale_session recreating <sid>/).
+    {
+        let info_path = match attach_info_path(&sid) {
+            Ok(p) => p,
+            Err(e) => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "attach_info",
+                    format!("{e:#}"),
+                )
+            }
+        };
+        if let Err(e) = std::fs::write(info_path, json!({"port": port, "token": token}).to_string())
+        {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "attach_info",
+                format!("{e}"),
+            );
+        }
+    }
+
+    // Child: `den dex serve --fd <n>` — a plain den run that joins the
+    // session and execs the dex daemon inside the sandbox; the fd rides
+    // along through the fork chain (nothing in it closes foreign fds).
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "exe", format!("{e}")),
+    };
+    let daemon_log_dir = match platform_db_path() {
+        Ok(db) => match db.parent() {
+            Some(p) => p.join("runs").join(&sid),
+            None => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "runs_dir",
+                    "platform state dir missing",
+                )
+            }
+        },
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runs_dir",
+                format!("{e:#}"),
+            )
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(&daemon_log_dir) {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runs_dir",
+            format!("{e}"),
+        );
+    }
+    let log_path = daemon_log_dir.join("daemon.log");
+    let log_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "log_open",
+                format!("{e}"),
+            )
+        }
+    };
+    let log_clone = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "log_fd", format!("{e}")),
+    };
+    let mut cmd = Command::new(exe);
+    cmd.arg(&sess.profile)
+        .args(["serve", "--fd", &fd.to_string()])
+        .env("DEN_SESSION", &sid)
+        .env("DEX_DAEMON_TOKEN", &token)
+        .env("DEN_QUIET", "1")
+        .env_remove("DEN_NEW")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_clone))
+        .stderr(Stdio::from(log_file))
+        .process_group(0);
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return err_json(StatusCode::INTERNAL_SERVER_ERROR, "spawn", format!("{e}"));
+        }
+    };
+    let pid = child.id().unwrap_or(0);
+    let childh = Arc::new(Child {
+        run_id: "daemon".into(),
+        pid,
+        killed: AtomicBool::new(false),
+        _lock: lock,
+    });
+    let _ = reg(&st.reg, {
+        let sid = sid.clone();
+        move |r| r.set_attach_port(&sid, port)
+    })
+    .await;
+    let _ = reg(&st.reg, {
+        let sid = sid.clone();
+        move |r| r.set_session_status(&sid, registry::S_ATTACHED)
+    })
+    .await;
+    st.children
+        .lock()
+        .unwrap()
+        .insert(sid.clone(), childh.clone());
+    tokio::spawn(reap_daemon(st.clone(), sid.clone(), child, childh));
+    Json(json!({
+        "attach_url": format!("http://127.0.0.1:{port}"),
+        "attach_token": token,
+    }))
+    .into_response()
+}
+
+/// Daemon-kind reap: no per-run delta (dex owns its turns); a clean exit or
+/// a stop returns the session to `idle`, a crash to `failed`.
+async fn reap_daemon(
+    st: Arc<ServeState>,
+    sid: String,
+    mut child: tokio::process::Child,
+    childh: Arc<Child>,
+) {
+    let st_run = match child.wait().await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("den serve: daemon wait failed for {sid}: {e}");
+            let _ = reg(&st.reg, {
+                let sid = sid.clone();
+                move |r| r.set_session_status(&sid, registry::S_FAILED)
+            })
+            .await;
+            st.children.lock().unwrap().remove(&sid);
+            return;
+        }
+    };
+    let status = match (
+        st_run.code(),
+        st_run.signal(),
+        childh.killed.load(Ordering::SeqCst),
+    ) {
+        (Some(0), _, _) => registry::S_IDLE,
+        (_, Some(_), true) => registry::S_IDLE, // stopped by us
+        _ => registry::S_FAILED,
+    };
+    let _ = reg(&st.reg, {
+        let sid = sid.clone();
+        move |r| r.set_session_status(&sid, status)
+    })
+    .await;
+    st.children.lock().unwrap().remove(&sid);
+    if let Ok(p) = attach_info_path(&sid) {
+        let _ = std::fs::remove_file(p); // port is gone; a reattach relaunches
+    }
+    if let Ok(p) = session_lock_path(&sid) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Stop a live daemon session: SIGTERM the process group, SIGKILL after 10s.
+async fn stop_session(State(st): State<Arc<ServeState>>, AxPath(sid): AxPath<String>) -> Response {
+    if let Err(e) = valid_sid(&sid) {
+        return err_json(StatusCode::BAD_REQUEST, "invalid_sid", e);
+    }
+    let child = st.children.lock().unwrap().get(&sid).cloned();
+    let Some(child) = child else {
+        return err_json(
+            StatusCode::CONFLICT,
+            "not_running",
+            "no live daemon on this session",
+        );
+    };
+    child.killed.store(true, Ordering::SeqCst);
+    let pgid = child.pid as i32;
+    // SAFETY: SIGTERM to a process group we own.
+    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        if pid_alive(child.pid as i32) {
+            // SAFETY: SIGKILL to the same process group.
+            unsafe { libc::kill(-(child.pid as i32), libc::SIGKILL) };
+        }
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"stopped": true, "sid": sid})),
+    )
+        .into_response()
 }
 
 // ---- runs ------------------------------------------------------------------

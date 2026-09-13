@@ -12,14 +12,24 @@ cd "$(dirname "$0")/.."
 
 PORT="${PORT:-8520}"
 TOKEN="smoke-$RANDOM"
+# The daemon-attach test needs the PATCHED dex (--fd adoption). Point
+# DEX_WORKTREE at a dex checkout with the fd-listener patch until it is
+# merged + installed; the smoke builds it and puts it first on PATH.
+DEX_WORKTREE="${DEX_WORKTREE:-/home/aks/Work/dex/.worktrees/fd-listener}"
 # Scratch must NOT sit under /tmp|/var/tmp|/run: the sandbox mounts fresh
 # tmpfs over those (sandbox.rs step 4) and would swallow the scratch HOME
 # and its FUSE mountpoint. Real HOME survives (it lives on the host fs).
 SCRATCH="$(mktemp -d "${HOME}/.den/smoke-XXXXXX")"
-trap 'kill "$SRV_PID" 2>/dev/null || true; for m in "$SCRATCH"/home/.den/sessions/*/mnt; do fusermount3 -uz "$m" 2>/dev/null || true; done; rm -rf "$SCRATCH"' EXIT
+trap 'kill "$SRV_PID" 2>/dev/null || true; pkill -f "$BIN dex serve --fd" 2>/dev/null || true; for m in "$SCRATCH"/home/.den/sessions/*/mnt; do fusermount3 -uz "$m" 2>/dev/null || true; done; rm -rf "$SCRATCH"' EXIT
 
 cargo build -q --bin den
 BIN="$(pwd)/target/debug/den"
+
+# patched dex: build + PATH-first so the sandboxed daemon adopts the fd
+if [ -d "$DEX_WORKTREE" ]; then
+  (cd "$DEX_WORKTREE" && cargo build -q --bin dex)
+  export PATH="$DEX_WORKTREE/target/debug:$PATH"
+fi
 
 export HOME="$SCRATCH/home"
 mkdir -p "$HOME"
@@ -120,5 +130,37 @@ if curl -sf -X POST "$BASE/sessions/$SID4/runs" "${AUTH[@]}" -H 'Content-Type: a
 fi
 echo "ok: busy session refused"
 curl -sf -X POST "$BASE/runs/$RID4/kill" "${AUTH[@]}" >/dev/null
+
+# 7. daemon session: /attach passes a host listener fd into the sandboxed
+#    dex daemon (platform-api.md §3) — /health answers through it
+SID5=$(curl -sf -X POST "$BASE/sessions" "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d '{"profile":"dex","kind":"daemon"}' | jqget "['sid']")
+echo "ok: daemon session $SID5"
+ATT=$(curl -sf -X POST "$BASE/sessions/$SID5/attach" "${AUTH[@]}")
+URL=$(echo "$ATT" | jqget "['attach_url']")
+DTOKEN=$(echo "$ATT" | jqget "['attach_token']")
+DAEMON_OK=0
+for i in $(seq 1 60); do
+  if curl -sf --max-time 5 "$URL/health" -H "Authorization: Bearer $DTOKEN" >/dev/null 2>&1; then DAEMON_OK=1; break; fi
+  sleep 0.3
+done
+[ "$DAEMON_OK" = "1" ] || {
+  echo "FAIL: dex daemon not reachable at $URL"
+  tail -20 "$SCRATCH/home/.den/runs/$SID5/daemon.log" 2>/dev/null
+  exit 1
+}
+echo "ok: daemon attach ($URL)"
+# reconnect is idempotent: same port + token while the child is live
+ATT2=$(curl -sf -X POST "$BASE/sessions/$SID5/attach" "${AUTH[@]}")
+[ "$(echo "$ATT2" | jqget "['attach_url']")" = "$URL" ] || { echo "FAIL: reconnect drifted"; exit 1; }
+echo "ok: reconnect idempotent"
+# stop the daemon, wait for the reap, then delete
+curl -sf -X POST "$BASE/sessions/$SID5/stop" "${AUTH[@]}" >/dev/null
+for i in $(seq 1 40); do
+  curl -sf -X DELETE "$BASE/sessions/$SID5" "${AUTH[@]}" | jqget "['removed']" >/dev/null 2>&1 && break
+  sleep 0.3
+done
+curl -sf "$BASE/sessions/$SID5" "${AUTH[@]}" >/dev/null 2>&1 && { echo "FAIL: delete"; exit 1; }
+echo "ok: daemon stop+delete"
 
 echo "SMOKE-OK"

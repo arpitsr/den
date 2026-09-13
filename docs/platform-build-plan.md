@@ -71,23 +71,25 @@ Order matters: registry → diff refactor → argv map → serve module → disp
 
 Can start in parallel with Phase 1: the dex patch is a separate repo.
 
-8. [ ] **dex patch (~/Work/dex)**: listener adoption — `dex serve --fd <n>`
+8. [x] **dex patch (~/Work/dex)**: listener adoption — `dex serve --fd <n>`
    and/or `LISTEN_FDS`/`LISTEN_FDNAMES`: build `std::net::TcpListener` from
    the raw fd (`FromRawFd`, CLOEXEC already cleared by den) and hand it to
    the existing `run_daemon(listener)` (src/daemon/mod.rs:710). Token path
    unchanged (`DEX_DAEMON_TOKEN` env). dex-repo test: bind a listener in the
    test, pass its fd via env, assert the daemon serves on it.
-9. [ ] **fd passthrough (src/sandbox.rs, Linux-only)**: den serve binds the
+9. [x] **fd passthrough (src/sandbox.rs, Linux-only)**: den serve binds the
    host listener, passes it down N→U→A (CLOEXEC cleared; exempt the fd from
    the chain's child fd-cleanup, mirroring how the proxy listener reaches
-   its child). Gate inside `selftest --sandbox`: `den raw sh -c 'test -e
-   /proc/self/fd/4 && echo ok'` prints ok with the fd wired.
-10. [ ] **/attach endpoint (src/serve.rs)**: daemon-kind session with no live
+   its child). IMPLEMENTED WITH ZERO sandbox.rs CHANGES: the chain only
+   closes its own named pipes (no fd sweep), so a CLOEXEC-cleared listener
+   fd survives the whole M→N→U→A→exec chain by plain inheritance. The smoke
+   script (daemon-attach flow) is the live gate.
+10. [x] **/attach endpoint (src/serve.rs)**: daemon-kind session with no live
    child → bind `127.0.0.1:<port>` (ephemeral, recorded in registry),
    generate `DEX_DAEMON_TOKEN`, spawn `den dex serve --fd 4`, status=attached;
    response `{attach_url, attach_token}`. Reap → status idle/exited;
    relaunch on next /attach (dex journal + fs.db keep continuity).
-11. [ ] **`den attach <sid>`**: host TUI launcher — runs `dex connect
+11. [x] **`den attach <sid>`**: host TUI launcher — runs `dex connect
    <attach_url> --reattach <sid>` with the token wired through.
 - [x] **Multi-turn turn-kind sessions (den side)**: turn sessions are
   conversations, not one-shots. dex path: den pre-assigns the agent session
