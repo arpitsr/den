@@ -8,10 +8,10 @@
 //! Env: DEN_API_TOKEN (required — no token, no server), DEN_BIND
 //! (default 127.0.0.1:8520), DEN_MAX_RUNS (default 8).
 
-use crate::registry::{self, NewRun, NewSession, Registry};
+use crate::registry::{self, NewRun, NewSession, Registry, SessionRow};
 use crate::{
-    bin_found, cmd_rm, delta_snapshot, diff_run_snap, open_session, random_suffix, session_base_db,
-    session_db_path, sessions_root, snapshot_fs, valid_sid,
+    bin_found, cmd_rm, delta_snapshot, diff_run_snap, open_session, push, random_suffix,
+    session_base_db, session_db_path, sessions_root, snapshot_fs, valid_sid,
 };
 use anyhow::{bail, Context, Result};
 use axum::extract::{Path as AxPath, Request, State};
@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd as _;
 // ExitStatusExt: signal() — did our SIGTERM/SIGKILL stop the child?
+use sha2::{Digest, Sha256};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -97,6 +98,7 @@ fn session_lock_path(sid: &str) -> Result<std::path::PathBuf> {
 /// Delete a session's lock file after the child is gone (keep the tree tidy).
 struct Child {
     run_id: String,
+    owner: String,
     pid: u32,
     killed: AtomicBool,
     /// flock(LOCK_EX) held until the child is reaped — one live process per
@@ -150,26 +152,67 @@ fn pid_alive(p: i32) -> bool {
 
 // ---- auth ------------------------------------------------------------------
 
+/// Who the request is for: `root` = DEN_API_TOKEN (sees everything, mints
+/// keys); anything else is a minted `dk_…` key scoped to its owner.
+#[derive(Clone)]
+struct AuthContext {
+    owner: String,
+    root: bool,
+    /// Per-key concurrent-run cap from the minted key row (None = root or
+    /// unlimited). Checked at run start in addition to the global DEN_MAX_RUNS.
+    max_concurrent: Option<i64>,
+}
+
+fn key_hash(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 async fn auth_mw(
     State(st): State<Arc<ServeState>>,
-    req: Request,
+    mut req: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let want = format!("Bearer {}", st.token);
-    let ok = req
+    let Some(token) = req
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|got| ct_eq(got, &want));
-    if ok {
-        next.run(req).await
-    } else {
-        err_json(
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+    else {
+        return err_json(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "missing or bad bearer token",
-        )
-    }
+            "missing bearer token",
+        );
+    };
+    let ctx = if ct_eq(&token, &st.token) {
+        AuthContext {
+            owner: "root".into(),
+            root: true,
+            max_concurrent: None,
+        }
+    } else {
+        let hash = key_hash(&token);
+        match reg(&st.reg, move |r| r.find_key(&hash)).await {
+            Ok(Some(k)) if k.revoked_at.is_none() => AuthContext {
+                owner: k.owner,
+                root: false,
+                max_concurrent: k.max_concurrent,
+            },
+            _ => {
+                return err_json(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "unknown or revoked key",
+                )
+            }
+        }
+    };
+    req.extensions_mut().insert(ctx);
+    next.run(req).await
 }
 
 // ---- routes ----------------------------------------------------------------
@@ -181,6 +224,10 @@ fn router(st: Arc<ServeState>) -> Router {
         .route("/sessions/{sid}", get(get_session).delete(delete_session))
         .route("/sessions/{sid}/attach", post(attach_session))
         .route("/sessions/{sid}/stop", post(stop_session))
+        .route("/sessions/{sid}/files", get(session_files))
+        .route("/sessions/{sid}/push", post(push_session_route))
+        .route("/keys", post(create_key).get(list_keys))
+        .route("/keys/{key_id}/revoke", post(revoke_key))
         .route(
             "/sessions/{sid}/runs",
             post(launch_run).get(list_session_runs),
@@ -209,14 +256,21 @@ async fn health(State(st): State<Arc<ServeState>>) -> Response {
 #[derive(Deserialize)]
 struct CreateReq {
     sid: Option<String>,
-    /// turn | daemon (default turn; daemon launches arrive in Phase 2)
+    /// turn | daemon
     kind: Option<String>,
     profile: String,
     seed_dir: Option<String>,
+    /// git URL — cloned to a temp dir at first run and seeded from it
+    /// (den-side, so host git credentials never enter the session)
+    seed_git: Option<String>,
     seed_dirty: Option<String>,
 }
 
-async fn create_session(State(st): State<Arc<ServeState>>, Json(req): Json<CreateReq>) -> Response {
+async fn create_session(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    Json(req): Json<CreateReq>,
+) -> Response {
     let sid = match &req.sid {
         Some(s) => match valid_sid(s) {
             Ok(()) => s.clone(),
@@ -224,17 +278,27 @@ async fn create_session(State(st): State<Arc<ServeState>>, Json(req): Json<Creat
         },
         None => format!("s-{}", random_suffix(5)),
     };
-    let seed_json = match (&req.seed_dir, &req.seed_dirty) {
-        (None, Some(_)) => {
+    let seed_json = match (&req.seed_dir, &req.seed_git, &req.seed_dirty) {
+        (Some(_), Some(_), _) => {
             return err_json(
                 StatusCode::BAD_REQUEST,
                 "invalid_seed",
-                "seed_dirty without seed_dir",
+                "seed_dir and seed_git are exclusive",
             )
         }
-        (None, None) => None,
-        (Some(dir), dirty) => {
+        (None, None, Some(_)) => {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "invalid_seed",
+                "seed_dirty without a seed source",
+            )
+        }
+        (None, None, None) => None,
+        (Some(dir), None, dirty) => {
             Some(json!({"dir": dir, "dirty": dirty.as_deref().unwrap_or("ask")}).to_string())
+        }
+        (None, Some(url), dirty) => {
+            Some(json!({"git": url, "dirty": dirty.as_deref().unwrap_or("ask")}).to_string())
         }
     };
     let ns = NewSession {
@@ -242,7 +306,7 @@ async fn create_session(State(st): State<Arc<ServeState>>, Json(req): Json<Creat
         kind: req.kind.unwrap_or_else(|| "turn".into()),
         profile: req.profile.clone(),
         seed_json,
-        owner: None,
+        owner: Some(ctx.owner.clone()),
     };
     match reg(&st.reg, move |r| r.create_session(&ns)).await {
         Ok(()) => {}
@@ -284,10 +348,11 @@ async fn list_sessions(State(st): State<Arc<ServeState>>) -> Response {
 
 async fn list_session_runs(
     State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
     AxPath(sid): AxPath<String>,
 ) -> Response {
-    if let Err(e) = valid_sid(&sid) {
-        return err_json(StatusCode::BAD_REQUEST, "invalid_sid", e);
+    if let Err(resp) = authorize(&st, &ctx, &sid).await {
+        return resp;
     }
     match reg(&st.reg, move |r| r.list_runs(&sid)).await {
         Ok(rows) => Json(json!({"runs": rows})).into_response(),
@@ -360,6 +425,375 @@ async fn delete_session(
     }
 }
 
+/// Owner check for every session-scoped route: root sees all, a minted
+/// key only its own sessions. Returns the row or an error response.
+async fn authorize(
+    st: &Arc<ServeState>,
+    ctx: &AuthContext,
+    sid: &str,
+) -> Result<SessionRow, Response> {
+    let got = reg(&st.reg, {
+        let sid = sid.to_string();
+        move |r| r.get_session(&sid)
+    })
+    .await;
+    match got {
+        Ok(Some(s)) if ctx.root || s.owner.as_deref() == Some(ctx.owner.as_str()) => Ok(s),
+        Ok(Some(_)) => Err(err_json(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no such session",
+        )),
+        Ok(None) => Err(err_json(
+            StatusCode::NOT_FOUND,
+            "unknown_session",
+            "no such session",
+        )),
+        Err(e) => Err(err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry",
+            format!("{e:#}"),
+        )),
+    }
+}
+
+// ---- keys (root only; platform-api.md §17) ---------------------------------
+
+#[derive(Deserialize)]
+struct CreateKeyReq {
+    owner: Option<String>,
+    name: Option<String>,
+    max_concurrent: Option<i64>,
+}
+
+async fn create_key(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    Json(req): Json<CreateKeyReq>,
+) -> Response {
+    if !ctx.root {
+        return err_json(
+            StatusCode::FORBIDDEN,
+            "root_only",
+            "keys are minted by the root token",
+        );
+    }
+    let owner = req.owner.unwrap_or_else(|| "default".into());
+    let raw = format!("dk_{}", random_suffix(32));
+    let nk = crate::registry::NewKey {
+        key_hash: key_hash(&raw),
+        key_id: format!("k-{}", random_suffix(8)),
+        owner: owner.clone(),
+        name: req.name.clone(),
+        max_concurrent: req.max_concurrent,
+    };
+    let key_id = nk.key_id.clone();
+    if let Err(e) = reg(&st.reg, move |r| r.create_key(&nk)).await {
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry",
+            format!("{e:#}"),
+        );
+    }
+    (
+        StatusCode::CREATED,
+        Json(json!({"key_id": key_id, "key": raw, "owner": owner})),
+    )
+        .into_response()
+}
+
+async fn list_keys(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+) -> Response {
+    if !ctx.root {
+        return err_json(
+            StatusCode::FORBIDDEN,
+            "root_only",
+            "keys are root-visible only",
+        );
+    }
+    match reg(&st.reg, |r| r.list_keys()).await {
+        Ok(rows) => Json(json!({"keys": rows})).into_response(),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "registry",
+            format!("{e:#}"),
+        ),
+    }
+}
+
+async fn revoke_key(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    AxPath(key_id): AxPath<String>,
+) -> Response {
+    if !ctx.root {
+        return err_json(
+            StatusCode::FORBIDDEN,
+            "root_only",
+            "keys are root-managed only",
+        );
+    }
+    let key_id2 = key_id.clone();
+    match reg(&st.reg, move |r| r.revoke_key(&key_id2)).await {
+        Ok(()) => Json(json!({"revoked": key_id})).into_response(),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let code = if msg.contains("no live key") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            err_json(code, "revoke_failed", msg)
+        }
+    }
+}
+
+// ---- files (read-only SDK access; platform-api.md §8) ----------------------
+
+/// GET /sessions/:sid/files?path=/x — file (base64) or directory listing.
+#[derive(Deserialize)]
+struct FilesQuery {
+    path: String,
+    /// Max file bytes returned inline; larger files list size only.
+    #[serde(default = "default_file_cap")]
+    max_bytes: usize,
+}
+fn default_file_cap() -> usize {
+    1_000_000
+}
+
+async fn session_files(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    AxPath(sid): AxPath<String>,
+    axum::extract::Query(q): axum::extract::Query<FilesQuery>,
+) -> Response {
+    let sess = match authorize(&st, &ctx, &sid).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let _ = sess;
+    // path hygiene: absolute, no .., collapsed
+    let path = q.path.trim().to_string();
+    if path.is_empty() || !path.starts_with('/') || path.split('/').any(|c| c == "..") {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "path must be absolute without '..'",
+        );
+    }
+    let owned_sid = sid.clone();
+    let max_bytes = q.max_bytes;
+    let res = tokio::task::spawn_blocking(move || {
+        crate::block_on(async move {
+            let agent = match open_session(&owned_sid).await? {
+                Some(a) => a,
+                None => anyhow::bail!("no session DB"),
+            };
+            let st = agent.fs.lstat(&path).await?;
+            let Some(st) = st else {
+                anyhow::bail!("path-not-found")
+            };
+            let mode = st.mode;
+            let size = st.size;
+            if st.is_file() {
+                if size as usize > max_bytes {
+                    anyhow::Ok(json!({
+                        "path": path, "kind": "file", "size": size,
+                        "mode": format!("{mode:o}"), "truncated": true,
+                    }))
+                } else {
+                    let bytes = agent.fs.read_file(&path).await?.unwrap_or_default();
+                    let mut b64 = String::new();
+                    {
+                        use std::io::Write as _;
+                        Base64Writer::new(&mut b64).write_all(&bytes)?;
+                    }
+                    anyhow::Ok(json!({
+                        "path": path, "kind": "file", "size": size,
+                        "mode": format!("{mode:o}"), "encoding": "base64", "content": b64,
+                    }))
+                }
+            } else {
+                let entries = agent.fs.readdir_plus(st.ino).await?.unwrap_or_default();
+                let list: Vec<Value> = entries
+                    .iter()
+                    .map(|e| {
+                        json!({
+                            "name": e.name,
+                            "kind": if e.stats.is_file() { "file" } else { "dir" },
+                            "size": e.stats.size,
+                            "mode": format!("{}", e.stats.mode & 0o7777),
+                        })
+                    })
+                    .collect();
+                anyhow::Ok(json!({
+                    "path": path, "kind": "dir", "entries": list,
+                }))
+            }
+        })
+    })
+    .await;
+    let payload = match res {
+        Ok(Ok(Ok(v))) => v,
+        Ok(Ok(Err(e))) => {
+            let msg = format!("{e:#}");
+            let code = if msg.contains("path-not-found") || msg.contains("no session DB") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return err_json(code, "files", msg);
+        }
+        Ok(Err(e)) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "files_task",
+                format!("{e:#}"),
+            )
+        }
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "files_task",
+                format!("{e}"),
+            )
+        }
+    };
+    Json(payload).into_response()
+}
+
+/// Minimal std/base64 encoder (no extra dep: base64 without padding is 3
+/// lines; keep it dependency-free like the rest of den).
+struct Base64Writer<'a> {
+    out: &'a mut String,
+    buf: [u8; 3],
+    len: usize,
+}
+impl<'a> Base64Writer<'a> {
+    fn new(out: &'a mut String) -> Self {
+        Base64Writer {
+            out,
+            buf: [0; 3],
+            len: 0,
+        }
+    }
+}
+impl<'a> std::io::Write for Base64Writer<'a> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for &b in data {
+            self.buf[self.len] = b;
+            self.len += 1;
+            if self.len == 3 {
+                let n = ((self.buf[0] as u32) << 16)
+                    | ((self.buf[1] as u32) << 8)
+                    | (self.buf[2] as u32);
+                let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
+                for i in idx {
+                    self.out.push(TABLE[i as usize] as char);
+                }
+                self.len = 0;
+            }
+        }
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> Drop for Base64Writer<'a> {
+    fn drop(&mut self) {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        if self.len == 1 {
+            let n = (self.buf[0] as u32) << 16;
+            let idx = [(n >> 18) & 63, (n >> 12) & 63];
+            for i in idx {
+                self.out.push(TABLE[i as usize] as char);
+            }
+            self.out.push_str("==");
+        } else if self.len == 2 {
+            let n = ((self.buf[0] as u32) << 16) | ((self.buf[1] as u32) << 8);
+            let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63];
+            for i in idx {
+                self.out.push(TABLE[i as usize] as char);
+            }
+            self.out.push('=');
+        }
+    }
+}
+
+// ---- push (lands the delta as a git branch; runs on the host) --------------
+
+#[derive(Deserialize)]
+struct PushReq {
+    branch: Option<String>,
+    message: Option<String>,
+    dry_run: bool,
+    keep: bool,
+}
+
+async fn push_session_route(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    AxPath(sid): AxPath<String>,
+    Json(req): Json<PushReq>,
+) -> Response {
+    if let Err(resp) = authorize(&st, &ctx, &sid).await {
+        return resp;
+    }
+    let opts = push::PushOpts {
+        branch: req.branch,
+        to: None,
+        remote: None,
+        message: req.message,
+        dry_run: req.dry_run,
+        keep: req.keep,
+        pr: false,
+    };
+    let res = tokio::task::spawn_blocking(move || {
+        crate::block_on(async move {
+            let sdir = sessions_root()?.join(&sid);
+            push::push_session(&sid, &sdir, &opts).await
+        })
+    })
+    .await;
+    match res {
+        Ok(Ok(Ok(out))) => Json(json!({
+            "changed": out.changed,
+            "deleted": out.deleted,
+            "ignored": out.ignored,
+            "dropped": out.dropped,
+            "status": out.status,
+            "pushed": out.pushed,
+            "branch": out.branch,
+            "repo": out.repo.to_string_lossy(),
+            "worktree": out.worktree.as_ref().map(|w| w.to_string_lossy()),
+            "push_note": out.push_note,
+        }))
+        .into_response(),
+        Ok(Ok(Err(e))) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "push_failed",
+            format!("{e:#}"),
+        ),
+        Ok(Err(e)) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "push_failed",
+            format!("{e:#}"),
+        ),
+        Err(e) => err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "push_task",
+            format!("{e}"),
+        ),
+    }
+}
+
 // ---- daemon sessions (attachable; platform-api.md §3) ----------------------
 
 /// `<platform>/attach/<sid>.json` — port + session-scoped token written by
@@ -380,6 +814,7 @@ pub(crate) fn attach_info_path(sid: &str) -> Result<std::path::PathBuf> {
 
 async fn attach_session(
     State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
     AxPath(sid): AxPath<String>,
 ) -> Response {
     if let Err(e) = valid_sid(&sid) {
@@ -602,6 +1037,7 @@ async fn attach_session(
     let pid = child.id().unwrap_or(0);
     let childh = Arc::new(Child {
         run_id: "daemon".into(),
+        owner: ctx.owner.clone(),
         pid,
         killed: AtomicBool::new(false),
         _lock: lock,
@@ -712,6 +1148,7 @@ struct LaunchReq {
 
 async fn launch_run(
     State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
     AxPath(sid): AxPath<String>,
     Json(req): Json<LaunchReq>,
 ) -> Response {
@@ -721,22 +1158,9 @@ async fn launch_run(
     if req.prompt.trim().is_empty() {
         return err_json(StatusCode::BAD_REQUEST, "invalid_prompt", "prompt is empty");
     }
-    let Some(sess) = (match reg(&st.reg, {
-        let sid = sid.clone();
-        move |r| r.get_session(&sid)
-    })
-    .await
-    {
+    let sess = match authorize(&st, &ctx, &sid).await {
         Ok(s) => s,
-        Err(e) => {
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "registry",
-                format!("{e:#}"),
-            )
-        }
-    }) else {
-        return err_json(StatusCode::NOT_FOUND, "unknown_session", "no such session");
+        Err(resp) => return resp,
     };
     if sess.kind != "turn" {
         return err_json(
@@ -750,6 +1174,7 @@ async fn launch_run(
     }
     {
         let children = st.children.lock().unwrap();
+        // global ceiling first, then the calling key's own cap (root: none)
         if children.len() >= st.max_runs {
             return err_json(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -760,6 +1185,19 @@ async fn launch_run(
                     st.max_runs
                 ),
             );
+        }
+        if let Some(cap) = ctx.0.max_concurrent {
+            let mine = children.values().filter(|c| c.owner == ctx.owner).count();
+            if mine >= cap as usize {
+                return err_json(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "key_quota",
+                    format!(
+                        "{} concurrent runs for '{}' (key cap {cap})",
+                        mine, ctx.owner
+                    ),
+                );
+            }
         }
         if children.contains_key(&sid) {
             return err_json(
@@ -943,6 +1381,7 @@ async fn launch_run(
     }
     let childh = Arc::new(Child {
         run_id: run_id.clone(),
+        owner: ctx.owner.clone(),
         pid,
         killed: AtomicBool::new(false),
         _lock: lock,
@@ -982,6 +1421,14 @@ fn seed_into_args(seed_json: Option<&str>, sid: &str) -> Vec<String> {
     let Ok(v) = serde_json::from_str::<Value>(s) else {
         return vec![];
     };
+    if let Some(git) = v.get("git").and_then(|g| g.as_str()) {
+        let mut out = vec!["--seed-git".to_string(), git.to_string()];
+        if let Some(d) = v.get("dirty").and_then(|d| d.as_str()) {
+            out.push("--seed-dirty".into());
+            out.push(d.to_string());
+        }
+        return out;
+    }
     let Some(dir) = v.get("dir").and_then(|d| d.as_str()) else {
         return vec![];
     };
@@ -1076,23 +1523,14 @@ async fn reap(
     }
 }
 
-async fn get_run(State(st): State<Arc<ServeState>>, AxPath(rid): AxPath<String>) -> Response {
-    match reg(&st.reg, move |r| r.get_run(&rid)).await {
-        Ok(Some(row)) => Json(row).into_response(),
-        Ok(None) => err_json(StatusCode::NOT_FOUND, "unknown_run", "no such run"),
-        Err(e) => err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "registry",
-            format!("{e:#}"),
-        ),
-    }
-}
-
-/// Full run log, text/plain. Tails past 1 MiB so a runaway agent can't
-/// balloon an API response.
-async fn run_log(State(st): State<Arc<ServeState>>, AxPath(rid): AxPath<String>) -> Response {
-    let Some(row) = (match reg(&st.reg, move |r| r.get_run(&rid)).await {
-        Ok(r) => r,
+async fn get_run(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    AxPath(rid): AxPath<String>,
+) -> Response {
+    let row = match reg(&st.reg, move |r| r.get_run(&rid)).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "unknown_run", "no such run"),
         Err(e) => {
             return err_json(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1100,9 +1538,34 @@ async fn run_log(State(st): State<Arc<ServeState>>, AxPath(rid): AxPath<String>)
                 format!("{e:#}"),
             )
         }
-    }) else {
-        return err_json(StatusCode::NOT_FOUND, "unknown_run", "no such run");
     };
+    if let Err(resp) = authorize(&st, &ctx, &row.sid).await {
+        return resp;
+    }
+    Json(row).into_response()
+}
+
+/// Full run log, text/plain. Tails past 1 MiB so a runaway agent can't
+/// balloon an API response.
+async fn run_log(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    AxPath(rid): AxPath<String>,
+) -> Response {
+    let row = match reg(&st.reg, move |r| r.get_run(&rid)).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "unknown_run", "no such run"),
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "registry",
+                format!("{e:#}"),
+            )
+        }
+    };
+    if let Err(resp) = authorize(&st, &ctx, &row.sid).await {
+        return resp;
+    }
     let Some(path) = row.log_path else {
         return err_json(StatusCode::NOT_FOUND, "no_log", "run has no log file");
     };
@@ -1131,7 +1594,24 @@ async fn run_log(State(st): State<Arc<ServeState>>, AxPath(rid): AxPath<String>)
     }
 }
 
-async fn kill_run(State(st): State<Arc<ServeState>>, AxPath(rid): AxPath<String>) -> Response {
+async fn kill_run(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    AxPath(rid): AxPath<String>,
+) -> Response {
+    if !ctx.root {
+        // cheap pre-check: the run must belong to this key's session
+        if let Ok(Some(row)) = reg(&st.reg, {
+            let rid = rid.clone();
+            move |r| r.get_run(&rid)
+        })
+        .await
+        {
+            if let Err(resp) = authorize(&st, &ctx, &row.sid).await {
+                return resp;
+            }
+        }
+    }
     // find the live child by run id
     let child = {
         let map = st.children.lock().unwrap();
@@ -1215,6 +1695,37 @@ mod tests {
 
     /// env vars are process-global (dex_journal_path reads HOME)
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn seed_into_args_routes_git_vs_dir() {
+        // git spec -> --seed-git
+        let a = seed_into_args(Some(r#"{"git":"https://github.com/x/y"}"#), "nosuch");
+        assert_eq!(a, vec!["--seed-git", "https://github.com/x/y"]);
+
+        // git + dirty
+        let b = seed_into_args(
+            Some(r#"{"git":"https://github.com/x/y","dirty":"head"}"#),
+            "nosuch",
+        );
+        assert_eq!(
+            b,
+            vec![
+                "--seed-git",
+                "https://github.com/x/y",
+                "--seed-dirty",
+                "head"
+            ]
+        );
+
+        // dir spec unchanged
+        let c = seed_into_args(Some(r#"{"dir":"/tmp/proj"}"#), "nosuch");
+        assert_eq!(c, vec!["--seed", "/tmp/proj"]);
+
+        // none / garbage / missing key -> no args
+        assert!(seed_into_args(None, "nosuch").is_empty());
+        assert!(seed_into_args(Some("not json"), "nosuch").is_empty());
+        assert!(seed_into_args(Some("{}"), "nosuch").is_empty());
+    }
 
     #[test]
     fn headless_argv_known_profiles() {
