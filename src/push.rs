@@ -16,6 +16,7 @@ use crate::snapshot_fs;
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT, S_IFREG};
 use agentfs_sdk::{AgentFS, AgentFSOptions};
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -222,6 +223,7 @@ pub(crate) struct PushOpts {
     pub pr: bool,
 }
 
+#[derive(Debug, Serialize)]
 pub(crate) struct PushOutcome {
     pub changed: Vec<String>,
     pub deleted: Vec<String>,

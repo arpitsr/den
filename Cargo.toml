@@ -13,7 +13,7 @@ agentfs-sdk = "0.6.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "process", "signal"] }
 # platform API server (docs/platform-api.md): axum over the existing tokio
 # runtime; json + http1 + tokio only — no form/multipart/query extras
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 anyhow = "1"
 libc = "0.2"
 litetx = "0.1.0"
@@ -24,5 +24,7 @@ rusqlite = { version = "0.29", features = ["bundled"] }
 fuser = { version = "0.15", default-features = false, features = ["abi-7-31"] }
 async-trait = "0.1.92"
 serde = { version = "1", features = ["derive"] }
+# platform API-key hashing (docs/platform-api.md §17): only sha256(key) is stored
+sha2 = "0.10"
 serde_json = "1"
 serde_yaml = "0.9"

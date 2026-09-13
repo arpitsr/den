@@ -132,7 +132,16 @@ impl Registry {
                delta_json TEXT,
                log_path TEXT
              );
-             CREATE INDEX IF NOT EXISTS idx_runs_sid ON runs(sid);",
+             CREATE INDEX IF NOT EXISTS idx_runs_sid ON runs(sid);
+             CREATE TABLE IF NOT EXISTS keys (
+               key_hash TEXT PRIMARY KEY,
+               key_id TEXT UNIQUE NOT NULL,
+               owner TEXT NOT NULL,
+               name TEXT,
+               max_concurrent INTEGER,
+               created_at INTEGER NOT NULL,
+               revoked_at INTEGER
+             );",
         )?;
         Ok(Registry {
             conn: Mutex::new(conn),
@@ -376,6 +385,102 @@ fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     })
 }
 
+/// A minted platform API key. Only the sha256 lives here; the raw
+/// "dk_…" is shown exactly once at mint time.
+#[derive(Clone, Debug, Serialize)]
+pub struct KeyRow {
+    pub key_id: String,
+    pub owner: String,
+    pub name: Option<String>,
+    pub max_concurrent: Option<i64>,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
+pub struct NewKey {
+    pub key_hash: String,
+    pub key_id: String,
+    pub owner: String,
+    pub name: Option<String>,
+    pub max_concurrent: Option<i64>,
+}
+
+fn row_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<KeyRow> {
+    Ok(KeyRow {
+        key_id: r.get(0)?,
+        owner: r.get(1)?,
+        name: r.get(2)?,
+        max_concurrent: r.get(3)?,
+        created_at: r.get(4)?,
+        revoked_at: r.get(5)?,
+    })
+}
+
+impl Registry {
+    // ---- keys (platform auth; raw "dk_…" never stored) ----
+
+    pub fn create_key(&self, k: &NewKey) -> Result<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO keys (key_hash, key_id, owner, name, max_concurrent, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    k.key_hash,
+                    k.key_id,
+                    k.owner,
+                    k.name,
+                    k.max_concurrent,
+                    unix_now()
+                ],
+            )
+            .with_context(|| format!("create key {}", k.key_id))?;
+        Ok(())
+    }
+
+    /// The live key for a presented bearer token (by hash), or None.
+    pub fn find_key(&self, key_hash: &str) -> Result<Option<KeyRow>> {
+        self.conn()
+            .query_row(
+                "SELECT key_id, owner, name, max_concurrent, created_at, revoked_at
+                 FROM keys WHERE key_hash = ?1",
+                params![key_hash],
+                row_key,
+            )
+            .optional()
+            .context("find key")
+    }
+
+    pub fn list_keys(&self) -> Result<Vec<KeyRow>> {
+        let conn = self.conn();
+        let mut st = conn
+            .prepare(
+                "SELECT key_id, owner, name, max_concurrent, created_at, revoked_at
+                 FROM keys ORDER BY created_at DESC, key_id",
+            )
+            .context("list keys")?;
+        let rows = st
+            .query_map([], row_key)
+            .context("list keys")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("list keys")?;
+        Ok(rows)
+    }
+
+    pub fn revoke_key(&self, key_id: &str) -> Result<()> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE keys SET revoked_at = ?2 WHERE key_id = ?1 AND revoked_at IS NULL",
+                params![key_id, unix_now()],
+            )
+            .context("revoke key")?;
+        if n == 0 {
+            bail!("no live key {key_id}");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +601,33 @@ mod tests {
             argv_json: None,
         };
         assert!(db.insert_run(&r, R_QUEUED, None).is_err());
+    }
+
+    #[test]
+    fn key_lifecycle() {
+        let t = TempDir::new("keys").unwrap();
+        let db = t.db();
+        let k = NewKey {
+            key_hash: "h1".into(),
+            key_id: "id1".into(),
+            owner: "ci".into(),
+            name: Some("ci-bot".into()),
+            max_concurrent: Some(2),
+        };
+        db.create_key(&k).unwrap();
+        let found = db.find_key("h1").unwrap().unwrap();
+        assert_eq!(found.owner, "ci");
+        assert_eq!(found.max_concurrent, Some(2));
+        assert!(found.revoked_at.is_none());
+        assert!(db.find_key("nope").unwrap().is_none());
+        assert_eq!(db.list_keys().unwrap().len(), 1);
+        db.revoke_key("id1").unwrap();
+        assert!(db.find_key("h1").unwrap().unwrap().revoked_at.is_some());
+        // revoked key still findable by hash (caller rejects revoked), but
+        // revoking again is a no-op error (already revoked)
+        assert!(db.revoke_key("id1").is_err());
+        // minting the same hash twice fails (PRIMARY KEY)
+        assert!(db.create_key(&k).is_err());
     }
 
     #[test]
