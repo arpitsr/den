@@ -125,6 +125,12 @@ Can start in parallel with Phase 1: the dex patch is a separate repo.
    `DEX_JSON` if dex gains one) into runs; webhook/SSE on run completion.
 19. [ ] TOML config for profiles/limits (README "when to grow it" trigger:
    several custom agents).
+20. [ ] **Control-plane seam (Phase A)**: `den exec --session <sid>
+   [--seed …] [--autostart] -- <cmd>…` — stable runtime verb for platform
+   launches (host-PATH resolution stays in den; argv assembly moves to the
+   platform side); serve checks `den --version` at boot; document the
+   session-layout contract (`docs/runtime-contract.md`). Repo split only on
+   the triggers in "Sequencing & parallelism".
 - [ ] **Generic daemon bridge (Phase 2 follow-up)**: in-sandbox forwarder
    that adopts fd 4 and proxies to any agent daemon's in-netns port
    (platform-api.md §3 "Any agent daemon"); enforces the session token when
@@ -132,6 +138,21 @@ Can start in parallel with Phase 1: the dex patch is a separate repo.
    daemon without agent-side patches; dex stays native-adoption.
 
 ## Sequencing & parallelism
+
+**Control-plane seam (decision, applies to all phases):** den stays the
+runtime core; the platform layer (`serve.rs`, `registry.rs`, keys, attach
+broker, webhooks, future web-UI backend) is separable at any point because
+its interface is already process-shaped: spawn `den`, read `fs.db` via the
+published agentfs-sdk, flock `<root>/<sid>.lock` (cross-binary), `den rm`
+for cleanup. Phase A — make the seam explicit and load-bearing: add
+`den exec --session <sid> [--seed …] [--autostart] -- <cmd>…` as the
+stable runtime verb (argv assembly moves to the platform side; den stops
+relying on the implicit `den <profile>` + DEN_SESSION convention for
+platform launches), check `den --version` at serve boot. Phase B (repo
+split) triggers on any of: a second runtime consumer, a different stack
+for the control plane (e.g. a BEAM control plane supervising `den exec`
+children), or multi-host orchestration. Until then the modules stay in
+this repo behind the seam.
 
 ```
 Phase 1 (den serve) ──────────────┐
