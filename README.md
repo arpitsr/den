@@ -5,11 +5,17 @@ A Rust binary that launches any local coding-agent CLI (`claude`, `codex`,
 filesystem + user/mount namespaces), and binds the `agentfs-sdk` crate for
 typed, in-process access to what the sandboxed agent did.
 
-The agent's whole filesystem is one SQLite file (`fs.db`). New sessions
-start empty — or seeded from a directory (`--seed`) — and resumed sessions
-open the DB and nothing else: the host tree is hidden behind the mount and
-irrelevant. Every session is self-contained and shippable to another machine
-(`den backup` / `den replicate` + `den pull`).
+A session's filesystem is a SQLite **base + delta** pair (see
+`docs/layered-sessions.md`): the seed is copied once into a shared read-only
+base DB (`~/.den/bases/<content-key>/base.db`), and the session's own
+`~/.den/sessions/<sid>/fs.db` holds only what the agent created, modified
+(copy-up), or deleted (tombstones). A merge layer serves base ∪ delta as one
+tree, so N subagents on one repo share N−1 copies of it and session start on
+a base hit is O(changes), not O(repo). Sessions without a `--seed` (and
+`DEN_LAYER=0`) keep the old single-DB behavior: fs.db *is* the whole tree.
+Every session is still self-contained — backup/replicate/pull ship the delta
+(and its tombstones); a base is content-addressed and immutable, seeded once
+per repo state.
 
 ### Seeding
 
@@ -129,9 +135,11 @@ den: session codex-myproject — 2 added, 1 modified, 1 removed this run
   - README.md
 ```
 
-Sessions are born portable: `fs.db` always contains the complete tree, so
-`den backup`/`replicate` + `den pull` (or just copying the file) reproduces
-the exact environment on another machine or VM — no host checkout needed.
+Sessions are born portable: legacy sessions' `fs.db` contains the complete
+tree; layered sessions ship the delta (with tombstones) plus the
+content-addressed base (`~/.den/bases/<key>/base.db`, 0644, never rewritten
+after seeding) — copy both and the environment reproduces on another machine
+or VM without a host checkout.
 
 Note: because resumed sessions see only the DB, host-side changes (`git pull`,
 IDE edits) are invisible to an existing session. Start a fresh one
@@ -297,9 +305,10 @@ Unknown commands just get the defaults.
 ```
 den/
   Cargo.toml            agentfs-sdk 0.6.4, fuser (FUSE), tokio, anyhow, litetx, rusqlite
-  src/main.rs           profiles, argv assembly, seed/snapshot, run/inspect/sessions/dump/selftest
+  src/main.rs           profiles, argv assembly, seed/base/snapshot, run/inspect/sessions/dump/selftest
   src/sandbox.rs        fork/unshare namespaces, read-only remount, exec, signals
   src/proxy.rs          egress allowlist proxy (CONNECT + absolute-form HTTP)
+  src/layer.rs          base+delta merge layer (copy-up, tombstones, merged listings)
   src/fuse.rs           FUSE filesystem serving the session's SQLite virtual FS (fuser)
   src/mount.rs          mount lifecycle (fusermount), MountHandle, helpers
   src/backup.rs         LTX backup/restore/inspect of session fs.db files (litetx + rusqlite)
