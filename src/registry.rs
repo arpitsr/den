@@ -327,35 +327,21 @@ impl Registry {
         Ok(rows)
     }
 
-    /// Boot sweep: runs stuck in `running` whose child pid is gone get
-    /// marked `orphaned` (serve died mid-run; the child was reaped by init).
-    /// A missing pid is an orphan by definition (spawn never recorded).
+    /// Boot sweep: serve's children died with it (or reparented to init)
+    /// — every `running` row from a previous serve can no longer be
+    /// observed, so mark them all `orphaned`. A live orphan child still
+    /// holds the session flock, so the session stays busy until it exits.
     /// Returns how many rows moved.
-    pub fn sweep_orphans(&self, is_alive: impl Fn(i32) -> bool) -> Result<usize> {
+    pub fn sweep_orphans(&self) -> Result<usize> {
         let conn = self.conn();
-        let mut st = conn
-            .prepare("SELECT id, pid FROM runs WHERE status = 'running'")
-            .context("sweep: select running")?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
-            })
-            .context("sweep: query")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("sweep")?;
-        let mut moved = 0;
-        for (id, pid) in rows {
-            let alive = pid.is_some_and(|p| is_alive(p as i32));
-            if alive {
-                continue;
-            }
-            let now = unix_now();
-            conn.execute(
-                "UPDATE runs SET status = 'orphaned', finished_at = ?2 WHERE id = ?1",
-                params![id, now],
-            )?;
-            moved += 1;
-        }
+        let now = unix_now();
+        let moved = conn
+            .execute(
+                "UPDATE runs SET status = 'orphaned', finished_at = ?1
+                 WHERE status = 'running'",
+                params![now],
+            )
+            .context("sweep: mark orphans")?;
         Ok(moved)
     }
 }
@@ -514,11 +500,11 @@ mod tests {
     }
 
     #[test]
-    fn orphan_sweep_marks_dead_pids_only() {
+    fn orphan_sweep_marks_all_running_rows() {
         let t = TempDir::new("sweep").unwrap();
         let db = t.db();
         db.create_session(&sess("s1")).unwrap();
-        for (id, pid) in [("r-live", Some(7)), ("r-dead", Some(8)), ("r-nopid", None)] {
+        for (id, pid) in [("r-live", Some(7)), ("r-nopid", None)] {
             let r = NewRun {
                 id: id.into(),
                 sid: "s1".into(),
@@ -529,24 +515,15 @@ mod tests {
             db.insert_run(&r, R_QUEUED, None).unwrap();
             if let Some(p) = pid {
                 db.set_run_pid(id, p).unwrap();
-            } // None stays queued; sweep only looks at running
+            }
         }
-        // r-nopid is queued, not running — force it to running with no pid
-        // recorded via a direct finish-less path: insert_run then set status
-        // through set_run_pid is impossible without a pid, so sweep treats
-        // running-with-no-pid as orphan; simulate by marking r-nopid running
-        // through a dedicated update.
-        db.conn()
-            .execute(
-                "UPDATE runs SET status = 'running' WHERE id = 'r-nopid'",
-                params![],
-            )
-            .unwrap();
-        let moved = db.sweep_orphans(|p| p != 8).unwrap(); // 7 alive, 8 dead
-        assert_eq!(moved, 2);
-        assert_eq!(db.get_run("r-live").unwrap().unwrap().status, R_RUNNING);
-        assert_eq!(db.get_run("r-dead").unwrap().unwrap().status, R_ORPHANED);
-        assert_eq!(db.get_run("r-nopid").unwrap().unwrap().status, R_ORPHANED);
-        assert!(db.get_run("r-dead").unwrap().unwrap().finished_at.is_some());
+        // a finished row must survive the sweep untouched
+        db.finish_run("r-nopid", R_EXITED, Some(0), None).unwrap();
+        let moved = db.sweep_orphans().unwrap();
+        assert_eq!(moved, 1); // only r-live (the running one)
+        assert_eq!(db.get_run("r-live").unwrap().unwrap().status, R_ORPHANED);
+        assert!(db.get_run("r-live").unwrap().unwrap().finished_at.is_some());
+        assert_eq!(db.get_run("r-nopid").unwrap().unwrap().status, R_EXITED);
+        assert_eq!(db.sweep_orphans().unwrap(), 0); // idempotent
     }
 }

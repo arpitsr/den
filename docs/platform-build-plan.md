@@ -7,10 +7,10 @@ progress; CI gates for every phase: `cargo fmt --check`, `cargo clippy
 
 ## Phase 0 — prereqs (gate before any code)
 
-- [ ] Linux host with FUSE: `fusermount3` present, `/dev/fuse` available
+- [x] Linux host with FUSE: `fusermount3` present, `/dev/fuse` available
 - [ ] Egress deps for default networking: `slirp4netns`, `nft` (or accept
       `DEN_NET=none` for MVP smoke tests)
-- [ ] Agents on PATH: `dex` built (`cargo build --release` in ~/Work/dex),
+- [x] Agents on PATH: `dex` built (`cargo build --release` in ~/Work/dex),
       plus `codex`/`claude` for cross-agent checks
 - [ ] Service-account layout: `DEN_SESSION_ROOT` (e.g. /var/lib/den/sessions)
       decided; run den under it once manually
@@ -21,26 +21,26 @@ progress; CI gates for every phase: `cargo fmt --check`, `cargo clippy
 
 Order matters: registry → diff refactor → argv map → serve module → dispatch.
 
-1. [ ] **Cargo.toml**: add `axum` (json, http1); extend tokio features to
+1. [x] **Cargo.toml**: add `axum` (json, http1); extend tokio features to
    `["rt-multi-thread", "macros", "net", "time", "sync", "process", "signal"]`.
-2. [ ] **src/registry.rs** — platform.db (schema: platform-api.md §6):
+2. [x] **src/registry.rs** — platform.db (schema: platform-api.md §6):
    open/create with WAL, `sessions` + `runs` tables, CRUD: upsert_session,
    get/list_sessions, insert_run, update_run, mark_orphans (status
    transition on boot). Sync rusqlite behind a small API; serve calls it
    from `spawn_blocking` with a `Mutex<Connection>`. Unit tests against a
    tempdir DB (schema, transitions, orphan sweep).
-3. [ ] **diff refactor (src/main.rs)**: extract the added/modified/removed
+3. [x] **diff refactor (src/main.rs)**: extract the added/modified/removed
    computation from `print_run_summary` (main.rs:895-996) into
    `pub(crate) async fn diff_run_snap(sid, before) -> RunDelta` with
    `RunDelta { added, modified, removed }` (serde). print path keeps
    byte-identical output. Unit tests on synthetic RunSnap values (legacy +
    layered, incl. no-op copy-up exclusion).
-4. [ ] **Headless argv map (src/main.rs)**: extend `Profile` with a
+4. [x] **Headless argv map (src/main.rs)**: extend `Profile` with a
    headless builder per §10 of platform-api.md (dex → `-p <prompt>`,
    claude → `-p`, codex → `exec`, gemini → `-p`, opencode → `run`; unknown →
    bare prompt arg). `build_argv` gains a `headless(prompt: Option<&str>)`
    mode. Tests: argv assembly per profile with/without prompt.
-5. [ ] **src/serve.rs**:
+5. [x] **src/serve.rs**:
    - bearer auth: `DEN_API_TOKEN` required — refuse to boot without it;
      constant-time compare middleware.
    - routes (turn subset of §8): health, POST/GET/GET-id/DELETE sessions,
@@ -53,12 +53,13 @@ Order matters: registry → diff refactor → argv map → serve module → disp
      backup.rs:309-317): acquire pre-spawn, hold until reap; held → 409.
    - kill: SIGTERM to process group, SIGKILL after 10s (`tokio::time`).
    - `DEN_MAX_RUNS` gate → 429 (default 8).
-   - orphan sweep at boot: rows running with dead pid (via `kill(pid,0)`) →
-     orphaned.
-6. [ ] **Dispatch (src/main.rs)**: `den serve` arm; env config: DEN_API_TOKEN
+   - orphan sweep at boot: every row still `running` → `orphaned` (a
+     restarted serve observes no children; a surviving orphan keeps the
+     session flock until it exits).
+6. [x] **Dispatch (src/main.rs)**: `den serve` arm; env config: DEN_API_TOKEN
    (required), DEN_BIND (default `127.0.0.1:8520` — dex owns 8420,
    don't collide), DEN_MAX_RUNS, DEN_SESSION_ROOT.
-7. [ ] **Tests + smoke**: registry/argv/diff unit tests wired into
+7. [x] **Tests + smoke**: registry/argv/diff unit tests wired into
    `cmd_selftest`; `scripts/smoke-serve.sh` — the §13 acceptance flow in
    curl: create session → launch `codex exec` "touch /hello.txt" → poll run →
    delta_json lists /hello.txt → kill a sleeping run → restart serve mid-run
@@ -88,7 +89,7 @@ Can start in parallel with Phase 1: the dex patch is a separate repo.
    relaunch on next /attach (dex journal + fs.db keep continuity).
 11. [ ] **`den attach <sid>`**: host TUI launcher — runs `dex connect
    <attach_url> --reattach <sid>` with the token wired through.
-- [ ] **Multi-turn turn-kind sessions (den side)**: turn sessions are
+- [x] **Multi-turn turn-kind sessions (den side)**: turn sessions are
   conversations, not one-shots. dex path: den pre-assigns the agent session
   id (`--session <sid>` on the *first* run too — no capture needed). Generic
   CLIs: after each run, den reads the agent's own session id out of the VFS
