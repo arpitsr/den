@@ -373,7 +373,7 @@ fn prompt_and_persist(host: &str) -> Result<bool> {
     if approved().lock().unwrap().contains(host) {
         return Ok(true);
     }
-    eprint!("\npit: agent is requesting network access to \"{}\" (not in egress allowlist). Allow and remember? [y/N] ", host);
+    eprint!("\nden: agent is requesting network access to \"{}\" (not in egress allowlist). Allow and remember? [y/N] ", host);
     std::io::stderr().flush()?;
     let mut answer = String::new();
     if std::io::stdin().read_line(&mut answer)? == 0 {

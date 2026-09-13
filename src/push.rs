@@ -13,7 +13,7 @@
 //!   3. `den push` diffs VFS vs baseline -> worktree -> branch -> remote
 
 use crate::snapshot_fs;
-use agentfs_sdk::filesystem::{S_IFMT, S_IFREG};
+use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT, S_IFREG};
 use agentfs_sdk::{AgentFS, AgentFSOptions};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -79,6 +79,56 @@ pub(crate) fn diff_snapshots(
         .cloned()
         .collect();
     changed.sort();
+    deleted.sort();
+    (changed, deleted, dropped)
+}
+
+/// Layered-session diff (docs/layered-sessions.md §3.7): the session's
+/// delta IS its change set — no whole-tree snapshot walk. Pure, unit-tested.
+///   `delta`      every delta entry (path -> attrs); changed candidates
+///   `base`       base attrs for delta paths ∪ tombstone descendants
+///                (None = not in base, i.e. brand-new)
+///   `tombstones` tombstoned base-FILE paths: dir rows are expanded by the
+///                caller to the files under them (git deletes files, not
+///                dirs); an empty tombstoned dir contributes nothing
+/// A path that is tombstoned AND delta-resident is a delete-then-recreate:
+/// it counts as changed, not deleted.
+pub(crate) fn diff_layers(
+    baseline_tops: &[String],
+    delta: &HashMap<String, (i64, u32, i64)>,
+    base: &HashMap<String, Option<(i64, u32, i64)>>,
+    tombstones: &HashSet<String>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let tops: HashSet<&str> = baseline_tops.iter().map(|s| s.as_str()).collect();
+    let mut dropped: Vec<String> = delta
+        .iter()
+        .filter(|(p, attrs)| {
+            !pushable(p, &tops) && base.get(*p).copied().flatten() != Some(**attrs)
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    dropped.sort();
+    let mut changed: Vec<String> = delta
+        .iter()
+        .filter(|(p, attrs)| {
+            pushable(p, &tops)
+                && match base.get(*p) {
+                    Some(Some(ba)) => ba != *attrs, // copy-up + write
+                    _ => true,                      // not in base: brand-new
+                }
+        })
+        .map(|(p, _)| p.clone())
+        .collect();
+    changed.sort();
+    let mut deleted: Vec<String> = tombstones
+        .iter()
+        .filter(|p| {
+            !delta.contains_key(*p)
+                && pushable(p, &tops)
+                && base.get(*p).is_some_and(|b| b.is_some())
+        })
+        .cloned()
+        .collect();
     deleted.sort();
     (changed, deleted, dropped)
 }
@@ -194,6 +244,220 @@ pub(crate) async fn push_session(
     session_dir: &Path,
     o: &PushOpts,
 ) -> Result<PushOutcome> {
+    // Layered sessions diff base ∪ delta − tombstones (the delta IS the
+    // change set); legacy sessions diff the whole fs.db against seed.snapshot.
+    if session_dir.join("base").exists() {
+        push_session_layered(sid, session_dir, o).await
+    } else {
+        push_session_legacy(sid, session_dir, o).await
+    }
+}
+
+/// Base-tree file paths under the tombstoned `root` (git needs file-level
+/// deletions; one dir row covers its whole subtree). Iterative, no box.
+async fn collect_base_files(base: &AgentFS, root: &str, out: &mut HashSet<String>) {
+    let mut stack = vec![root.to_string()];
+    while let Some(dir) = stack.pop() {
+        let Some(st) = base.fs.lstat(&dir).await.ok().flatten() else {
+            continue;
+        };
+        if st.mode & S_IFMT != S_IFDIR {
+            continue;
+        }
+        let names = base
+            .fs
+            .readdir(st.ino)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        for name in names {
+            let child = format!("{dir}/{name}");
+            if let Some(cs) = base.fs.lstat(&child).await.ok().flatten() {
+                if cs.mode & S_IFMT == S_IFDIR {
+                    stack.push(child);
+                } else {
+                    out.insert(child);
+                }
+            }
+        }
+    }
+}
+
+async fn push_session_layered(sid: &str, session_dir: &Path, o: &PushOpts) -> Result<PushOutcome> {
+    let db = session_dir.join("fs.db");
+    let agent =
+        match AgentFS::open(AgentFSOptions::with_path(db.to_string_lossy().to_string())).await {
+            Ok(a) => a,
+            Err(e) => bail!("open {}: {e}", db.display()),
+        };
+    let base_db = std::fs::read_to_string(session_dir.join("base"))
+        .with_context(|| format!("session {sid} has no readable base pointer"))?
+        .trim()
+        .to_string();
+    let base = AgentFS::open(AgentFSOptions::with_path(base_db.clone()))
+        .await
+        .with_context(|| format!("open base {base_db}"))?;
+
+    // delta entries (the change set)
+    let mut delta: HashMap<String, (i64, u32, i64)> = HashMap::new();
+    for p in agent.get_delta_paths().await? {
+        if let Some(st) = agent.fs.lstat(&p).await.ok().flatten() {
+            delta.insert(p, (st.mtime, st.mtime_nsec, st.size));
+        }
+    }
+    // tombstones expanded to base files (dir rows cover their subtree)
+    let rows = agent.get_whiteouts().await?;
+    let mut tombstones: HashSet<String> = HashSet::new();
+    for t in &rows {
+        match base.fs.lstat(t).await.ok().flatten() {
+            Some(st) if st.mode & S_IFMT == S_IFDIR => {
+                collect_base_files(&base, t, &mut tombstones).await;
+            }
+            Some(_) => {
+                tombstones.insert(t.clone());
+            }
+            None => {}
+        }
+    }
+    // base attrs for delta paths ∪ tombstone descendants
+    let tops = base.fs.readdir(1).await.ok().flatten().unwrap_or_default();
+    let mut base_attrs: HashMap<String, Option<(i64, u32, i64)>> = HashMap::new();
+    for p in delta.keys().chain(tombstones.iter()) {
+        let attr = base
+            .fs
+            .lstat(p)
+            .await
+            .ok()
+            .flatten()
+            .map(|st| (st.mtime, st.mtime_nsec, st.size));
+        base_attrs.insert(p.clone(), attr);
+    }
+    let (changed, deleted, dropped) = diff_layers(&tops, &delta, &base_attrs, &tombstones);
+    if changed.is_empty() && deleted.is_empty() {
+        if dropped.is_empty() {
+            bail!("session {sid}: no file changes vs its seed baseline — nothing to push");
+        }
+        bail!(
+            "session {sid}: no pushable changes — {} changed path(s) under sandbox-internal \
+             dirs (etc/, usr/, …) are never pushed",
+            dropped.len()
+        );
+    }
+
+    // Contents come from the delta (copy-up already materialized them).
+    let mut payload: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut ignored = 0usize;
+    for p in &changed {
+        match agent.fs.lstat(p).await.ok().flatten() {
+            Some(s) if s.mode & S_IFMT == S_IFREG => {}
+            _ => {
+                ignored += 1;
+                continue;
+            }
+        }
+        match agent.fs.read_file(p).await.ok().flatten() {
+            Some(bytes) => payload.push((p[1..].to_string(), bytes)),
+            None => ignored += 1,
+        }
+    }
+    drop(base);
+    if payload.is_empty() && deleted.is_empty() {
+        if dropped.is_empty() {
+            bail!("session {sid}: only non-file changes — nothing pushable");
+        }
+        bail!(
+            "session {sid}: no pushable file changes — sandbox-internal paths ({} dropped) \
+             and non-file entries are never pushed",
+            dropped.len()
+        );
+    }
+    push_finish(
+        sid,
+        session_dir,
+        o,
+        payload,
+        deleted,
+        ignored,
+        dropped.len(),
+    )
+    .await
+}
+
+/// Shared tail of both push paths: baseline-drift check, throwaway worktree,
+/// apply + commit + push.
+async fn push_finish(
+    sid: &str,
+    session_dir: &Path,
+    o: &PushOpts,
+    payload: Vec<(String, Vec<u8>)>,
+    deleted: Vec<String>,
+    ignored: usize,
+    dropped: usize,
+) -> Result<PushOutcome> {
+    // Where do the changes land? --to wins; else the session's recorded cwd.
+    let repo = match &o.to {
+        Some(d) => d.clone(),
+        None => PathBuf::from(
+            std::fs::read_to_string(session_dir.join("base_path"))
+                .with_context(|| format!("no base_path for session {sid}; pass --to <repo-dir>"))?
+                .trim(),
+        ),
+    };
+    if git_probe(&repo, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        bail!(
+            "{} is not a git repository — pass --to <repo-dir>",
+            repo.display()
+        );
+    }
+    // Baseline-vs-HEAD drift: the payload diffs against the seed-time tree,
+    // but the worktree below is cut from the host's HEAD *now*. If the host
+    // repo advanced since seeding, its commits land on the branch and
+    // agent-touched files may overwrite newer host content — say so.
+    if let Ok(sha) = std::fs::read_to_string(session_dir.join("seed.sha")) {
+        if !sha.trim().is_empty()
+            && git_probe(&repo, &["rev-parse", "HEAD"]).as_deref() != Some(sha.trim())
+        {
+            eprintln!(
+                "den: warning: {} has advanced past the session's seed commit — \
+                 host-side commits since seeding are folded into the branch",
+                repo.display()
+            );
+        }
+    }
+    let branch = o.branch.clone().unwrap_or_else(|| format!("den/{sid}"));
+    if !valid_branch(&branch) {
+        bail!("invalid branch name {branch:?}");
+    }
+    let wt = std::env::temp_dir().join(format!(
+        "den-push-{}-{}",
+        sid.replace('/', "_"),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .subsec_nanos()
+    ));
+    let res = push_apply(
+        &repo, &wt, &branch, &payload, &deleted, ignored, dropped, sid, o,
+    );
+    if !o.keep {
+        // Throwaway worktree — the commit lives in the repo's object store.
+        let _ = Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "remove", "--force", &wt.to_string_lossy()])
+            .output();
+        let _ = Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "prune"])
+            .output();
+    }
+    res
+}
+
+pub(crate) async fn push_session_legacy(
+    sid: &str,
+    session_dir: &Path,
+    o: &PushOpts,
+) -> Result<PushOutcome> {
     let db = session_dir.join("fs.db");
     if !db.exists() {
         bail!("no fs.db for session {sid} — nothing to push");
@@ -254,70 +518,16 @@ pub(crate) async fn push_session(
         );
     }
 
-    // Where do the changes land? --to wins; else the session's recorded cwd.
-    let repo = match &o.to {
-        Some(d) => d.clone(),
-        None => PathBuf::from(
-            std::fs::read_to_string(session_dir.join("base_path"))
-                .with_context(|| format!("no base_path for session {sid}; pass --to <repo-dir>"))?
-                .trim(),
-        ),
-    };
-    if git_probe(&repo, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
-        bail!(
-            "{} is not a git repository — pass --to <repo-dir>",
-            repo.display()
-        );
-    }
-    // Baseline-vs-HEAD drift: the payload diffs against the seed-time tree,
-    // but the worktree below is cut from the host's HEAD *now*. If the host
-    // repo advanced since seeding, its commits land on the branch and
-    // agent-touched files may overwrite newer host content — say so.
-    if let Ok(sha) = std::fs::read_to_string(session_dir.join("seed.sha")) {
-        if !sha.trim().is_empty()
-            && git_probe(&repo, &["rev-parse", "HEAD"]).as_deref() != Some(sha.trim())
-        {
-            eprintln!(
-                "den: warning: {} has advanced past the session's seed commit — \
-                 host-side commits since seeding are folded into the branch",
-                repo.display()
-            );
-        }
-    }
-    let branch = o.branch.clone().unwrap_or_else(|| format!("den/{sid}"));
-    if !valid_branch(&branch) {
-        bail!("invalid branch name {branch:?}");
-    }
-    let wt = std::env::temp_dir().join(format!(
-        "den-push-{}-{}",
-        sid.replace('/', "_"),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .subsec_nanos()
-    ));
-    let res = push_apply(
-        &repo,
-        &wt,
-        &branch,
-        &payload,
-        &deleted,
+    push_finish(
+        sid,
+        session_dir,
+        o,
+        payload,
+        deleted,
         ignored,
         dropped.len(),
-        sid,
-        o,
-    );
-    if !o.keep {
-        // Throwaway worktree — the commit lives in the repo's object store.
-        let _ = Command::new("git")
-            .current_dir(&repo)
-            .args(["worktree", "remove", "--force", &wt.to_string_lossy()])
-            .output();
-        let _ = Command::new("git")
-            .current_dir(&repo)
-            .args(["worktree", "prune"])
-            .output();
-    }
-    res
+    )
+    .await
 }
 
 /// Apply the delta to a fresh worktree of `repo`, then commit + push.
@@ -433,6 +643,14 @@ mod tests {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
+    fn hm(pairs: &[(&str, Option<(i64, u32, i64)>)]) -> HashMap<String, Option<(i64, u32, i64)>> {
+        pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
+    }
+
+    fn hmb(pairs: &[(&str, (i64, u32, i64))]) -> HashMap<String, (i64, u32, i64)> {
+        pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
+    }
+
     #[test]
     fn diff_semantics() {
         // Repo without an etc/ dir: /etc, /tmp junk is excluded; /.git always.
@@ -464,6 +682,45 @@ mod tests {
         let now2 = snap(&[("/etc/hosts", (4, 0, 8))]);
         let (changed2, _, _) = diff_snapshots(&base2, &now2);
         assert_eq!(changed2, vec!["/etc/hosts"]);
+    }
+
+    #[test]
+    fn diff_layers_semantics() {
+        let tops: Vec<String> = vec!["src".into(), "pkg".into()];
+        // delta: /src/lib.rs written (copy-up + write), /pkg/new created,
+        // /etc/x changed (sandbox-internal → dropped), /src/gone deleted
+        // (tombstone; its dir variant expanded by the caller), and a
+        // delete-then-recreate of /src/again.txt (tombstone + delta entry)
+        let delta = hmb(&[
+            ("/src/lib.rs", (200, 1, 10)),
+            ("/pkg/new", (300, 0, 4)),
+            ("/etc/x", (400, 0, 99)),
+            ("/src/back", (500, 0, 3)),
+        ]);
+        let mut base = hm(&[
+            ("/src/lib.rs", Some((100, 0, 9))),
+            ("/pkg/new", None),
+            ("/etc/x", Some((50, 0, 1))),
+            ("/src/old.rs", Some((10, 0, 5))),
+            ("/src/back", Some((90, 0, 2))),
+        ]);
+        base.insert("/src/deleted-dir".to_string(), Some((1, 0, 0)));
+        base.insert("/src/deleted-dir/a.txt".to_string(), Some((1, 0, 2)));
+        base.insert("/src/gone".to_string(), Some((7, 0, 1)));
+        // tombstones as the caller builds them: the dir row expanded to its
+        // base files (the dir row itself is not a file to delete)
+        let tombstones: HashSet<String> = [
+            "/src/deleted-dir/a.txt".to_string(),
+            "/src/gone".to_string(),
+            "/src/back".to_string(), // tombstone AND delta-resident
+        ]
+        .into();
+        let (changed, deleted, dropped) = diff_layers(&tops, &delta, &base, &tombstones);
+        assert_eq!(changed, vec!["/pkg/new", "/src/back", "/src/lib.rs"]);
+        // the recreated path stays out of deletions; the tombstoned dir's
+        // base files land there expanded
+        assert_eq!(deleted, vec!["/src/deleted-dir/a.txt", "/src/gone"]);
+        assert_eq!(dropped, vec!["/etc/x"]);
     }
 
     #[test]
