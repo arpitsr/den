@@ -7,10 +7,10 @@ progress; CI gates for every phase: `cargo fmt --check`, `cargo clippy
 
 ## Phase 0 — prereqs (gate before any code)
 
-- [x] Linux host with FUSE: `fusermount3` present, `/dev/fuse` available
+- [ ] Linux host with FUSE: `fusermount3` present, `/dev/fuse` available
 - [ ] Egress deps for default networking: `slirp4netns`, `nft` (or accept
       `DEN_NET=none` for MVP smoke tests)
-- [x] Agents on PATH: `dex` built (`cargo build --release` in ~/Work/dex),
+- [ ] Agents on PATH: `dex` built (`cargo build --release` in ~/Work/dex),
       plus `codex`/`claude` for cross-agent checks
 - [ ] Service-account layout: `DEN_SESSION_ROOT` (e.g. /var/lib/den/sessions)
       decided; run den under it once manually
@@ -21,26 +21,26 @@ progress; CI gates for every phase: `cargo fmt --check`, `cargo clippy
 
 Order matters: registry → diff refactor → argv map → serve module → dispatch.
 
-1. [x] **Cargo.toml**: add `axum` (json, http1); extend tokio features to
+1. [ ] **Cargo.toml**: add `axum` (json, http1); extend tokio features to
    `["rt-multi-thread", "macros", "net", "time", "sync", "process", "signal"]`.
-2. [x] **src/registry.rs** — platform.db (schema: platform-api.md §6):
+2. [ ] **src/registry.rs** — platform.db (schema: platform-api.md §6):
    open/create with WAL, `sessions` + `runs` tables, CRUD: upsert_session,
    get/list_sessions, insert_run, update_run, mark_orphans (status
    transition on boot). Sync rusqlite behind a small API; serve calls it
    from `spawn_blocking` with a `Mutex<Connection>`. Unit tests against a
    tempdir DB (schema, transitions, orphan sweep).
-3. [x] **diff refactor (src/main.rs)**: extract the added/modified/removed
+3. [ ] **diff refactor (src/main.rs)**: extract the added/modified/removed
    computation from `print_run_summary` (main.rs:895-996) into
    `pub(crate) async fn diff_run_snap(sid, before) -> RunDelta` with
    `RunDelta { added, modified, removed }` (serde). print path keeps
    byte-identical output. Unit tests on synthetic RunSnap values (legacy +
    layered, incl. no-op copy-up exclusion).
-4. [x] **Headless argv map (src/main.rs)**: extend `Profile` with a
+4. [ ] **Headless argv map (src/main.rs)**: extend `Profile` with a
    headless builder per §10 of platform-api.md (dex → `-p <prompt>`,
    claude → `-p`, codex → `exec`, gemini → `-p`, opencode → `run`; unknown →
    bare prompt arg). `build_argv` gains a `headless(prompt: Option<&str>)`
    mode. Tests: argv assembly per profile with/without prompt.
-5. [x] **src/serve.rs**:
+5. [ ] **src/serve.rs**:
    - bearer auth: `DEN_API_TOKEN` required — refuse to boot without it;
      constant-time compare middleware.
    - routes (turn subset of §8): health, POST/GET/GET-id/DELETE sessions,
@@ -55,10 +55,10 @@ Order matters: registry → diff refactor → argv map → serve module → disp
    - `DEN_MAX_RUNS` gate → 429 (default 8).
    - orphan sweep at boot: rows running with dead pid (via `kill(pid,0)`) →
      orphaned.
-6. [x] **Dispatch (src/main.rs)**: `den serve` arm; env config: DEN_API_TOKEN
+6. [ ] **Dispatch (src/main.rs)**: `den serve` arm; env config: DEN_API_TOKEN
    (required), DEN_BIND (default `127.0.0.1:8520` — dex owns 8420,
    don't collide), DEN_MAX_RUNS, DEN_SESSION_ROOT.
-7. [x] **Tests + smoke**: registry/argv/diff unit tests wired into
+7. [ ] **Tests + smoke**: registry/argv/diff unit tests wired into
    `cmd_selftest`; `scripts/smoke-serve.sh` — the §13 acceptance flow in
    curl: create session → launch `codex exec` "touch /hello.txt" → poll run →
    delta_json lists /hello.txt → kill a sleeping run → restart serve mid-run
@@ -70,23 +70,23 @@ Order matters: registry → diff refactor → argv map → serve module → disp
 
 Can start in parallel with Phase 1: the dex patch is a separate repo.
 
-8. [x] **dex patch (~/Work/dex)**: listener adoption — `dex serve --fd <n>`
+8. [ ] **dex patch (~/Work/dex)**: listener adoption — `dex serve --fd <n>`
    and/or `LISTEN_FDS`/`LISTEN_FDNAMES`: build `std::net::TcpListener` from
    the raw fd (`FromRawFd`, CLOEXEC already cleared by den) and hand it to
    the existing `run_daemon(listener)` (src/daemon/mod.rs:710). Token path
    unchanged (`DEX_DAEMON_TOKEN` env). dex-repo test: bind a listener in the
    test, pass its fd via env, assert the daemon serves on it.
-9. [x] **fd passthrough (src/sandbox.rs, Linux-only)**: den serve binds the
+9. [ ] **fd passthrough (src/sandbox.rs, Linux-only)**: den serve binds the
    host listener, passes it down N→U→A (CLOEXEC cleared; exempt the fd from
    the chain's child fd-cleanup, mirroring how the proxy listener reaches
    its child). Gate inside `selftest --sandbox`: `den raw sh -c 'test -e
    /proc/self/fd/4 && echo ok'` prints ok with the fd wired.
-10. [x] **/attach endpoint (src/serve.rs)**: daemon-kind session with no live
+10. [ ] **/attach endpoint (src/serve.rs)**: daemon-kind session with no live
    child → bind `127.0.0.1:<port>` (ephemeral, recorded in registry),
    generate `DEX_DAEMON_TOKEN`, spawn `den dex serve --fd 4`, status=attached;
    response `{attach_url, attach_token}`. Reap → status idle/exited;
    relaunch on next /attach (dex journal + fs.db keep continuity).
-11. [x] **`den attach <sid>`**: host TUI launcher — runs `dex connect
+11. [ ] **`den attach <sid>`**: host TUI launcher — runs `dex connect
    <attach_url> --reattach <sid>` with the token wired through.
 - [ ] **Multi-turn turn-kind sessions (den side)**: turn sessions are
   conversations, not one-shots. dex path: den pre-assigns the agent session
@@ -125,12 +125,6 @@ Can start in parallel with Phase 1: the dex patch is a separate repo.
    `DEX_JSON` if dex gains one) into runs; webhook/SSE on run completion.
 19. [ ] TOML config for profiles/limits (README "when to grow it" trigger:
    several custom agents).
-20. [x] **Control-plane seam (Phase A)**: `den exec --session <sid>
-   [--seed …] [--autostart] -- <cmd>…` — stable runtime verb for platform
-   launches (host-PATH resolution stays in den; argv assembly moves to the
-   platform side); serve checks `den --version` at boot; document the
-   session-layout contract (`docs/runtime-contract.md`). Repo split only on
-   the triggers in "Sequencing & parallelism".
 - [ ] **Generic daemon bridge (Phase 2 follow-up)**: in-sandbox forwarder
    that adopts fd 4 and proxies to any agent daemon's in-netns port
    (platform-api.md §3 "Any agent daemon"); enforces the session token when
@@ -138,21 +132,6 @@ Can start in parallel with Phase 1: the dex patch is a separate repo.
    daemon without agent-side patches; dex stays native-adoption.
 
 ## Sequencing & parallelism
-
-**Control-plane seam (decision, applies to all phases):** den stays the
-runtime core; the platform layer (`serve.rs`, `registry.rs`, keys, attach
-broker, webhooks, future web-UI backend) is separable at any point because
-its interface is already process-shaped: spawn `den`, read `fs.db` via the
-published agentfs-sdk, flock `<root>/<sid>.lock` (cross-binary), `den rm`
-for cleanup. Phase A — make the seam explicit and load-bearing: add
-`den exec --session <sid> [--seed …] [--autostart] -- <cmd>…` as the
-stable runtime verb (argv assembly moves to the platform side; den stops
-relying on the implicit `den <profile>` + DEN_SESSION convention for
-platform launches), check `den --version` at serve boot. Phase B (repo
-split) triggers on any of: a second runtime consumer, a different stack
-for the control plane (e.g. a BEAM control plane supervising `den exec`
-children), or multi-host orchestration. Until then the modules stay in
-this repo behind the seam.
 
 ```
 Phase 1 (den serve) ──────────────┐

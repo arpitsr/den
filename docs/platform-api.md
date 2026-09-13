@@ -67,10 +67,8 @@ HTTP server cannot host runs in-process. So:
   machinery (spawn_detached, src/main.rs) is used only for backup/replicate
   watchers, exactly as `--autostart` does today.
 - serve restart while sessions are children: orphans reparent to init. On
-  boot, serve marks every registry row still in `running` as `orphaned` —
-  after a restart nothing observes those children anymore, so their
-  outcome is lost by definition. A surviving orphan child keeps holding
-  the session flock until it exits (one live process per session holds).
+  boot, serve scans registry rows in `running`/`attached` state and marks them
+  `orphaned` unless the recorded pid is still alive (`kill(pid, 0)`).
 
 ## 2. Session kinds
 
