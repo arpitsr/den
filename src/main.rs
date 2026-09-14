@@ -2077,14 +2077,26 @@ fn cmd_up(rest: &[String]) -> Result<()> {
     let mut profile: Option<String> = None;
     let mut seed_dir: Option<String> = None;
     let mut seed_git: Option<String> = None;
+    let mut seed_dirty: Option<String> = None;
     let mut prompt: Vec<String> = Vec::new();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--seed" => seed_dir = Some(it.next().context("--seed needs a dir")?.clone()),
-            "--seed-git" => seed_git = Some(it.next().context("--seed-git needs a url")?.clone()),
+            "--seed-git" => {
+                let u = it.next().context("--seed-git needs a url")?.clone();
+                // Match the solo path's resolve_seed_source: http(s) URLs only.
+                if !u.starts_with("http://") && !u.starts_with("https://") {
+                    bail!("--seed-git expects an http(s) URL, got '{u}'");
+                }
+                seed_git = Some(u);
+            }
             "--seed-dirty" => {
-                let _ = it.next(); // accepted for parity; the API seed_json carries it
+                let v = it.next().context("--seed-dirty needs a mode")?.clone();
+                // Validate here (ask|all|head) and pass the raw string: the
+                // daemon re-parses it when it launches the runner.
+                parse_dirty_mode(&v)?;
+                seed_dirty = Some(v);
             }
             other if other.starts_with('-') => bail!("den up: unknown flag {other}"),
             other => {
@@ -2104,8 +2116,13 @@ fn cmd_up(rest: &[String]) -> Result<()> {
         bail!("--seed and --seed-git are exclusive");
     }
     client::ensure_daemon()?;
-    let _ = seed_git; // up keeps to seed_dir for now; seed_git rides a later phase
-    let (sid, _rid) = client::up(&profile, &prompt.join(" "), seed_dir.as_deref())?;
+    let (sid, _rid) = client::up(
+        &profile,
+        &prompt.join(" "),
+        seed_dir.as_deref(),
+        seed_git.as_deref(),
+        seed_dirty.as_deref(),
+    )?;
     println!("{sid}");
     Ok(())
 }
@@ -2114,9 +2131,9 @@ fn cmd_up(rest: &[String]) -> Result<()> {
 /// state, no daemon needed (docs/socket-daemon.md §3).
 fn cmd_logs(sid: &str) -> Result<()> {
     let reg = Registry::open(&crate::serve::platform_db_path()?)?;
-    let runs = reg.list_runs(sid)?;
+    let runs = reg.list_runs(sid)?; // ORDER BY started_at ASC → last is latest
     let run = runs
-        .first()
+        .last()
         .cloned()
         .context(format!("no runs recorded for {sid}"))?;
     println!("[run {} — {}]", run.id, run.status);
@@ -2139,7 +2156,15 @@ fn cmd_logs(sid: &str) -> Result<()> {
 /// (serve-created sessions have no dirs to scan) — proxy. Otherwise read
 /// the fs tree directly, as always. Never autospawns for a listing.
 fn cmd_sessions(select: bool, solo: bool) -> Result<()> {
-    if !solo && client::try_daemon().is_ok() {
+    if !solo {
+        match client::try_daemon() {
+            Ok(_) => {}
+            // Live but wrong-version daemon: its registry holds the
+            // sessions; an fs-tree fallback would silently show an empty
+            // (or stale) world. Bail with the actionable hint instead.
+            Err(e) if e.downcast_ref::<client::VersionMismatch>().is_some() => bail!("{e}"),
+            Err(_) => {} // no daemon → read the local fs tree
+        }
         let rows = client::sessions_list()?;
         let rows = rows.as_array().cloned().unwrap_or_default();
         if rows.is_empty() {
@@ -2850,29 +2875,43 @@ fn main() -> Result<()> {
             }
             // Daemon present and the invocation is a bare prompt? Proxy the
             // one-shot: create + launch + stream from the daemon (its
-            // children outlive this terminal). Seed flags keep the local
-            // path — their semantics are richer in-process.
-            if !solo
-                && !passthrough.iter().any(|a| a.starts_with('-'))
-                && client::try_daemon().is_ok()
-            {
-                let prompt = passthrough.join(" ");
-                let (sid, rid) = client::create_and_launch(pname, &prompt, None)?;
-                let delta = client::stream_run(&rid)?;
-                match delta {
-                    Some(d) if d != "null" && !d.is_empty() => {
-                        let v: serde_json::Value =
-                            serde_json::from_str(&d).unwrap_or(serde_json::Value::Null);
-                        println!("den: session {sid} — run captured a delta");
-                        if let Some(obj) = v.as_object() {
-                            for (k, val) in obj {
-                                println!("  {k}: {val}");
+            // children outlive this terminal). Empty passthrough is the
+            // interactive TUI — it can't proxy (no prompt to send, no TTY
+            // to stream) and an empty POST would 400 — so it stays solo.
+            // Seed flags keep the local path — their semantics are richer
+            // in-process.
+            let proxyable =
+                !passthrough.is_empty() && !passthrough.iter().any(|a| a.starts_with('-'));
+            if !solo && proxyable {
+                match client::try_daemon() {
+                    Ok(_) => {
+                        let prompt = passthrough.join(" ");
+                        let (sid, rid) =
+                            client::create_and_launch(pname, &prompt, None, None, None)?;
+                        let delta = client::stream_run(&rid)?;
+                        match delta {
+                            Some(d) if d != "null" && !d.is_empty() => {
+                                let v: serde_json::Value =
+                                    serde_json::from_str(&d).unwrap_or(serde_json::Value::Null);
+                                println!("den: session {sid} — run captured a delta");
+                                if let Some(obj) = v.as_object() {
+                                    for (k, val) in obj {
+                                        println!("  {k}: {val}");
+                                    }
+                                }
                             }
+                            _ => {}
                         }
+                        return Ok(());
                     }
-                    _ => {}
+                    // Refuse the proxy per docs/socket-daemon.md §4, but the
+                    // user asked for a run — say why, then fall through and
+                    // run in-process so the command still completes.
+                    Err(e) if e.downcast_ref::<client::VersionMismatch>().is_some() => {
+                        eprintln!("den: {e}; running in-process instead");
+                    }
+                    Err(_) => {} // no daemon: solo, as always
                 }
-                return Ok(());
             }
             let args = split_run_args(passthrough);
             let SplitRunArgs {

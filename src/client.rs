@@ -97,11 +97,35 @@ pub fn request(
     token: Option<&str>,
 ) -> Result<(u16, Value)> {
     let (status, body) = request_raw(socket, method, path, body, token)?;
+    if !(200..300).contains(&status) {
+        bail!("den serve returned {status}: {}", error_message(&body));
+    }
     if body.iter().all(|&b| b.is_ascii_whitespace()) {
         return Ok((status, json!({})));
     }
     let v = serde_json::from_slice(&body).context("non-JSON response body")?;
     Ok((status, v))
+}
+
+/// Best-effort human message from a non-2xx body: the daemon's
+/// `{"error":{"code","message"}}` text when present, the raw body otherwise.
+/// Without this, a 400/409 from the daemon surfaces as "no sid in response"
+/// instead of what actually went wrong.
+fn error_message(body: &[u8]) -> String {
+    let s = String::from_utf8_lossy(body);
+    let s = s.trim();
+    if s.is_empty() {
+        return "(no body)".into();
+    }
+    serde_json::from_str::<Value>(s)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| s.to_string())
 }
 
 fn split_http(raw: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -133,8 +157,13 @@ pub(crate) fn try_daemon_at(sp: &PathBuf) -> Result<Value> {
 /// Connect, autospawning a detached `den serve --socket` if none is up.
 /// DEN_AUTOSPAWN=0 (or a failed spawn) errors instead.
 pub fn ensure_daemon() -> Result<()> {
-    if try_daemon().is_ok() {
-        return Ok(());
+    match try_daemon() {
+        Ok(_) => return Ok(()),
+        // A live but wrong-version daemon is not an autospawn situation:
+        // a new spawn would refuse the live socket and the wait would
+        // time out. Propagate the typed error with the restart hint.
+        Err(e) if e.downcast_ref::<VersionMismatch>().is_some() => return Err(e),
+        Err(_) => {}
     }
     if std::env::var("DEN_AUTOSPAWN").as_deref() == Ok("0") {
         bail!(
@@ -159,12 +188,18 @@ pub fn ensure_daemon() -> Result<()> {
 /// Detached spawn, serialized by an flock-ed lock file so parallel first
 /// calls don't race: the winner spawns, losers just wait for the socket.
 fn spawn_daemon() -> Result<()> {
-    spawn_daemon_at(&socket_path())
+    spawn_daemon_at(&socket_path(), true)
 }
 
 /// Spawn a daemon on an exact socket path — `den serve restart` uses this so
 /// a `--socket` override survives the stop/start round trip.
-pub(crate) fn spawn_daemon_at(sp: &PathBuf) -> Result<()> {
+///
+/// `local_only` (autospawn) strips the TCP env: an autospawned daemon is a
+/// local convenience, not a listener. Carrying DEN_API_TOKEN through would
+/// silently open a bearer-auth'd TCP port, and DEN_BIND without a token
+/// would fail boot. Restart keeps the env, so an explicitly-run TCP daemon
+/// restarts as one.
+pub(crate) fn spawn_daemon_at(sp: &PathBuf, local_only: bool) -> Result<()> {
     let lock_path = sp.with_extension("autospawn.lock");
     if let Some(dir) = lock_path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -181,7 +216,11 @@ pub(crate) fn spawn_daemon_at(sp: &PathBuf) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        // Truncate, not append: an append-mode daemon log grows forever
+        // across boot cycles, and the previous daemon's output is not
+        // worth keeping around (run logs live under the registry tree).
+        .truncate(true)
         .open(daemon_log_path())?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("serve")
@@ -190,6 +229,9 @@ pub(crate) fn spawn_daemon_at(sp: &PathBuf) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    if local_only {
+        cmd.env_remove("DEN_API_TOKEN").env_remove("DEN_BIND");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -201,11 +243,33 @@ pub(crate) fn spawn_daemon_at(sp: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// The daemon's version differs from this CLI's. Callers must NOT treat
+/// this as "no daemon" and silently fall back to the solo path — the socket
+/// still answers, but its view of the world (daemon-created sessions, live
+/// runs) differs. Recover: `den serve restart`.
+#[derive(Debug)]
+pub struct VersionMismatch {
+    /// The running daemon's semver.
+    pub daemon: String,
+}
+
+impl std::fmt::Display for VersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "den daemon is v{}, this CLI is v{} — restart it: den serve restart",
+            self.daemon,
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+}
+
+impl std::error::Error for VersionMismatch {}
+
 fn check_version(h: &Value) -> Result<()> {
     let v = h.get("version").and_then(|x| x.as_str()).unwrap_or("?");
-    let mine = env!("CARGO_PKG_VERSION");
-    if v != mine {
-        bail!("den daemon is v{v}, this CLI is v{mine} — restart it: den serve restart");
+    if v != env!("CARGO_PKG_VERSION") {
+        return Err(anyhow::Error::new(VersionMismatch { daemon: v.into() }));
     }
     Ok(())
 }
@@ -220,13 +284,27 @@ fn token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// POST /v1/sessions → 201 SessionRow ({"sid", ...}).
-fn create_session(profile: &str, seed_dir: Option<&str>) -> Result<String> {
+/// POST /v1/sessions → 201 SessionRow ({"sid", ...}). The seed spec passes
+/// through untouched (dir/git are exclusive — the API rejects a mixed POST);
+/// a silently-dropped seed flag here would leave the user's agent without
+/// code while they believe it was seeded.
+fn create_session(
+    profile: &str,
+    seed_dir: Option<&str>,
+    seed_git: Option<&str>,
+    seed_dirty: Option<&str>,
+) -> Result<String> {
     let sp = socket_path();
-    let body = match seed_dir {
-        Some(d) => json!({"profile": profile, "seed_dir": d}),
-        None => json!({"profile": profile}),
-    };
+    let mut body = json!({"profile": profile});
+    if let Some(d) = seed_dir {
+        body["seed_dir"] = json!(d);
+    }
+    if let Some(u) = seed_git {
+        body["seed_git"] = json!(u);
+    }
+    if let Some(m) = seed_dirty {
+        body["seed_dirty"] = json!(m);
+    }
     let (_, v) = request(&sp, "POST", "/v1/sessions", Some(&body), token().as_deref())?;
     v.get("sid")
         .and_then(|x| x.as_str())
@@ -255,15 +333,23 @@ pub fn create_and_launch(
     profile: &str,
     prompt: &str,
     seed_dir: Option<&str>,
+    seed_git: Option<&str>,
+    seed_dirty: Option<&str>,
 ) -> Result<(String, String)> {
-    let sid = create_session(profile, seed_dir)?;
+    let sid = create_session(profile, seed_dir, seed_git, seed_dirty)?;
     let rid = launch_run(&sid, prompt)?;
     Ok((sid, rid))
 }
 
 /// `den up`: create + launch, return (sid, rid) without streaming.
-pub fn up(profile: &str, prompt: &str, seed_dir: Option<&str>) -> Result<(String, String)> {
-    create_and_launch(profile, prompt, seed_dir)
+pub fn up(
+    profile: &str,
+    prompt: &str,
+    seed_dir: Option<&str>,
+    seed_git: Option<&str>,
+    seed_dirty: Option<&str>,
+) -> Result<(String, String)> {
+    create_and_launch(profile, prompt, seed_dir, seed_git, seed_dirty)
 }
 
 /// GET /v1/sessions → {"sessions": [SessionRow]}.
@@ -356,7 +442,10 @@ fn stream_run_push(rid: &str) -> Result<StreamOut> {
                     .map(String::from);
                 return Ok(false); // run is over — stop reading
             }
-            other => bail!("unknown run-stream frame '{other}'"),
+            // Forward-compat: a newer daemon may add frame types. Skip
+            // them instead of tearing the stream down — the "done" frame
+            // is what actually terminates this loop.
+            _ => {}
         }
         Ok(true)
     };
@@ -454,6 +543,9 @@ impl Dechunker {
                             .context("chunk size line not utf8")?;
                         let hex = s.trim().split(';').next().unwrap_or("");
                         let n = usize::from_str_radix(hex, 16).context("bad chunk size")?;
+                        if n > MAX_STREAM_CHUNK {
+                            bail!("chunk of {n} bytes exceeds the cap");
+                        }
                         self.state = if n == 0 {
                             ChunkState::Trailers
                         } else {
@@ -527,6 +619,9 @@ impl FrameBuf {
                 .unwrap_or("")
                 .parse()
                 .context("bad stream frame length")?;
+            if len > MAX_STREAM_CHUNK {
+                bail!("stream frame of {len} bytes exceeds the {MAX_STREAM_CHUNK}-byte cap");
+            }
             let total = nl + 1 + len + 1; // header line + payload + trailer LF
             if self.buf.len() < total {
                 return Ok(true);
@@ -540,9 +635,40 @@ impl FrameBuf {
     }
 }
 
+/// Upper bound for one decoded frame or chunk. Log frames are file chunks;
+/// an unbounded declared length would let a stream balloon our buffer (the
+/// peer is a same-uid local daemon, so this is hygiene, not a hardening
+/// boundary).
+const MAX_STREAM_CHUNK: usize = 64 * 1024 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_mismatch_is_a_typed_error() {
+        let e = check_version(&json!({"version": "9.9.9"})).unwrap_err();
+        let vm = e
+            .downcast_ref::<VersionMismatch>()
+            .expect("mismatch downcasts to VersionMismatch");
+        assert_eq!(vm.daemon, "9.9.9");
+        assert!(e.to_string().contains("den serve restart"));
+        // Same version must pass.
+        check_version(&json!({"version": env!("CARGO_PKG_VERSION")})).unwrap();
+    }
+
+    #[test]
+    fn error_message_prefers_the_daemons_text() {
+        assert_eq!(
+            error_message(br#"{"error":{"code":"max_runs","message":"session busy"}}"#),
+            "session busy"
+        );
+        assert_eq!(
+            error_message(b"plain text rejection"),
+            "plain text rejection"
+        );
+        assert_eq!(error_message(b""), "(no body)");
+    }
 
     #[test]
     fn dechunker_decodes_incremental_chunks() {

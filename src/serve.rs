@@ -177,6 +177,10 @@ fn bearer_token(req: &Request) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_string())
+        // An empty credential ("Bearer " with nothing after) is not a
+        // token: treat it as absent so it can't ride the root-token
+        // compare below.
+        .filter(|s| !s.is_empty())
 }
 
 /// Token -> context, shared by both transports. Root token = DEN_API_TOKEN;
@@ -184,7 +188,10 @@ fn bearer_token(req: &Request) -> Option<String> {
 // Response<Body> is bulky; boxing the error would touch every call site.
 #[allow(clippy::result_large_err)]
 async fn authorize_token(st: &Arc<ServeState>, token: &str) -> Result<AuthContext, Response> {
-    if ct_eq(token, &st.token) {
+    // Root match requires a non-empty token on both sides: a socket-only
+    // daemon has no root token, and an empty bearer must never match it —
+    // any peer who can reach the socket could otherwise mint root.
+    if !token.is_empty() && !st.token.is_empty() && ct_eq(token, &st.token) {
         return Ok(AuthContext {
             owner: "root".into(),
             root: true,
@@ -199,10 +206,9 @@ async fn authorize_token(st: &Arc<ServeState>, token: &str) -> Result<AuthContex
             Ok(AuthContext {
                 owner: k.owner,
                 root: false,
-                max_concurrent: k
-                    .max_concurrent
-                    .map(|c| c.min(st.max_runs as i64))
-                    .filter(|c| *c >= 0),
+                // create_key validates >= 0; a corrupt legacy row fails
+                // closed (cap < mine ⇒ every run refused), not open.
+                max_concurrent: k.max_concurrent.map(|c| c.min(st.max_runs as i64)),
             })
         }
         _ => Err(err_json(
@@ -241,13 +247,17 @@ async fn auth_mw_socket(
     mut req: Request,
     next: axum::middleware::Next,
 ) -> Response {
+    // A bearer key, explicitly presented, narrows the peercred context. An
+    // unknown or empty token is NOT a hard 401: on the socket the ground
+    // truth is the peer uid (TCP keeps bearer-strict), so a failed bearer
+    // falls through to the peercred check. That also keeps a CLI carrying
+    // DEN_API_TOKEN for remote use working against a socket-only daemon,
+    // whose registry has no such root token.
     if let Some(token) = bearer_token(&req) {
-        let ctx = match authorize_token(&st, &token).await {
-            Ok(c) => c,
-            Err(resp) => return resp,
-        };
-        req.extensions_mut().insert(ctx);
-        return next.run(req).await;
+        if let Ok(ctx) = authorize_token(&st, &token).await {
+            req.extensions_mut().insert(ctx);
+            return next.run(req).await;
+        }
     }
     let creds = req.extensions().get::<tokio::net::unix::UCred>().copied();
     match creds {
@@ -557,6 +567,15 @@ async fn create_key(
         );
     }
     let owner = req.owner.unwrap_or_else(|| "default".into());
+    if let Some(n) = req.max_concurrent {
+        if n < 0 {
+            return err_json(
+                StatusCode::BAD_REQUEST,
+                "invalid_cap",
+                format!("max_concurrent {n} is negative"),
+            );
+        }
+    }
     // Key material from the OS CSPRNG (urandom), base64url — not the
     // alphanumeric session-suffix helper, whose 36-char alphabet would cap
     // a 32-char key at ~166 bits of effective entropy and bias 12 bits/char.
@@ -2115,7 +2134,7 @@ pub fn cmd_serve_restart(rest: &[String]) -> Result<()> {
     if let Some(pid) = stop_daemon_at(&path)? {
         println!("den serve: stopped pid {pid}");
     } // none running — starting fresh
-    crate::client::spawn_daemon_at(&path)?;
+    crate::client::spawn_daemon_at(&path, false)?;
     let mut health = None;
     let mut last_err = String::new();
     for _ in 0..60 {
@@ -2230,6 +2249,12 @@ async fn serve_unix(st: Arc<ServeState>, path: PathBuf) -> Result<()> {
     }
     let listener = tokio::net::UnixListener::bind(&path)
         .with_context(|| format!("bind {}", path.display()))?;
+    // 0600 (docs/socket-daemon.md §2): peercred is the real boundary, but
+    // the file mode keeps other local users from even connecting.
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("den serve: chmod 0600 {}: {e}", path.display());
+    }
     eprintln!("den serve: listening on {}", path.display());
     let base = socket_router(st);
     loop {

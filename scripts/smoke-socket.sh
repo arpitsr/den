@@ -20,8 +20,10 @@ export HOME="$SCRATCH/home"
 export XDG_RUNTIME_DIR="$SCRATCH/xdg"
 mkdir -p "$HOME" "$XDG_RUNTIME_DIR"
 cleanup() {
+  # SCRATCH-scoped only: a bare `pkill -f "den serve"` would kill every den
+  # serve on the host, including the user's production daemon. All smoke
+  # daemons live under $SCRATCH, so this pattern covers them.
   pkill -f "den serve --socket $SCRATCH" 2>/dev/null || true
-  pkill -f "den serve" 2>/dev/null || true
   rm -rf "$SCRATCH"
 }
 trap cleanup EXIT

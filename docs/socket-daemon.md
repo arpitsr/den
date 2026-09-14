@@ -50,9 +50,9 @@ Non-goals:
 | **Serve transports** | `src/serve.rs` | + `--socket PATH`: second `axum::serve` on `UnixListener`, same `Router`. Boot accepts TCP-only, socket-only, or both |
 | **Local auth** | `src/serve.rs` | + peer-cred middleware on the socket listener only: `SO_PEERCRED` uid == euid ⇒ root `AuthContext`; a bearer key still honored if presented. TCP keeps bearer-only |
 | **CLI client** | `src/client.rs` (new) | Socket detection, typed calls for the proxyable commands, version handshake, error mapping (daemon down → clear message, not a Rust backtrace) |
-| **CLI dispatch** | `src/main.rs` | Lifecycle subcommands route: `--solo` or no daemon ⇒ in-process (today); else proxy. `--solo` forces in-process |
-| **Autospawn** | `src/client.rs` | Double-fork detached `den serve --socket`, spawn-lock file so parallel first calls don't race, 3s socket-wait timeout |
-| **Version pin** | `serve.rs` health | `/v1/health` already returns `version`; client refuses proxy on mismatch with a `den serve restart` hint |
+| **CLI dispatch** | `src/main.rs` | Lifecycle subcommands route: `--solo` or no daemon ⇒ in-process (today); else proxy. `--solo` forces in-process; an empty prompt (interactive TUI) always stays in-process — it has nothing to POST and no TTY to stream |
+| **Autospawn** | `src/client.rs` | Double-fork detached `den serve --socket`, spawn-lock file so parallel first calls don't race, 3s socket-wait timeout. Autospawned daemons are socket-only: the child env drops `DEN_API_TOKEN`/`DEN_BIND`, so a local convenience daemon never silently opens a TCP port (explicit `den serve restart` preserves the env, so a deliberately-run TCP daemon restarts as one) |
+| **Version pin** | `serve.rs` health | `/v1/health` already returns `version`; on mismatch the client refuses the proxy with a `den serve restart` hint (`den sessions`/`den up` bail — their daemon-side data is invisible to a stale CLI; the one-shot run warns and falls back in-process so the user's command still completes) |
 
 Runner, registry, sandbox, durability: untouched.
 
@@ -61,7 +61,7 @@ Runner, registry, sandbox, durability: untouched.
 | Transport | Auth | Root context | Keys |
 |---|---|---|---|
 | TCP (as today) | bearer required, no token ⇒ no listen | `DEN_API_TOKEN` | hashed `dk_…` |
-| Unix socket | none required | same-uid via `SO_PEERCRED` | accepted if presented |
+| Unix socket | none required | same-uid via `SO_PEERCRED` | accepted if presented; an unknown/empty bearer falls through to the peercred check rather than 401 (the uid is the ground truth — TCP keeps bearer-strict) |
 
 Refusal rules stay: `den serve --socket` with neither `DEN_API_TOKEN` nor
 `--socket` fails; socket path gets 0600 perms and lives under
