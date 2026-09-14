@@ -940,6 +940,13 @@ fn run_sandbox_child(
                 let _ = fs::create_dir_all(parent);
             }
         }
+        // The target usually lives under /run (e.g. systemd's
+        // stub-resolv.conf), which step 4 just replaced with an empty
+        // tmpfs: the parents were recreated above but the file itself is
+        // gone, and bind-mounting onto a missing path fails with ENOENT.
+        // Touch it first (a dangling-symlink fallback is resolved by the
+        // create); if this fails the bind below reports the real error.
+        let _ = fs::File::create(target);
         let src_cstr = path_to_cstring(src, "resolv.conf path");
         let dst_cstr = path_to_cstring(target, "resolv.conf target");
         // SAFETY: bind-mount a regular file onto the resolv.conf target.
@@ -1775,8 +1782,11 @@ fn setup_env_vars(session_id: &str) {
         ] {
             std::env::set_var(v, &proxy_url);
         }
-        std::env::set_var("NO_PROXY", "");
-        std::env::set_var("no_proxy", "");
+        // Loopback stays direct: dex-style CLI→daemon health checks on
+        // 127.0.0.1 must hit the sandbox's own loopback, not the egress
+        // proxy (which would dial the *host's* loopback and prompt).
+        std::env::set_var("NO_PROXY", "localhost,127.0.0.1,::1");
+        std::env::set_var("no_proxy", "localhost,127.0.0.1,::1");
     }
 
     // Configure SSH to skip system config files: inside the user namespace,
