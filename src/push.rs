@@ -643,6 +643,7 @@ mod tests {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
+    #[allow(clippy::type_complexity)] // test helper; pre-existing lint under clippy 1.98
     fn hm(pairs: &[(&str, Option<(i64, u32, i64)>)]) -> HashMap<String, Option<(i64, u32, i64)>> {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }

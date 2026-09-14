@@ -152,6 +152,17 @@ const DEFAULT_ALLOWED_DIRS: &[&str] = &[
     ".npm",         // npm local registry
 ];
 
+/// The four XDG base directories: `(env var, default subdir under $HOME)`.
+/// `$VAR` wins when absolute; otherwise (unset, empty, or relative — a
+/// relative XDG value is meaningless against a read-only `/`) the default
+/// subdir is used. Empty HOME yields relative paths; callers must skip those.
+const XDG_BASES: &[(&str, &str)] = &[
+    ("XDG_CONFIG_HOME", ".config"),     // ~/.config
+    ("XDG_DATA_HOME", ".local/share"),  // ~/.local/share
+    ("XDG_STATE_HOME", ".local/state"), // ~/.local/state
+    ("XDG_CACHE_HOME", ".cache"),       // ~/.cache
+];
+
 /// Secrets hidden from the agent by default: shadowed by an empty tmpfs
 /// (dirs) or a /dev/null bind (files). DEN_NO_HIDE=~/.ssh restores.
 const DEFAULT_HIDE: &[&str] = &[
@@ -1445,6 +1456,24 @@ fn effective_hides() -> Vec<PathBuf> {
     hides
 }
 
+/// Spec-resolved XDG base dirs, in (var, dir) order. Shared by the writable
+/// defaults (build_allowed_paths) and the child env pin (setup_env_vars) so
+/// the agent writes exactly where den granted writes.
+pub(crate) fn xdg_base_dirs() -> Vec<(&'static str, PathBuf)> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let base = Path::new(&home);
+    XDG_BASES
+        .iter()
+        .map(|(var, sub)| {
+            let dir = match std::env::var(var) {
+                Ok(v) if Path::new(&v).is_absolute() => PathBuf::from(v),
+                _ => base.join(sub),
+            };
+            (*var, dir)
+        })
+        .collect()
+}
+
 /// Remount all filesystems read-only except the overlay and allowed paths.
 ///
 /// Correct order: bind-mount each allowed path to itself (rw), lock it with
@@ -1584,6 +1613,21 @@ fn build_allowed_paths(user_allowed: &[String]) -> Result<Vec<PathBuf>> {
         }
     }
 
+    // XDG base dirs (spec-resolved, created if missing): an XDG-following
+    // agent persists config/state/logs/caches here with zero extra flags.
+    // Relative resolutions (empty HOME) are skipped — never mkdir in the cwd.
+    for (_, dir) in xdg_base_dirs() {
+        if dir.is_relative() {
+            continue;
+        }
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        if dir.exists() && !allowed.contains(&dir) {
+            allowed.push(dir);
+        }
+    }
+
     for path in user_allowed {
         let canonical = Path::new(path).canonicalize().with_context(|| {
             format!(
@@ -1685,6 +1729,14 @@ fn setup_env_vars(session_id: &str) {
     std::env::set_var("AGENTFS", "1");
     std::env::set_var("AGENTFS_SANDBOX", "linux-namespace");
     std::env::set_var("AGENTFS_SESSION", session_id);
+
+    // Pin the XDG base dirs to the absolute paths den granted writable
+    // (build_allowed_paths): with a read-only `/`, a missing or relative
+    // value would resolve inside the sandbox cwd and any agent state the
+    // child writes there would pollute the session delta.
+    for (var, dir) in xdg_base_dirs().iter().filter(|(_, d)| d.is_absolute()) {
+        std::env::set_var(var, dir);
+    }
 
     // Nested runs (§7): a subagent's den inherits this session's pinned
     // base DB (host path — readable, never written inside the sandbox).
@@ -2129,4 +2181,65 @@ fn install_seccomp() -> Result<()> {
 fn install_seccomp() -> Result<()> {
     eprintln!("warning: seccomp deny-list not implemented for this architecture");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup::tests::HOME_LOCK;
+
+    /// Env vars swapped below (HOME + XDG_* are process-global).
+    const SWAPPED_ENV: &[&str] = &[
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+    ];
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("den-xdg-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_allowed_paths_defaults_to_xdg_base_dirs() {
+        // HOME/XDG are process-global: serialize with the backup tests that
+        // swap HOME too, and restore everything so later tests are unaffected.
+        let _g = HOME_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = SWAPPED_ENV
+            .iter()
+            .map(|v| (*v, std::env::var_os(v)))
+            .collect();
+        for v in SWAPPED_ENV {
+            std::env::remove_var(v);
+        }
+        let home = temp_dir("home");
+        std::env::set_var("HOME", &home);
+        // fallback defaults are created and granted…
+        let allows = build_allowed_paths(&[]).unwrap();
+        for d in [".config", ".local/share", ".local/state", ".cache"] {
+            assert!(allows.contains(&home.join(d)), "missing {d}");
+        }
+        // …an absolute XDG override wins…
+        let cfg = temp_dir("cfg");
+        std::env::set_var("XDG_CONFIG_HOME", &cfg);
+        let allows = build_allowed_paths(&[]).unwrap();
+        assert!(allows.contains(&cfg));
+        assert!(!allows.contains(&home.join(".config")));
+        // …and a relative XDG value falls back to the default subdir.
+        std::env::set_var("XDG_CACHE_HOME", "relative/path");
+        let allows = build_allowed_paths(&[]).unwrap();
+        assert!(allows.contains(&home.join(".cache")));
+        for (v, val) in saved {
+            match val {
+                Some(x) => std::env::set_var(v, x),
+                None => std::env::remove_var(v),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&cfg);
+    }
 }

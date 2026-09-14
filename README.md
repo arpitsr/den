@@ -108,6 +108,7 @@ den claude "continue the refactor"    # resumes: the DB is the whole FS, host tr
 den codex  "fix the flaky test"       # separate session per profile+dir
 den pi     "..."                      # no --seed: starts in an empty virtual FS
 den opencode
+den dex "triage inbox"          # XDG-based agent: config/state/cache persist with zero flags
 den list                      # known profiles (any other CLI works: den <cmd> args...)
 den selftest                  # sanity-check argv assembly
 den selftest --sandbox        # full round-trip: seed, mount, vfs writes, ro-enforcement
@@ -295,9 +296,13 @@ den pull codex-myproject --force --to /tmp/db  # overwrite / restore elsewhere
 
 Any first argument is the command to run: `den anything args...` execs
 `anything args...` inside the sandbox. A few known agents get extra host dirs
-kept writable beyond the sandbox defaults (`~/.config`, `~/.cache`, `~/.local`,
-`~/.npm`, `~/.claude`, `~/.codex`, `~/.gemini`, `~/.amp`): `ak` (`.ak`),
-`pi` (`.pi`), `opencode` (`.opencode`) — see `fn profile` in `src/main.rs`.
+kept writable beyond the sandbox defaults (the four XDG base dirs —
+`~/.config`, `~/.local/share`, `~/.local/state`, `~/.cache` — plus legacy
+agent dotdirs like `~/.claude`, `~/.codex`, `~/.npm`): `ak` (`.ak`),
+`pi` (`.pi`), `opencode` (`.opencode`) — see `fn profile` in `src/main.rs`
+and `build_allowed_paths` in `src/sandbox.rs`. XDG-following agents (e.g.
+`dex`, which keeps config, state, logs and caches under `<base>/dex/`)
+persist with zero flags: `den dex ...` just works.
 Unknown commands just get the defaults.
 
 ## Project layout
