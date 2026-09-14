@@ -6,7 +6,7 @@
 # Verifies: socket-only boot without a token, peercred health, TCP not bound,
 # second-serve refusal, proxied sessions, den up (background run), den logs,
 # one-shot proxy, --solo escape hatch, autospawn from a cold socket, orphan
-# sweep after a daemon kill.
+# sweep after a daemon kill, den serve stop (SIGTERM + file cleanup).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -106,6 +106,15 @@ head -2 "$SCRATCH/xdg3-serve.log"
 # boot sweep may report orphaned runs from the killed daemon (best-effort
 # children still running under their own pgid are unaffected)
 ok "restart with fresh socket dir (boot sweep ran)"
-pkill -f "den serve --socket $SCRATCH" 2>/dev/null || true
+
+# --- 10) den serve stop: SIGTERM, socket+pid file removed, idempotent --------
+SOCK3="$XDG_RUNTIME_DIR/den/den.sock"
+"$BIN" serve stop --socket "$SOCK3" | grep -q "stopped pid" \
+  || { echo "FAIL: serve stop"; exit 1; }
+[ ! -S "$SOCK3" ] || { echo "FAIL: socket survived stop"; exit 1; }
+if "$BIN" serve stop --socket "$SOCK3" 2>/dev/null; then
+  echo "FAIL: stop on a stopped daemon should fail"; exit 1
+fi
+ok "den serve stop (graceful; second stop reports not running)"
 
 echo "SMOKE-SOCKET-OK"

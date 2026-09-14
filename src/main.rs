@@ -2795,7 +2795,13 @@ fn main() -> Result<()> {
             cmd_logs(&sid)
         }
         [c, rest @ ..] if c == "up" => cmd_up(rest),
-        [c, rest @ ..] if c == "serve" => crate::serve::cmd_serve(rest),
+        [c, rest @ ..] if c == "serve" => {
+            if rest.first().map(|a| a.as_str()) == Some("stop") {
+                crate::serve::cmd_serve_stop(&rest[1..])
+            } else {
+                crate::serve::cmd_serve(rest)
+            }
+        }
         [c, rest @ ..] if c == "exec" => {
             let code = cmd_exec(rest)?;
             std::process::exit(code)

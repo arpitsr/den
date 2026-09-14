@@ -77,6 +77,7 @@ hygiene problem in practice; serve removes its socket at startup and exit).
 | `den up` (launch-and-detach) | **new: returns immediately, run lives in daemon** | autospawn then same |
 | `den attach <sid>` | proxy to attach_url (socket-bound URL for local) | error: session only exists under daemon |
 | `den push/backup/replicate` | local always (fs.db is on-disk; no daemon needed) | local |
+| `den serve stop [--socket PATH]` | **new: SIGTERM the daemon** (10 s grace → SIGKILL); it removes its socket + `<socket>.pid` | reports `not running` (exit 1), tidies a dead socket/pid pair |
 
 Launch-and-detach is the headline capability: `den up "fix the tests"` =
 create + launch + print sid/log path, exit. Come back with `den logs <sid>`.
@@ -92,6 +93,7 @@ Solo mode keeps waiting synchronously — no behavior change for scripts.
 | Version mismatch | client refuses proxy, prints hint | `den serve restart` (new: stop+start via spawn-lock) |
 | `--solo` while daemon runs | two lifecycle owners on one host — flock files keep sessions exclusive per-sid, as today | accepted, documented |
 | Socket dir missing (no XDG_RUNTIME_DIR, e.g. cron) | serve falls back to `XDG_STATE_HOME/den/den.sock` with a warning | automatic |
+| Stale pid file (daemon killed -9, pid reused) | stop verifies `/proc/<pid>/cmdline` is a `den serve` before signalling; a foreign pid is refused and the file removed | automatic |
 
 ## 5. Phases (each shippable, gates per phase)
 
@@ -105,8 +107,14 @@ Solo mode keeps waiting synchronously — no behavior change for scripts.
    background runs. Gate: `scripts/smoke-socket.sh` — solo run, autospawn,
    proxy run, `den up` + close-term + `den logs`, daemon kill → orphan sweep,
    version-mismatch refusal.
-4. **Optional later**: SSE log streaming over socket, `den serve restart`
-   (SIGTERM + respawn), TUI attach over socket.
+4. **Streaming + stop** (~250 LOC): `/v1/runs/:id/stream` — the daemon
+   tails the run log server-side and pushes length-prefixed frames
+   (`log`/`ping`/`done`); the CLI holds one connection instead of
+   re-downloading the whole file every 500 ms (O(log bytes) vs O(n²)).
+   Old daemons without the route fall back to polling. Plus
+   `den serve stop`: pid file at `<socket>.pid`, SIGTERM → 10 s → SIGKILL,
+   socket + pid file removed on the way down. Gate: smoke-socket.sh steps
+   9–10. *Still open:* `den serve restart`, TUI attach over socket.
 
 Total ~650 lines, no new dependencies (unix sockets via tokio net, peercred
 via nix/libc getsockopt — std `std::os::unix` + libc, both already in tree).

@@ -20,6 +20,9 @@ hyper = { version = "1", default-features = false, features = ["http1", "server"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # tower::Service needed to invoke the axum Router from the socket accept loop
 tower = { version = "0.5", default-features = false }
+# Stream trait for run-log streaming responses (Body::from_stream) — traits
+# only, no futures-runtime
+futures-core = "0.3"
 anyhow = "1"
 libc = "0.2"
 litetx = "0.1.0"

@@ -269,9 +269,119 @@ pub fn sessions_list() -> Result<Value> {
     Ok(v.get("sessions").cloned().unwrap_or(json!([])))
 }
 
+/// Outcome of the push-style stream reader.
+enum StreamOut {
+    /// Terminal `done` frame arrived — the run is over.
+    Done(Option<String>),
+    /// The daemon predates /v1/runs/:id/stream — caller should poll.
+    NoRoute,
+}
+
 /// Stream a run's log to stdout until it finishes. Returns delta_json (what
 /// the agent changed) when the run captured one.
 pub fn stream_run(rid: &str) -> Result<Option<String>> {
+    match stream_run_push(rid) {
+        Ok(out) => Ok(match out {
+            StreamOut::Done(d) => d,
+            StreamOut::NoRoute => stream_run_poll(rid)?,
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Push flavor: one held connection, the daemon tails the log file and
+/// pushes frames (`log <len>\n<bytes>\n`, a `ping` keepalive, terminal
+/// `done <len>\n<json>\n`). O(log bytes) on the wire, ~150 ms delivery —
+/// versus the poll flavor's whole-file re-download every 500 ms.
+fn stream_run_push(rid: &str) -> Result<StreamOut> {
+    let sp = socket_path();
+    let mut stream =
+        UnixStream::connect(&sp).with_context(|| format!("connect {}", sp.display()))?;
+    // Long read timeout: a quiet run (long tool call) must not kill the
+    // stream — the daemon pings every 5 s anyway.
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(600)))?;
+    let req =
+        format!("GET /v1/runs/{rid}/stream HTTP/1.1\r\nHost: den\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
+
+    // Read the header block incrementally — a streamed body never ends on
+    // its own, so read_to_end would hang forever.
+    let mut raw = Vec::new();
+    let hdr_end = loop {
+        let mut chunk = [0u8; 4096];
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            bail!("daemon closed the connection before responding");
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i;
+        }
+        if raw.len() > 64 * 1024 {
+            bail!("run stream header block too large");
+        }
+    };
+    let status = parse_status(&raw[..hdr_end]).context("malformed http status line")?;
+    if status == 404 {
+        return Ok(StreamOut::NoRoute); // old daemon without /stream
+    }
+    if status != 200 {
+        let msg = String::from_utf8_lossy(&raw[hdr_end + 4..]);
+        bail!("run stream returned {status}: {}", msg.trim());
+    }
+    let chunked = raw[..hdr_end]
+        .windows(7)
+        .any(|w| w.eq_ignore_ascii_case(b"chunked"));
+
+    let mut de = Dechunker::default();
+    let mut frames = FrameBuf::default();
+    let mut delta: Option<String> = None;
+    let mut handle = |ev: &str, payload: &[u8]| -> Result<bool> {
+        match ev {
+            "log" => {
+                print!("{}", String::from_utf8_lossy(payload));
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+            }
+            "ping" => {}
+            "done" => {
+                let v: Value = serde_json::from_slice(payload).unwrap_or(Value::Null);
+                delta = v
+                    .get("delta_json")
+                    .and_then(|x| x.as_str())
+                    .map(String::from);
+                return Ok(false); // run is over — stop reading
+            }
+            other => bail!("unknown run-stream frame '{other}'"),
+        }
+        Ok(true)
+    };
+    // Bytes that arrived with the header read may already hold body data.
+    let keep = if chunked {
+        frames.feed(&de.push(&raw[hdr_end + 4..])?, &mut handle)?
+    } else {
+        frames.feed(&raw[hdr_end + 4..], &mut handle)?
+    };
+    let mut keep = keep;
+    while keep {
+        let mut chunk = [0u8; 8192];
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            bail!("run stream ended without a done frame");
+        }
+        let decoded = if chunked {
+            de.push(&chunk[..n])?
+        } else {
+            chunk[..n].to_vec()
+        };
+        keep = frames.feed(&decoded, &mut handle)?;
+    }
+    Ok(StreamOut::Done(delta))
+}
+
+/// Poll flavor (fallback for daemons from before /stream existed):
+/// re-download the log, print the delta, 500 ms cadence.
+fn stream_run_poll(rid: &str) -> Result<Option<String>> {
     let sp = socket_path();
     let mut printed = 0usize;
     loop {
@@ -308,9 +418,188 @@ pub fn stream_run(rid: &str) -> Result<Option<String>> {
     }
 }
 
+/// Incremental HTTP chunked-body decoder — the daemon streams responses
+/// with `Transfer-Encoding: chunked` (body length is unknown up front).
+#[derive(Default)]
+struct Dechunker {
+    state: ChunkState,
+    line: Vec<u8>,
+}
+
+#[derive(Default)]
+enum ChunkState {
+    #[default]
+    Size,
+    Body(usize),
+    /// after a body chunk: consume the exact CRLF before the next size line
+    Cr,
+    Lf,
+    /// after the terminal 0 chunk: trailers until close — discarded
+    Trailers,
+}
+
+impl Dechunker {
+    /// Feed raw wire bytes; returns the decoded body bytes seen so far.
+    fn push(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(data.len());
+        for &b in data {
+            match self.state {
+                ChunkState::Size => {
+                    if b == b'\n' {
+                        let s = String::from_utf8(std::mem::take(&mut self.line))
+                            .context("chunk size line not utf8")?;
+                        let hex = s.trim().split(';').next().unwrap_or("");
+                        let n = usize::from_str_radix(hex, 16).context("bad chunk size")?;
+                        self.state = if n == 0 {
+                            ChunkState::Trailers
+                        } else {
+                            ChunkState::Body(n)
+                        };
+                    } else {
+                        if self.line.len() > 16 {
+                            bail!("chunk size line too long");
+                        }
+                        self.line.push(b);
+                    }
+                }
+                ChunkState::Body(rem) => {
+                    out.push(b);
+                    self.state = if rem == 1 {
+                        ChunkState::Cr
+                    } else {
+                        ChunkState::Body(rem - 1)
+                    };
+                }
+                ChunkState::Cr => {
+                    if b == b'\r' {
+                        self.state = ChunkState::Lf;
+                    } else {
+                        bail!("missing CR after chunk body");
+                    }
+                }
+                ChunkState::Lf => {
+                    if b == b'\n' {
+                        self.state = ChunkState::Size;
+                    } else {
+                        bail!("missing LF after chunk body");
+                    }
+                }
+                ChunkState::Trailers => {} // discard until the connection closes
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Extracts length-prefixed stream frames from a byte stream. Frame:
+/// `event <len>\n<len bytes>\n` — matches serve's `frame()` encoder.
+#[derive(Default)]
+struct FrameBuf {
+    buf: Vec<u8>,
+}
+
+impl FrameBuf {
+    /// Feed bytes; calls `f` per complete frame. `f` returning false stops
+    /// parsing (the terminal `done` frame) — further feeds become no-ops
+    /// until the caller stops calling.
+    fn feed(
+        &mut self,
+        data: &[u8],
+        f: &mut dyn FnMut(&str, &[u8]) -> Result<bool>,
+    ) -> Result<bool> {
+        self.buf.extend_from_slice(data);
+        loop {
+            let Some(nl) = self.buf.iter().position(|&b| b == b'\n') else {
+                return Ok(true);
+            };
+            if nl > 64 {
+                bail!("stream frame header too long");
+            }
+            let head = String::from_utf8_lossy(&self.buf[..nl]).into_owned();
+            let mut it = head.split(' ');
+            let ev = it.next().unwrap_or("");
+            let len: usize = it
+                .next()
+                .unwrap_or("")
+                .parse()
+                .context("bad stream frame length")?;
+            let total = nl + 1 + len + 1; // header line + payload + trailer LF
+            if self.buf.len() < total {
+                return Ok(true);
+            }
+            let payload = self.buf[nl + 1..nl + 1 + len].to_vec();
+            self.buf.drain(..total);
+            if !f(ev, &payload)? {
+                return Ok(false);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dechunker_decodes_incremental_chunks() {
+        let mut d = Dechunker::default();
+        let mut out = d.push(b"5\r\nhello\r\n").unwrap();
+        out.extend(d.push(b"6\r\n world\r\n2").unwrap());
+        out.extend(d.push(b"\r\nab\r\n0\r\n\r\n").unwrap());
+        assert_eq!(&out, b"hello worldab");
+    }
+
+    #[test]
+    fn framebuf_extracts_framed_events_incrementally() {
+        let mut f = FrameBuf::default();
+        let mut seen: Vec<(String, Vec<u8>)> = Vec::new();
+        // incomplete frame stays buffered
+        let keep1 = {
+            let mut push = |ev: &str, p: &[u8]| -> Result<bool> {
+                seen.push((ev.to_string(), p.to_vec()));
+                Ok(true)
+            };
+            f.feed(b"log 5\nhello", &mut push).unwrap()
+        };
+        assert!(keep1);
+        assert!(seen.is_empty());
+        // completion + two more frames, one per event type
+        let keep2 = {
+            let mut push = |ev: &str, p: &[u8]| -> Result<bool> {
+                seen.push((ev.to_string(), p.to_vec()));
+                Ok(true)
+            };
+            f.feed(b"\nping 0\n\ndone 7\n{\"a\":1}\n", &mut push)
+                .unwrap()
+        };
+        assert!(keep2);
+        assert_eq!(
+            seen,
+            vec![
+                ("log".to_string(), b"hello".to_vec()),
+                ("ping".to_string(), b"".to_vec()),
+                ("done".to_string(), b"{\"a\":1}".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn framebuf_stops_after_a_false_callback() {
+        // the frame that returned false is fully delivered first; parsing
+        // stops with anything after it still buffered
+        let mut f = FrameBuf::default();
+        let mut seen: Vec<String> = Vec::new();
+        let keep = {
+            let mut stop_after_two = |ev: &str, _p: &[u8]| -> Result<bool> {
+                seen.push(ev.to_string());
+                Ok(seen.len() < 2)
+            };
+            f.feed(b"log 5\nhello\ndone 2\nhi\n", &mut stop_after_two)
+                .unwrap()
+        };
+        assert!(!keep);
+        assert_eq!(seen, vec!["log".to_string(), "done".to_string()]);
+    }
 
     #[test]
     fn socket_path_prefers_env_then_runtime_dir() {

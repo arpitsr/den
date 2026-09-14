@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd as _;
 // ExitStatusExt: signal() — did our SIGTERM/SIGKILL stop the child?
 use sha2::{Digest, Sha256};
-use std::io::Read as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -291,6 +291,7 @@ fn api_routes() -> Router<Arc<ServeState>> {
         )
         .route("/runs/{rid}", get(get_run))
         .route("/runs/{rid}/log", get(run_log))
+        .route("/runs/{rid}/stream", get(run_stream))
         .route("/runs/{rid}/kill", post(kill_run))
 }
 
@@ -318,6 +319,7 @@ async fn health(State(st): State<Arc<ServeState>>) -> Response {
     let running = st.children.lock().unwrap().len();
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
         "running": running,
         "max_runs": st.max_runs,
         "fusermount3": bin_found("fusermount3"),
@@ -1754,9 +1756,136 @@ async fn kill_run(
         .into_response()
 }
 
+// ---- run log streaming -----------------------------------------------------
+
+/// One stream frame: `event <len>\n<len bytes>\n` — length-prefixed so agent
+/// output with embedded newlines (or non-UTF8 bytes) survives the hop.
+fn frame(event: &str, payload: &[u8]) -> Vec<u8> {
+    let mut v = format!("{event} {}\n", payload.len()).into_bytes();
+    v.extend_from_slice(payload);
+    v.push(b'\n');
+    v
+}
+
+/// Stream adapter: the producer task pushes encoded frames into an mpsc
+/// channel; this impl feeds them to axum's chunked response body.
+/// UnboundedReceiver::poll_recv is public — no tokio-stream dep needed.
+struct Frames(tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>);
+
+impl futures_core::Stream for Frames {
+    type Item = Result<axum::body::Bytes, std::convert::Infallible>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.0
+            .poll_recv(cx)
+            .map(|opt| opt.map(|b| Ok(axum::body::Bytes::from(b))))
+    }
+}
+
+/// GET /v1/runs/{rid}/stream — live run log, pushed as length-prefixed
+/// frames: `log` events as the log grows, a `ping` keepalive during quiet
+/// stretches, and a terminal `done` event carrying
+/// {"status","exit_code","delta_json"}. Server-side tailing replaces the
+/// CLI's whole-file re-polling: O(log bytes) on the wire, ~150 ms delivery.
+async fn run_stream(
+    State(st): State<Arc<ServeState>>,
+    ctx: axum::Extension<AuthContext>,
+    AxPath(rid): AxPath<String>,
+) -> Response {
+    let spawn_rid = rid.clone();
+    let row = match reg(&st.reg, move |r| r.get_run(&rid)).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND, "unknown_run", "no such run"),
+        Err(e) => {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "registry",
+                format!("{e:#}"),
+            )
+        }
+    };
+    if let Err(resp) = authorize(&st, &ctx, &row.sid).await {
+        return resp;
+    }
+    let Some(path) = row.log_path else {
+        return err_json(StatusCode::NOT_FOUND, "no_log", "run has no log file");
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(stream_producer(path.into(), st, spawn_rid, tx));
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        axum::body::Body::from_stream(Frames(rx)),
+    )
+        .into_response()
+}
+
+/// Tail the run log and push frames until the run reaches a terminal
+/// status, then send `done` and exit. Exits early when the client hangs up
+/// (send fails — receiver dropped).
+async fn stream_producer(
+    log_path: PathBuf,
+    st: Arc<ServeState>,
+    rid: String,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let mut offset: u64 = 0;
+    let mut idle_since = tokio::time::Instant::now();
+    loop {
+        // tail new bytes since the last pass (the log only ever grows)
+        if let Ok(mut f) = std::fs::File::open(&log_path) {
+            if let Ok(md) = f.metadata() {
+                if md.len() > offset && f.seek(SeekFrom::Start(offset)).is_ok() {
+                    let mut buf = Vec::new();
+                    if f.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                        offset += buf.len() as u64;
+                        idle_since = tokio::time::Instant::now();
+                        if tx.send(frame("log", &buf)).is_err() {
+                            return; // client hung up
+                        }
+                    }
+                }
+            }
+        }
+        match reg(&st.reg, {
+            let rid = rid.clone();
+            move |r| r.get_run(&rid)
+        })
+        .await
+        {
+            Ok(Some(row)) if row.status != "running" && row.status != "queued" => {
+                let done = json!({
+                    "status": row.status,
+                    "exit_code": row.exit_code,
+                    "delta_json": row.delta_json,
+                });
+                let _ = tx.send(frame("done", done.to_string().as_bytes()));
+                return;
+            }
+            Ok(None) => {
+                // run row vanished (session deleted under us) — say so
+                let _ = tx.send(frame("done", br#"{"status":"gone"}"#.as_slice()));
+                return;
+            }
+            _ => {} // queued/running, or a registry hiccup: keep streaming
+        }
+        // keepalive so a quiet run (long tool call, no output) doesn't trip
+        // the client's read timeout
+        if idle_since.elapsed() > std::time::Duration::from_secs(5) {
+            idle_since = tokio::time::Instant::now();
+            if tx.send(frame("ping", b"")).is_err() {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
 // ---- entry -----------------------------------------------------------------
 
-/// `den serve` — boot sweep, then serve until killed.
+/// `den serve` — boot sweep, then serve until killed (`den serve stop`,
+/// Ctrl+C, or an external SIGTERM).
 ///
 /// Transports (docs/socket-daemon.md): `--socket PATH` (or DEN_SOCKET) adds
 /// the local unix socket with peercred auth; DEN_API_TOKEN enables the TCP
@@ -1817,10 +1946,23 @@ pub fn cmd_serve(rest: &[String]) -> Result<()> {
         max_runs,
         children: Mutex::new(HashMap::new()),
     });
+    // Stop bookkeeping: the pid file pairs this daemon with its socket so
+    // `den serve stop` can signal the right process without a host-wide
+    // pkill.
+    let pid_file = socket.as_ref().map(|p| pid_file_path(p));
+    if let Some(pf) = &pid_file {
+        if let Some(dir) = pf.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(pf, format!("{}\n", std::process::id())) {
+            eprintln!("den serve: pid file {}: {e}", pf.display());
+        }
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async move {
+    let cleanup_socket = socket.clone();
+    let res = rt.block_on(async move {
         let tcp = {
             let st = st.clone();
             async move {
@@ -1843,9 +1985,180 @@ pub fn cmd_serve(rest: &[String]) -> Result<()> {
                 }
             }
         };
-        tokio::try_join!(tcp, sk)?;
-        anyhow::Ok(())
-    })
+        // SIGTERM (`den serve stop`) or SIGINT (Ctrl+C) shuts down cleanly;
+        // in-flight connection tasks drop with the runtime right after.
+        tokio::select! {
+            r = async { tokio::try_join!(tcp, sk) } => r.map(|_| ()),
+            _ = wait_stop_signal() => Ok(()),
+        }
+    });
+    // The daemon owned the socket from boot until now; the connect() check
+    // covers the narrow race where a replacement serve bound it during
+    // shutdown — never unlink a socket someone else owns.
+    if let Some(path) = &cleanup_socket {
+        if path.exists() && std::os::unix::net::UnixStream::connect(path).is_err() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    if let Some(pf) = &pid_file {
+        remove_own_pid_file(pf);
+    }
+    res
+}
+
+/// `den serve stop [--socket PATH]` — graceful stop of the daemon on the
+/// given socket: SIGTERM, 10 s grace, then SIGKILL. The daemon removes its
+/// socket + pid file on the way down; the SIGKILL path cleans up here.
+pub fn cmd_serve_stop(rest: &[String]) -> Result<()> {
+    let mut socket: Option<PathBuf> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--socket" {
+            socket = Some(PathBuf::from(it.next().context("--socket needs a path")?));
+        } else {
+            bail!("unknown argument to den serve stop: {a}");
+        }
+    }
+    // Same resolution order the CLI uses everywhere: --socket, DEN_SOCKET,
+    // then the standard dir chain (XDG_RUNTIME_DIR → XDG_STATE_HOME → $HOME).
+    let path = socket
+        .or_else(|| {
+            std::env::var("DEN_SOCKET")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(crate::client::socket_path);
+    let pid_file = pid_file_path(&path);
+
+    let mut pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    if pid.is_none() {
+        // Daemon from before the pid file existed: health carries the pid.
+        pid = crate::client::request(&path, "GET", "/v1/health", None, None)
+            .ok()
+            .and_then(|(_, h)| h.get("pid").and_then(|p| p.as_u64()).map(|p| p as i32));
+    }
+    let Some(pid) = pid else {
+        // Nothing to signal — still tidy a dead socket/pid file pair.
+        if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        bail!("den serve: not running on {}", path.display());
+    };
+    if pid == std::process::id() as i32 {
+        bail!(
+            "pid file {} names this process — refusing",
+            pid_file.display()
+        );
+    }
+    if !is_den_serve(pid) {
+        // Stale pid, reused by something else — drop the file, not the
+        // innocent process.
+        let _ = std::fs::remove_file(&pid_file);
+        bail!("pid {pid} is not `den serve` — stale pid file removed");
+    }
+    // SAFETY: SIGTERM to a pid verified to be a den serve daemon.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while daemon_alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if daemon_alive(pid) {
+        // SAFETY: force-kill of a daemon that ignored SIGTERM for 10 s.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        for _ in 0..20 {
+            if !daemon_alive(pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    // The SIGKILL path skips the daemon's own cleanup — finish the job.
+    if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
+    if std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        == Some(pid)
+    {
+        let _ = std::fs::remove_file(&pid_file);
+    }
+    println!("den serve: stopped pid {pid} ({})", path.display());
+    Ok(())
+}
+
+/// pid-reuse guard: confirm the process is really a `den serve`. Hosts
+/// without /proc (macOS) skip the check — the pid file is fresh there.
+fn is_den_serve(pid: i32) -> bool {
+    let cmd = match std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    let mut args = cmd.split('\0').filter(|s| !s.is_empty());
+    let exe_is_den = args
+        .next()
+        .map(|a| {
+            std::path::Path::new(a)
+                .file_name()
+                .map(|f| f == "den")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    exe_is_den && args.any(|a| a == "serve")
+}
+
+/// True if the pid exists and is not a zombie: a background-started daemon
+/// lingers as a zombie until its parent shell reaps it, and that is
+/// "stopped" for our purposes (kill(0) alone would call it alive and stall
+/// the stop loop for the full grace period).
+fn daemon_alive(pid: i32) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // state is the first field after the (comm) parens — comm may
+        // contain spaces, so rsplit on the last ')'
+        Ok(s) => match s.rsplit_once(')') {
+            Some((_, rest)) => !rest.trim_start().starts_with('Z'),
+            None => true,
+        },
+        Err(_) => true, // no /proc — fall back to kill(0)
+    }
+}
+
+/// `<socket>.pid` — the daemon's pid, written at boot, removed at shutdown.
+/// (Not with_extension: that would turn "den.sock" into "den.pid".)
+fn pid_file_path(socket: &std::path::Path) -> PathBuf {
+    let mut s = socket.as_os_str().to_owned();
+    s.push(".pid");
+    PathBuf::from(s)
+}
+
+/// Drop the pid file only if it still names this process — never clobber
+/// the file a newer daemon rewrote.
+fn remove_own_pid_file(pf: &std::path::Path) {
+    let mine = std::fs::read_to_string(pf)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    if mine.is_none() || mine == Some(std::process::id()) {
+        let _ = std::fs::remove_file(pf);
+    }
+}
+
+/// SIGTERM (`den serve stop`) or SIGINT (Ctrl+C) → graceful shutdown.
+async fn wait_stop_signal() -> Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).context("signal handler")?;
+    let mut int = signal(SignalKind::interrupt()).context("signal handler")?;
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+    Ok(())
 }
 
 /// Local transport: accept loop with per-connection hyper http1 service.
@@ -1906,6 +2219,14 @@ mod tests {
 
     /// env vars are process-global (dex_journal_path reads HOME)
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn pid_file_sits_next_to_the_socket() {
+        assert_eq!(
+            pid_file_path(std::path::Path::new("/run/user/7/den.sock")),
+            PathBuf::from("/run/user/7/den.sock.pid")
+        );
+    }
 
     #[test]
     fn seed_into_args_routes_git_vs_dir() {
