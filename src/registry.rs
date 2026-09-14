@@ -439,11 +439,14 @@ impl Registry {
 
     /// The live key for a presented bearer token (by hash), or None.
     pub fn find_key(&self, key_hash: &str) -> Result<Option<KeyRow>> {
+        // Bound the scan: hashes are fixed-length (64 hex), so length
+        // filtering keeps this a no-op unless the column was tampered with.
+        let n = key_hash.len();
         self.conn()
             .query_row(
                 "SELECT key_id, owner, name, max_concurrent, created_at, revoked_at
-                 FROM keys WHERE key_hash = ?1",
-                params![key_hash],
+                 FROM keys WHERE key_hash = ?1 AND length(key_hash) = ?2",
+                params![key_hash, n as i64],
                 row_key,
             )
             .optional()

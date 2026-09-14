@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd as _;
 // ExitStatusExt: signal() — did our SIGTERM/SIGKILL stop the child?
 use sha2::{Digest, Sha256};
+use std::io::Read as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -197,11 +198,18 @@ async fn auth_mw(
     } else {
         let hash = key_hash(&token);
         match reg(&st.reg, move |r| r.find_key(&hash)).await {
-            Ok(Some(k)) if k.revoked_at.is_none() => AuthContext {
-                owner: k.owner,
-                root: false,
-                max_concurrent: k.max_concurrent,
-            },
+            Ok(Some(k)) if k.revoked_at.is_none() => {
+                // Caps never escalate: a key row can't raise the serve-wide
+                // limit, only lower it for that key.
+                AuthContext {
+                    owner: k.owner,
+                    root: false,
+                    max_concurrent: k
+                        .max_concurrent
+                        .map(|c| c.min(st.max_runs as i64))
+                        .filter(|c| *c >= 0),
+                }
+            }
             _ => {
                 return err_json(
                     StatusCode::UNAUTHORIZED,
@@ -481,7 +489,28 @@ async fn create_key(
         );
     }
     let owner = req.owner.unwrap_or_else(|| "default".into());
-    let raw = format!("dk_{}", random_suffix(32));
+    // Key material from the OS CSPRNG (urandom), base64url — not the
+    // alphanumeric session-suffix helper, whose 36-char alphabet would cap
+    // a 32-char key at ~166 bits of effective entropy and bias 12 bits/char.
+    let raw = {
+        let mut buf = [0u8; 32];
+        if let Err(e) = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf))
+        {
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "entropy",
+                format!("read /dev/urandom: {e}"),
+            );
+        }
+        let hex: String = buf
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .concat();
+        format!("dk_{hex}")
+        // Collision with an existing key is astronomically unlikely and the
+        // unique(key_hash) insert would fail loudly if it ever happened.
+    };
     let nk = crate::registry::NewKey {
         key_hash: key_hash(&raw),
         key_id: format!("k-{}", random_suffix(8)),

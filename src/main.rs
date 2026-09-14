@@ -837,6 +837,21 @@ fn clone_git_seed(url: &str) -> Result<PathBuf> {
 }
 
 fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
+    // A URL instead of a path: host-side clone, agent sees only the sanitized
+    // copy (embedded credentials never cross into the session).
+    if let Some(url) = dir
+        .to_str()
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+    {
+        let tmp = clone_git_seed(url)?;
+        return Ok(ResolvedSeed {
+            src: tmp.clone(),
+            git_dir: Some(tmp.join(".git")),
+            note: None,
+            temp: true,
+            head_sha: None,
+        });
+    }
     let fallback = |note: Option<String>| ResolvedSeed {
         src: dir.to_path_buf(),
         git_dir: None,
@@ -1104,11 +1119,27 @@ async fn base_key_meta(
 /// share one base. Reuses the existing seed machinery verbatim
 /// (resolve_seed_source / seed_session / scrub_git_config — the credential
 /// scrub now runs once per base instead of per session).
+/// Removes a temp seed source when dropped — a --seed-git clone (or HEAD
+/// extract) must never outlive the run, on any exit path (early `?`, lock
+/// deadline, panic). `disarm()` on success handoff.
+struct TempSeedGuard(PathBuf);
+
+impl Drop for TempSeedGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 async fn prepare_base(seed: &Path, dirty: DirtyMode, temp_seed: bool) -> Result<PreparedBase> {
     let mut rs = resolve_seed_source(seed, dirty)?;
     if temp_seed {
         rs.temp = true;
     }
+    let _temp_guard = if rs.temp {
+        Some(TempSeedGuard(rs.src.clone()))
+    } else {
+        None
+    };
     let digest = layer::worktree_digest(&rs.src)?;
     let key = layer::base_key(
         rs.git_dir.is_some(),
@@ -1147,11 +1178,6 @@ async fn prepare_base(seed: &Path, dirty: DirtyMode, temp_seed: bool) -> Result<
         let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
         let agent = AgentFS::open(opts).await.context("create base DB")?;
         let seeded = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await;
-        if rs.temp {
-            // Clean up whether seeding succeeded or failed — a `?` would
-            // otherwise leak the HEAD-extract temp dir.
-            let _ = std::fs::remove_dir_all(&rs.src);
-        }
         let n = seeded?;
         eprintln!(
             "den: seeded base {key} with {n} entries from {}",
