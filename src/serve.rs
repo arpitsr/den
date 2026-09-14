@@ -31,7 +31,6 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::process::Command;
 
 /// Per-profile headless invocation (platform-api.md §10): how a profile
 /// takes a prompt without a TTY, and how a follow-up turn resumes the same
@@ -109,6 +108,7 @@ struct Child {
 
 struct ServeState {
     reg: Arc<Registry>,
+    runner: std::sync::Arc<dyn crate::runner::Runner>,
     token: String,
     max_runs: usize,
     /// sid -> live child (turn kind; daemon kind joins in Phase 2)
@@ -1046,20 +1046,27 @@ async fn attach_session(
         Ok(f) => f,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "log_fd", format!("{e}")),
     };
-    let mut cmd = Command::new(exe);
-    cmd.args(["exec", "--session", &sid])
-        .arg("--")
-        .arg(&sess.profile)
-        .args(["serve", "--fd", &fd.to_string()])
-        .env("DEN_SESSION", &sid)
-        .env("DEX_DAEMON_TOKEN", &token)
-        .env("DEN_QUIET", "1")
-        .env_remove("DEN_NEW")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_clone))
-        .stderr(Stdio::from(log_file))
-        .process_group(0);
-    let child = match cmd.spawn() {
+    let child = match st.runner.launch(crate::runner::Launch {
+        exe: exe.to_string_lossy().into_owned(),
+        args: vec![
+            "exec".into(),
+            "--session".into(),
+            sid.clone(),
+            "--".into(),
+            sess.profile.clone(),
+            "serve".into(),
+            "--fd".into(),
+            fd.to_string(),
+        ],
+        sid: sid.clone(),
+        env: vec![
+            ("DEX_DAEMON_TOKEN".into(), token.clone()),
+            ("DEN_QUIET".into(), "1".into()),
+        ],
+        env_remove: vec!["DEN_NEW".into()],
+        stdout: Stdio::from(log_clone),
+        stderr: Stdio::from(log_file),
+    }) {
         Ok(c) => c,
         Err(e) => {
             return err_json(StatusCode::INTERNAL_SERVER_ERROR, "spawn", format!("{e}"));
@@ -1379,21 +1386,22 @@ async fn launch_run(
         Ok(e) => e,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "exe", format!("{e}")),
     };
-    let mut cmd = Command::new(exe);
-    cmd.args(["exec", "--session", &sid])
-        .args(seed_into_args(sess.seed_json.as_deref(), &sid))
-        .arg("--")
-        .arg(&sess.profile)
-        .args(&tail)
-        .env("DEN_SESSION", &sid)
-        .env_remove("DEN_NEW")
-        .env("DEN_QUIET", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_clone))
-        .stderr(Stdio::from(log_file))
-        .process_group(0);
-    let spawned = cmd.spawn();
-    let child = match spawned {
+    let child = match st.runner.launch(crate::runner::Launch {
+        exe: exe.to_string_lossy().into_owned(),
+        args: {
+            let mut a = vec!["exec".into(), "--session".into(), sid.clone()];
+            a.extend(seed_into_args(sess.seed_json.as_deref(), &sid));
+            a.push("--".into());
+            a.push(sess.profile.clone());
+            a.extend(tail);
+            a
+        },
+        sid: sid.clone(),
+        env: vec![("DEN_QUIET".into(), "1".into())],
+        env_remove: vec!["DEN_NEW".into()],
+        stdout: Stdio::from(log_clone),
+        stderr: Stdio::from(log_file),
+    }) {
         Ok(c) => c,
         Err(e) => {
             let _ = reg(&st.reg, {
@@ -1708,6 +1716,7 @@ pub fn cmd_serve() -> Result<()> {
     }
     let st = Arc::new(ServeState {
         reg: Arc::new(reg),
+        runner: crate::runner::runner()?,
         token,
         max_runs,
         children: Mutex::new(HashMap::new()),
