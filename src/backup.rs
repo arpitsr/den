@@ -676,13 +676,14 @@ pub fn default_restore_target(ltx: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use agentfs_sdk::{AgentFS, AgentFSOptions, DEFAULT_FILE_MODE};
     use std::sync::Mutex;
 
     /// HOME is process-global; serialize the tests that swap it.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    /// Shared with sandbox.rs tests (same process-global HOME/XDG swap).
+    pub(crate) static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     struct TestHome {
         _guard: std::sync::MutexGuard<'static, ()>,

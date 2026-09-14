@@ -39,6 +39,8 @@
 //!   DEN_HIDE=~/.a:~/.b  extra secrets to hide (colon-separated); DEN_NO_HIDE=~/.ssh restores
 //!   DEN_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")
 //!   DEN_SECCOMP=0    disable the seccomp syscall deny-list (not recommended)
+//!   (writable defaults: the four XDG base dirs plus the legacy agent
+//!    dotdirs — see build_allowed_paths in src/sandbox.rs)
 
 use crate::layer::read_key_json;
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT};
