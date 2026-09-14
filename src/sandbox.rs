@@ -940,6 +940,29 @@ fn run_sandbox_child(
                 let _ = fs::create_dir_all(parent);
             }
         }
+        // The target usually lives under /run (e.g. systemd's
+        // stub-resolv.conf), which step 4 just replaced with an empty
+        // tmpfs: the parents were recreated above but the file itself is
+        // gone, and bind-mounting onto a missing path fails with ENOENT.
+        // Touch the path first without truncating it, but only when it
+        // lives on one of the private tmpfs trees mounted in step 4
+        // (/run, /tmp, /var/tmp): there the touch is invisible to the
+        // host. Anything else (e.g. a regular /etc/resolv.conf on
+        // non-systemd hosts, same filesystem and still writable here)
+        // must already exist — never create it, just let the bind below
+        // report the real error. If the touch fails the bind below
+        // reports the real error.
+        if !target.exists()
+            && (target.starts_with("/run")
+                || target.starts_with("/tmp")
+                || target.starts_with("/var/tmp"))
+        {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(target);
+        }
         let src_cstr = path_to_cstring(src, "resolv.conf path");
         let dst_cstr = path_to_cstring(target, "resolv.conf target");
         // SAFETY: bind-mount a regular file onto the resolv.conf target.
@@ -1248,8 +1271,15 @@ fn setup_dev() {
 fn bind_mount_fd(fd: libc::c_int, dst: &str) {
     let src = CString::new(format!("/proc/self/fd/{}", fd)).unwrap();
     let dst_cstr = CString::new(dst).unwrap();
-    // Create a placeholder file so the bind mount has a target.
-    let _ = fs::File::create(dst);
+    // Create a placeholder file so the bind mount has a target (without
+    // truncating an existing file).
+    if !Path::new(dst).exists() {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dst);
+    }
     // SAFETY: bind-mount with valid fd path and destination path.
     unsafe {
         let _ = libc::mount(
@@ -1775,8 +1805,11 @@ fn setup_env_vars(session_id: &str) {
         ] {
             std::env::set_var(v, &proxy_url);
         }
-        std::env::set_var("NO_PROXY", "");
-        std::env::set_var("no_proxy", "");
+        // Loopback stays direct: dex-style CLI→daemon health checks on
+        // 127.0.0.1 must hit the sandbox's own loopback, not the egress
+        // proxy (which would dial the *host's* loopback and prompt).
+        std::env::set_var("NO_PROXY", "localhost,127.0.0.1,::1");
+        std::env::set_var("no_proxy", "localhost,127.0.0.1,::1");
     }
 
     // Configure SSH to skip system config files: inside the user namespace,
