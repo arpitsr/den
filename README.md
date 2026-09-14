@@ -83,10 +83,50 @@ different project — see "When to grow it" below.
 ## Prereqs
 
 Linux with FUSE available (`fusermount3` or `fusermount` on `PATH` — the same
-runtime requirement agentfs has). macOS is not supported (no sandbox path; the
-binary bails with a clear message).
+runtime requirement agentfs has) for the sandboxed runner. macOS is supported
+in *process-runner* mode only (see `den serve` below): the sandbox paths bail
+with a clear message, headless serve runs agents as plain children.
 
 Any agent CLI you wrap must already be installed and authed on your `PATH`.
+
+## den serve — durable sessions over HTTP
+
+`den serve` runs sessions as supervised children behind an authenticated HTTP
+API — the same lifecycle the CLI uses, reachable from scripts, CI, or a UI.
+
+```bash
+export DEN_API_TOKEN=$(openssl rand -hex 24)   # required; refuses to listen without it
+den serve                                      # binds 127.0.0.1:8520
+```
+
+```bash
+curl -s -H "Authorization: Bearer $DEN_API_TOKEN" localhost:8520/v1/health
+SID=$(curl -s -XPOST -H "Authorization: Bearer $DEN_API_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"profile":"claude","seed_git":"https://github.com/you/repo"}' \
+  localhost:8520/v1/sessions | jq -r .sid)
+curl -s -XPOST -H "Authorization: Bearer $DEN_API_TOKEN" \
+  -d '{"prompt":"refactor auth"}' localhost:8520/v1/sessions/$SID/runs   # launch a turn
+```
+
+Routes (`/v1`): `POST/GET /sessions`, `GET/DELETE /sessions/{sid}`,
+`POST /sessions/{sid}/attach|stop|push`, `GET /sessions/{sid}/files`,
+`POST/GET /sessions/{sid}/runs`, `GET /runs/{rid}`, `GET /runs/{rid}/log`,
+`POST /runs/{rid}/kill`, `POST/GET /keys`. Minted `dk_…` keys are scoped to
+their owner and stored hashed; foreign sessions 404.
+
+| Env | Meaning | Default |
+|---|---|---|
+| `DEN_API_TOKEN` | root bearer token (required) | — |
+| `DEN_BIND` | listen address | `127.0.0.1:8520` |
+| `DEN_MAX_RUNS` | concurrent child runs | 8 |
+| `DEN_RUNNER` | isolation backend: `process` or `sandbox` | `process` |
+| `DEN_REGISTRY_URL` | registry backend (`sqlite://path`) | local platform.db |
+
+Isolation is pluggable: `DEN_RUNNER=process` (the default, portable — plain
+children with their own process group, works on macOS/CI/Docker) or
+`sandbox` (the Linux FUSE + namespace backend this repo is built around).
+The registry is a `Store` trait; SQLite ships here.
 
 ## Build & install
 
