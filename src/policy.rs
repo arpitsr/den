@@ -59,8 +59,24 @@ impl PolicySource for FilePolicy {
     }
 }
 
-/// Local policy resolution: built-in defaults + policy file +
-/// DEN_PROXY_ALLOW (comma-separated). File: DEN_PROXY_POLICY if set
+/// User-level egress config: `$XDG_CONFIG_HOME/den/egress.yaml` (default
+/// `~/.config/den/egress.yaml`). Merged above the built-in defaults and
+/// below any explicit/project file, so "hosts I always allow" live in one
+/// place instead of being re-approved per project.
+pub fn user_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            PathBuf::from(home).join(".config")
+        });
+    base.join("den").join("egress.yaml")
+}
+
+/// Local policy resolution: built-in defaults + user config + policy file +
+/// DEN_PROXY_ALLOW (comma-separated). Policy file: DEN_PROXY_POLICY if set
 /// (explicit — unreadable fails closed), else den-egress.yaml in the
 /// project dir if present (the proxy inherits den's cwd). Base that a
 /// cloud source merges over.
@@ -71,6 +87,13 @@ pub fn local() -> Arc<dyn PolicySource> {
             // Static asset; a parse failure here is a build-time bug.
             let mut p: EgressPolicy =
                 serde_yaml::from_str(DEFAULT_YAML).expect("default-egress.yaml");
+            // User config: missing is normal; unreadable/unparseable fails
+            // closed (merge is skipped, so the project file's entries do not
+            // silently take effect while the user's deny list is ignored).
+            let up = user_path();
+            if up.exists() {
+                p.merge(FilePolicy(up).policy()?);
+            }
             if let Ok(f) = std::env::var("DEN_PROXY_POLICY") {
                 p.merge(FilePolicy(f.into()).policy()?);
             } else {
@@ -93,15 +116,23 @@ pub fn local() -> Arc<dyn PolicySource> {
     Arc::new(Local)
 }
 
-/// Append `host` to the allow list of the user's egress policy file
-/// (DEN_PROXY_POLICY, else ./den-egress.yaml in the project dir), creating
-/// it if needed. Returns the file written so the caller can tell the user.
-/// Existing comments/structure are preserved; the entry is appended to the
-/// `allow:` list (or a new one is added).
+/// Append `host` to the user's egress policy file so the approval applies
+/// everywhere, not just this project: DEN_PROXY_POLICY if set (explicit
+/// override), else `$XDG_CONFIG_HOME/den/egress.yaml`, creating it (and
+/// parent dirs) if needed. Existing comments/structure are preserved; the
+/// entry is appended to the `allow:` list (or a new one is added).
+/// Returns the file written so the caller can tell the user.
 pub fn persist_allow(host: &str) -> Result<PathBuf> {
     let path = match std::env::var("DEN_PROXY_POLICY") {
         Ok(f) => PathBuf::from(f),
-        Err(_) => std::env::current_dir()?.join("den-egress.yaml"),
+        Err(_) => {
+            let p = user_path();
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("create {}", dir.display()))?;
+            }
+            p
+        }
     };
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
@@ -149,6 +180,9 @@ pub fn persist_allow(host: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that set process-global env (XDG_CONFIG_HOME).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn embedded_default_parses() {
         let p: EgressPolicy = serde_yaml::from_str(DEFAULT_YAML).unwrap();
@@ -177,5 +211,34 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(p.allow, ["a.com"]);
         assert_eq!(p.deny, ["b.a.com"]);
+    }
+
+    #[test]
+    fn user_config_merges_over_defaults() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("den-user-cfg-{}", std::process::id()));
+        let cfg = dir.join("den");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("egress.yaml"), "allow: [user-example.com]").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let p = local().policy().unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(p.allows("api.anthropic.com")); // default floor still there
+        assert!(p.allows("user-example.com"));
+    }
+
+    #[test]
+    fn broken_user_config_fails_closed() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("den-user-cfg-bad-{}", std::process::id()));
+        let cfg = dir.join("den");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("egress.yaml"), "allow: {not: a_list}").unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let r = local().policy();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(r.is_err(), "bad user egress.yaml must fail closed");
     }
 }
