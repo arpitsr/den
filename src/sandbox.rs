@@ -944,12 +944,19 @@ fn run_sandbox_child(
         // stub-resolv.conf), which step 4 just replaced with an empty
         // tmpfs: the parents were recreated above but the file itself is
         // gone, and bind-mounting onto a missing path fails with ENOENT.
-        // Touch the path first without truncating it: on non-systemd
-        // hosts the target is the host's /etc/resolv.conf (same
-        // filesystem, still writable here), so File::create would empty
-        // the host file if the bind below failed. If the touch fails
-        // the bind below reports the real error.
-        if !target.exists() {
+        // Touch the path first without truncating it, but only when it
+        // lives on one of the private tmpfs trees mounted in step 4
+        // (/run, /tmp, /var/tmp): there the touch is invisible to the
+        // host. Anything else (e.g. a regular /etc/resolv.conf on
+        // non-systemd hosts, same filesystem and still writable here)
+        // must already exist — never create it, just let the bind below
+        // report the real error. If the touch fails the bind below
+        // reports the real error.
+        if !target.exists()
+            && (target.starts_with("/run")
+                || target.starts_with("/tmp")
+                || target.starts_with("/var/tmp"))
+        {
             let _ = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
