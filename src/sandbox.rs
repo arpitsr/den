@@ -944,9 +944,18 @@ fn run_sandbox_child(
         // stub-resolv.conf), which step 4 just replaced with an empty
         // tmpfs: the parents were recreated above but the file itself is
         // gone, and bind-mounting onto a missing path fails with ENOENT.
-        // Touch it first (a dangling-symlink fallback is resolved by the
-        // create); if this fails the bind below reports the real error.
-        let _ = fs::File::create(target);
+        // Touch the path first without truncating it: on non-systemd
+        // hosts the target is the host's /etc/resolv.conf (same
+        // filesystem, still writable here), so File::create would empty
+        // the host file if the bind below failed. If the touch fails
+        // the bind below reports the real error.
+        if !target.exists() {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(target);
+        }
         let src_cstr = path_to_cstring(src, "resolv.conf path");
         let dst_cstr = path_to_cstring(target, "resolv.conf target");
         // SAFETY: bind-mount a regular file onto the resolv.conf target.
@@ -1255,8 +1264,15 @@ fn setup_dev() {
 fn bind_mount_fd(fd: libc::c_int, dst: &str) {
     let src = CString::new(format!("/proc/self/fd/{}", fd)).unwrap();
     let dst_cstr = CString::new(dst).unwrap();
-    // Create a placeholder file so the bind mount has a target.
-    let _ = fs::File::create(dst);
+    // Create a placeholder file so the bind mount has a target (without
+    // truncating an existing file).
+    if !Path::new(dst).exists() {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dst);
+    }
     // SAFETY: bind-mount with valid fd path and destination path.
     unsafe {
         let _ = libc::mount(
