@@ -64,8 +64,10 @@ mod mount;
 mod policy;
 mod proxy;
 pub(crate) mod push;
+mod registry;
 #[cfg(target_os = "linux")]
 mod sandbox;
+mod serve;
 
 #[derive(Clone)]
 struct Profile {
@@ -689,6 +691,9 @@ fn git_seed_ctx(dir: &Path) -> Option<GitSeedCtx> {
     if toplevel.is_empty() {
         return None;
     }
+    // A temp clone (from --seed-git) has a git dir but no meaningful
+    // "prefix" story beyond "" — treat it like a repo root, which is what a
+    // fresh clone always is.
     Some(GitSeedCtx {
         toplevel: PathBuf::from(toplevel),
         prefix: run(&["rev-parse", "--show-prefix"]).unwrap_or_default(),
@@ -809,7 +814,44 @@ struct ResolvedSeed {
 /// worktree is dirty and the user declines the dirt. `.git` is always seeded
 /// when the seed dir is the repo root — clean, dirty-and-accepted, or
 /// HEAD-extracted — so the agent sees diff/log/history either way.
+/// Clone a git URL to a fresh temp dir for --seed-git. Runs host-side (den
+/// itself), so the URL's embedded credentials never reach the agent. The
+/// caller seeds from the clone and cleans it up like any temp seed dir.
+fn clone_git_seed(url: &str) -> Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("den-seed-git-{}-{nanos}", std::process::id()));
+    let status = Command::new("git")
+        .args(["clone", "--depth", "1", url])
+        .arg(&tmp)
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| "seed-git: git not available")?;
+    anyhow::ensure!(
+        status.success(),
+        "seed-git: clone of {url} failed (check the URL and credentials)"
+    );
+    Ok(tmp)
+}
+
 fn resolve_seed_source(dir: &Path, mode: DirtyMode) -> Result<ResolvedSeed> {
+    // A URL instead of a path: host-side clone, agent sees only the sanitized
+    // copy (embedded credentials never cross into the session).
+    if let Some(url) = dir
+        .to_str()
+        .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+    {
+        let tmp = clone_git_seed(url)?;
+        return Ok(ResolvedSeed {
+            src: tmp.clone(),
+            git_dir: Some(tmp.join(".git")),
+            note: None,
+            temp: true,
+            head_sha: None,
+        });
+    }
     let fallback = |note: Option<String>| ResolvedSeed {
         src: dir.to_path_buf(),
         git_dir: None,
@@ -890,24 +932,33 @@ pub(crate) async fn snapshot_fs(agent: &AgentFS) -> HashMap<String, (i64, u32, i
     out
 }
 
-/// compact post-run summary: what this run touched in the virtual FS
-/// (added/modified/removed vs the pre-run snapshot) + capped listing
-async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
-    if std::env::var("DEN_QUIET").as_deref() == Ok("1") {
-        return Ok(());
-    }
-    let agent = match open_session(sid).await {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(()), // no session DB — nothing to summarize
-        Err(e) => {
-            eprintln!("\nagentfs: {e}");
-            return Ok(());
-        }
-    };
+/// what one run touched in the session's virtual FS: sorted path lists so
+/// CLI output and API JSON are stable (platform-api.md §9)
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct RunDelta {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+fn sorted(set: HashSet<String>) -> Vec<String> {
+    let mut v: Vec<_> = set.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Diff the pre-run snapshot against the session's current state.
+/// Shared by the CLI summary and the platform API — errors propagate; the
+/// CLI's no-session/open-error soft-handling stays in print_run_summary.
+pub(crate) async fn diff_run_snap(
+    sid: &str,
+    agent: &AgentFS,
+    before: &RunSnap,
+) -> Result<RunDelta> {
     // (kind, path) triples: "+" added, "M" modified, "-" removed
     let (added, modified, removed) = match before {
         RunSnap::Legacy(b) => {
-            let after = snapshot_fs(&agent).await;
+            let after = snapshot_fs(agent).await;
             let added: HashSet<String> = after
                 .keys()
                 .filter(|k| !b.contains_key(*k))
@@ -926,7 +977,7 @@ async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
             (added, modified, removed)
         }
         RunSnap::Layered(b) => {
-            let after = delta_snapshot(&agent).await?;
+            let after = delta_snapshot(agent).await?;
             // Base attrs tell copy-ups from new files and no-ops from edits:
             // a delta entry whose attrs match the base is an unmodified
             // copy-up (mtime preserved), not a change.
@@ -976,6 +1027,32 @@ async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
             (added, modified, removed)
         }
     };
+    Ok(RunDelta {
+        added: sorted(added),
+        modified: sorted(modified),
+        removed: sorted(removed),
+    })
+}
+
+/// compact post-run summary: what this run touched in the virtual FS
+/// (added/modified/removed vs the pre-run snapshot) + capped listing
+async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
+    if std::env::var("DEN_QUIET").as_deref() == Ok("1") {
+        return Ok(());
+    }
+    let agent = match open_session(sid).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(()), // no session DB — nothing to summarize
+        Err(e) => {
+            eprintln!("\nagentfs: {e}");
+            return Ok(());
+        }
+    };
+    let RunDelta {
+        added,
+        modified,
+        removed,
+    } = diff_run_snap(sid, &agent, before).await?;
     eprintln!(
         "\nden: session {sid} — {} added, {} modified, {} removed this run",
         added.len(),
@@ -1042,8 +1119,27 @@ async fn base_key_meta(
 /// share one base. Reuses the existing seed machinery verbatim
 /// (resolve_seed_source / seed_session / scrub_git_config — the credential
 /// scrub now runs once per base instead of per session).
-async fn prepare_base(seed: &Path, dirty: DirtyMode) -> Result<PreparedBase> {
-    let rs = resolve_seed_source(seed, dirty)?;
+/// Removes a temp seed source when dropped — a --seed-git clone (or HEAD
+/// extract) must never outlive the run, on any exit path (early `?`, lock
+/// deadline, panic). `disarm()` on success handoff.
+struct TempSeedGuard(PathBuf);
+
+impl Drop for TempSeedGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn prepare_base(seed: &Path, dirty: DirtyMode, temp_seed: bool) -> Result<PreparedBase> {
+    let mut rs = resolve_seed_source(seed, dirty)?;
+    if temp_seed {
+        rs.temp = true;
+    }
+    let _temp_guard = if rs.temp {
+        Some(TempSeedGuard(rs.src.clone()))
+    } else {
+        None
+    };
     let digest = layer::worktree_digest(&rs.src)?;
     let key = layer::base_key(
         rs.git_dir.is_some(),
@@ -1082,11 +1178,6 @@ async fn prepare_base(seed: &Path, dirty: DirtyMode) -> Result<PreparedBase> {
         let opts = AgentFSOptions::with_path(db.to_string_lossy().to_string());
         let agent = AgentFS::open(opts).await.context("create base DB")?;
         let seeded = seed_session(&agent, &rs.src, rs.git_dir.as_deref()).await;
-        if rs.temp {
-            // Clean up whether seeding succeeded or failed — a `?` would
-            // otherwise leak the HEAD-extract temp dir.
-            let _ = std::fs::remove_dir_all(&rs.src);
-        }
         let n = seeded?;
         eprintln!(
             "den: seeded base {key} with {n} entries from {}",
@@ -1272,21 +1363,26 @@ async fn snapshot_merged(session_dir: &Path) -> Result<HashMap<String, (i64, u32
     Ok(merged)
 }
 
+/// `temp_seed`: the seed dir is a temp clone (`--seed-git`) — prepare_base
+/// removes it after seeding instead of leaking it in /tmp.
 fn cmd_run(
-    profile_name: &str,
+    argv: Vec<String>,
     sid: &str,
-    passthrough: &[String],
     autostart: bool,
     auto_out: Option<PathBuf>,
     seed: Option<PathBuf>,
     dirty: DirtyMode,
+    temp_seed: bool,
 ) -> Result<i32> {
+    // Allows policy is keyed by the command name (argv[0]) — known agents
+    // get extra host dirs kept writable; unknown names run bare.
+    let profile_name = argv[0].clone();
     // full-vfs: layered sessions mount base+delta (§3); the delta starts
     // empty and holds only the session's changes. Legacy mode (DEN_LAYER=0,
     // or a pre-layer session dir without a `base` file) seeds fs.db itself.
     let db = session_db_path(sid)?;
     let fresh = !db.exists();
-    let allows = effective_allows(&profile(profile_name));
+    let allows = effective_allows(&profile(&profile_name));
     // Nested runs (§7 step 2): no --seed — the subagent inherits the outer
     // session's pinned base (its delta lives inside the outer VFS at
     // <cwd>/.den/<sid>/fs.db).
@@ -1303,6 +1399,7 @@ fn cmd_run(
         Some(block_on(prepare_base(
             seed.as_deref().context("seed dir")?,
             dirty,
+            temp_seed,
         ))??)
     } else {
         None
@@ -1390,7 +1487,7 @@ fn cmd_run(
         };
         anyhow::Ok(snap)
     })??;
-    let mut argv = build_argv(profile_name, passthrough)?;
+    let mut argv = argv;
     // Resolve the command on the host PATH before entering the sandbox, so a
     // file created in the overlay (e.g. a previous run's fake `bin/pi`) can't
     // shadow the real agent binary via PATH ordering inside the sandbox.
@@ -1427,18 +1524,21 @@ fn cmd_run(
 /// agent): `--seed <dir>` and `--seed-dirty <mode>` always, `--autostart
 /// [--out <base.ltx>]` only when --autostart is present, so plain agent args
 /// are never eaten.
-fn split_run_args(
-    rest: &[String],
-) -> (
-    bool,
-    Option<PathBuf>,
-    Option<PathBuf>,
-    Option<String>,
-    Vec<String>,
-) {
+#[derive(Debug, Default, PartialEq)]
+struct SplitRunArgs {
+    autostart: bool,
+    out: Option<PathBuf>,
+    seed: Option<PathBuf>,
+    git: Option<String>,
+    dirty: Option<String>,
+    passthrough: Vec<String>,
+}
+
+fn split_run_args(rest: &[String]) -> SplitRunArgs {
     let autostart = rest.iter().any(|a| a == "--autostart");
     let mut out = None;
     let mut seed = None;
+    let mut git = None;
     let mut dirty = None;
     let mut pass = Vec::new();
     let mut i = 0;
@@ -1446,6 +1546,10 @@ fn split_run_args(
         match rest[i].as_str() {
             "--seed" if rest.get(i + 1).is_some() => {
                 seed = Some(PathBuf::from(&rest[i + 1]));
+                i += 1;
+            }
+            "--seed-git" if rest.get(i + 1).is_some() => {
+                git = Some(rest[i + 1].clone());
                 i += 1;
             }
             "--seed-dirty" if rest.get(i + 1).is_some() => {
@@ -1461,7 +1565,14 @@ fn split_run_args(
         }
         i += 1;
     }
-    (autostart, out, seed, dirty, pass)
+    SplitRunArgs {
+        autostart,
+        out,
+        seed,
+        git,
+        dirty,
+        passthrough: pass,
+    }
 }
 
 /// Spawn a detached `den` subcommand for this session: stdin null, output to
@@ -1786,7 +1897,7 @@ fn cmd_dump(profile_name: &str, passthrough: &[String]) -> Result<()> {
     let sid = session_id(profile_name);
     // Run strips den's own flags (--seed/--seed-dirty/--autostart...); dump
     // must preview the same argv the agent will actually get.
-    let (_, _, _, _, passthrough) = split_run_args(passthrough);
+    let passthrough = split_run_args(passthrough).passthrough;
     let mut argv = build_argv(profile_name, &passthrough)?;
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
     let allows = effective_allows(&profile(profile_name));
@@ -1999,6 +2110,144 @@ fn cmd_rm(sid: &str) -> Result<()> {
     Ok(())
 }
 
+/// `den attach <sid>` — open the dex TUI against a running daemon session.
+/// Reads `<session>/attach.json` (written by POST /v1/sessions/:sid/attach)
+/// and execs `dex connect <url> --reattach <sid>` with the session-scoped
+/// token; exec replaces this process, so the TUI owns the terminal.
+fn cmd_attach(rest: &[String]) -> Result<()> {
+    let sid = rest
+        .first()
+        .filter(|s| *s != "--select")
+        .context("den attach <session-id>")?;
+    valid_sid(sid)?;
+    let path = crate::serve::attach_info_path(sid)?;
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no attach info for {sid} — launch it first: POST /v1/sessions/{sid}/attach (kind=daemon session)"
+        )
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&raw).context("parse attach.json")?;
+    let port = v
+        .get("port")
+        .and_then(|p| p.as_i64())
+        .context("attach.json: missing port")?;
+    let token = v
+        .get("token")
+        .and_then(|t| t.as_str())
+        .context("attach.json: missing token")?
+        .to_string();
+    let url = format!("http://127.0.0.1:{port}");
+    let mut cmd = Command::new(resolve_bin("dex"));
+    cmd.arg("connect")
+        .arg(&url)
+        .arg("--reattach")
+        .arg(sid)
+        .env("DEX_DAEMON_TOKEN", token);
+    let err = cmd.exec();
+    Err(err).with_context(|| format!("exec dex connect {url}"))
+}
+
+/// [--out <base.ltx>]] -- <cmd> [args...]` — the runtime's stable verb for -- <cmd> [args...]` — the runtime's stable verb for
+/// platform-driven launches (docs/runtime-contract.md): same prepare/run/
+/// reap path as a normal run, but the command argv after `--` is taken
+/// verbatim (no profile argv assembly — the caller owns that) and the
+/// session id is explicit. Host-PATH resolution stays here (den), so a
+/// file planted in the session overlay can't shadow the real agent binary.
+fn cmd_exec(rest: &[String]) -> Result<i32> {
+    let (sid, autostart, auto_out, seed, seed_git, dirty_raw, argv) = parse_exec_args(rest)?;
+    valid_sid(&sid)?;
+    let dirty = match dirty_raw.as_deref() {
+        None => DirtyMode::Ask,
+        Some(s) => parse_dirty_mode(s)?,
+    };
+    let seed = match (seed, seed_git.as_deref()) {
+        (Some(_), Some(_)) => bail!("--seed and --seed-git are exclusive"),
+        (Some(s), None) => Some(s),
+        (None, Some(url)) => Some(clone_git_seed(url)?),
+        (None, None) => None,
+    };
+    cmd_run(
+        argv,
+        &sid,
+        autostart,
+        auto_out,
+        seed,
+        dirty,
+        seed_git.is_some(),
+    )
+}
+
+/// (sid, autostart, autostart --out, --seed, --seed-git, --seed-dirty, command argv)
+type ExecParse = (
+    String,
+    bool,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+);
+
+/// Strict parser for `den exec`: everything before ` -- ` must be a known
+/// den flag; everything after is the command, never flag-stripped.
+fn parse_exec_args(rest: &[String]) -> Result<ExecParse> {
+    let mut sid = None;
+    let mut autostart = false;
+    let mut out = None;
+    let mut seed = None;
+    let mut git = None;
+    let mut dirty = None;
+    let mut cmd: Option<Vec<String>> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--session" => {
+                sid = Some(rest.get(i + 1).context("--session needs a value")?.clone());
+                i += 2;
+            }
+            "--seed" => {
+                seed = Some(PathBuf::from(
+                    rest.get(i + 1).context("--seed needs a dir")?.clone(),
+                ));
+                i += 2;
+            }
+            "--seed-git" => {
+                git = Some(rest.get(i + 1).context("--seed-git needs a url")?.clone());
+                i += 2;
+            }
+            "--seed-dirty" => {
+                dirty = Some(
+                    rest.get(i + 1)
+                        .context("--seed-dirty needs a mode")?
+                        .clone(),
+                );
+                i += 2;
+            }
+            "--autostart" => {
+                autostart = true;
+                i += 1;
+            }
+            "--out" if autostart => {
+                out = Some(PathBuf::from(
+                    rest.get(i + 1).context("--out needs a path")?.clone(),
+                ));
+                i += 2;
+            }
+            "--" => {
+                cmd = Some(rest[i + 1..].to_vec());
+                break;
+            }
+            other => bail!("den exec: unexpected argument '{other}' before ' -- '"),
+        }
+    }
+    let sid = sid.context("--session <sid> is required")?;
+    let cmd = cmd.context("den exec requires ' -- ' before the command")?;
+    if cmd.is_empty() {
+        bail!("den exec: empty command after ' -- '");
+    }
+    Ok((sid, autostart, out, seed, git, dirty, cmd))
+}
+
 fn cmd_selftest(rest: &[String]) -> Result<()> {
     if rest.iter().any(|a| a == "--sandbox") {
         selftest_sandbox()?;
@@ -2185,7 +2434,7 @@ fn selftest_layered() -> Result<()> {
 
         // Fresh layered session: base seeded once, delta starts empty.
         let (prep, before) = block_on(async {
-            let p = prepare_base(&dir, DirtyMode::All).await?;
+            let p = prepare_base(&dir, DirtyMode::All, false).await?;
             create_layered_session(&sid, &p).await?;
             let delta = open_session(&sid).await?.context("delta DB")?;
             anyhow::Ok((p, delta_snapshot(&delta).await?))
@@ -2196,7 +2445,7 @@ fn selftest_layered() -> Result<()> {
         check_sandbox(before.tombstones.is_empty(), true, "fresh tombstones empty")?;
 
         // Identical seed again → the SAME base is reused (key = content id).
-        let prep2 = block_on(prepare_base(&dir, DirtyMode::All))??;
+        let prep2 = block_on(prepare_base(&dir, DirtyMode::All, false))??;
         check_sandbox(
             prep2.db_path == prep.db_path,
             true,
@@ -2372,6 +2621,9 @@ fn usage() -> String {
      den restore <file.ltx> [--to db]  apply an LTX backup (and chain) back into a session\n  \
      den ltx <file.ltx>         inspect/verify a backup file\n  \
      den list                     list known profiles (any other cmd works too)\n  \
+     den attach <sid>             open the dex TUI against a running daemon session\n  \
+     den exec --session <sid> -- <cmd>...   run a command in a session (runtime verb;\n  \
+                                  docs/runtime-contract.md)\n  \
      den selftest                 sanity check\n\n\
 env: DEN_NET=proxy|none|full  DEN_PROXY_ALLOW/DEN_PROXY_POLICY  DEN_HIDE/DEN_NO_HIDE  DEN_LIMIT_*  DEN_SECCOMP\n"
         .to_string()
@@ -2429,6 +2681,12 @@ fn main() -> Result<()> {
             }
             backup::cmd_ltx_info(Path::new(path))
         }
+        [c] if c == "serve" => crate::serve::cmd_serve(),
+        [c, rest @ ..] if c == "exec" => {
+            let code = cmd_exec(rest)?;
+            std::process::exit(code)
+        }
+        [c, rest @ ..] if c == "attach" => cmd_attach(rest),
         // Internal: the sandbox proxy child (spawned by M with fd 3 as the
         // listener). Not a user-facing command.
         [c] if c == "proxy" => {
@@ -2462,10 +2720,20 @@ fn main() -> Result<()> {
         }
         [pname, passthrough @ ..] => {
             // "run" is not a command name; the run is implicit (`den claude`).
+            // exec/serve/attach ARE commands now — they're caught above; the
+            // message below is only for `run` (and safety for future names).
             if pname == "run" {
                 bail!("den run isn't a command — the run is implicit: den <cmd> [args...]");
             }
-            let (autostart, auto_out, seed, dirty_raw, passthrough) = split_run_args(passthrough);
+            let args = split_run_args(passthrough);
+            let SplitRunArgs {
+                autostart,
+                out: auto_out,
+                seed,
+                git: seed_git,
+                dirty: dirty_raw,
+                passthrough,
+            } = args;
             let dirty = match dirty_raw.as_deref() {
                 None => DirtyMode::Ask,
                 Some(s) => parse_dirty_mode(s)?,
@@ -2473,7 +2741,24 @@ fn main() -> Result<()> {
             let sid = session_id(pname);
             let allows = effective_allows(&profile(pname));
             drop_stale_session(&sid, &allows)?;
-            let code = cmd_run(pname, &sid, &passthrough, autostart, auto_out, seed, dirty)?;
+            let argv = build_argv(pname, &passthrough)?;
+            // --seed-git: clone to a temp dir, seed from the clone (den-side,
+            // so the agent never sees git credentials)
+            let seed = match (seed, seed_git.as_deref()) {
+                (Some(_), Some(_)) => bail!("--seed and --seed-git are exclusive"),
+                (Some(s), None) => Some(s),
+                (None, Some(url)) => Some(clone_git_seed(url)?),
+                (None, None) => None,
+            };
+            let code = cmd_run(
+                argv,
+                &sid,
+                autostart,
+                auto_out,
+                seed,
+                dirty,
+                seed_git.is_some(),
+            )?;
             std::process::exit(code);
         }
     }
@@ -2723,6 +3008,44 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn exec_parse_requires_session_and_separator() {
+        let s = |v: &str| String::from(v);
+        // --session is required
+        assert!(parse_exec_args(&[]).is_err());
+        // -- separator is required, and the command must be non-empty
+        assert!(parse_exec_args(&[s("--session"), s("s1")]).is_err());
+        assert!(parse_exec_args(&[s("--session"), s("s1"), s("--")]).is_err());
+        // unknown den flags before -- are rejected, never eaten silently
+        assert!(parse_exec_args(&[s("--session"), s("s1"), s("--wat"), s("--"), s("sh")]).is_err());
+        let (sid, autostart, out, seed, _, dirty, cmd) = parse_exec_args(&[
+            s("--session"),
+            s("s1"),
+            s("--seed"),
+            s("/repo"),
+            s("--seed-dirty"),
+            s("all"),
+            s("--autostart"),
+            s("--out"),
+            s("base.ltx"),
+            s("--"),
+            s("codex"),
+            s("exec"),
+            s("hi"),
+        ])
+        .unwrap();
+        assert_eq!(sid, "s1");
+        assert!(autostart);
+        assert_eq!(out, Some(PathBuf::from("base.ltx")));
+        assert_eq!(seed, Some(PathBuf::from("/repo")));
+        assert_eq!(dirty.as_deref(), Some("all"));
+        assert_eq!(cmd, vec!["codex", "exec", "hi"]);
+        // missing flag values are errors
+        assert!(
+            parse_exec_args(&[s("--session"), s("s1"), s("--seed"), s("--"), s("sh")]).is_err()
+        );
+    }
+
+    #[test]
     fn session_rows_include_numbered_choices() {
         let rows = vec![
             SessionRow {
@@ -2781,22 +3104,39 @@ mod tests {
     fn split_run_args_extracts_autostart() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        let (auto, out, seed, dirty, pass) =
-            split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
+        let SplitRunArgs {
+            autostart: auto,
+            out,
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--autostart", "--out", "s.ltx", "-y"]));
         assert!(auto);
         assert_eq!(out.unwrap().to_str().unwrap(), "s.ltx");
         assert!(seed.is_none() && dirty.is_none());
         assert_eq!(pass, v(&["-y"]));
 
         // without --autostart, --out is not stripped (but --seed always is)
-        let (auto, out, seed, dirty, pass) = split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
+        let SplitRunArgs {
+            autostart: auto,
+            out,
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--out", "s.ltx", "--seed", "."]));
         assert!(!auto && out.is_none());
         assert_eq!(seed.unwrap().to_str().unwrap(), ".");
         assert!(dirty.is_none());
         assert_eq!(pass, v(&["--out", "s.ltx"]));
 
         // flags may come after positional args
-        let (auto, _, _, _, pass) = split_run_args(&v(&["-y", "--autostart"]));
+        let SplitRunArgs {
+            autostart: auto,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["-y", "--autostart"]));
         assert!(auto);
         assert_eq!(pass, v(&["-y"]));
     }
@@ -2805,15 +3145,51 @@ mod tests {
     fn split_run_args_extracts_seed_dirty() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
 
-        let (_, _, seed, dirty, pass) =
-            split_run_args(&v(&["--seed", ".", "--seed-dirty", "all", "-y"]));
+        let SplitRunArgs {
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed", ".", "--seed-dirty", "all", "-y"]));
         assert_eq!(seed.unwrap().to_str().unwrap(), ".");
         assert_eq!(dirty.as_deref(), Some("all"));
         assert_eq!(pass, v(&["-y"]));
 
         // --seed-dirty without --seed is still stripped (harmless, ignored later)
-        let (_, _, seed, dirty, pass) = split_run_args(&v(&["--seed-dirty", "head", "task"]));
+        let SplitRunArgs {
+            seed,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed-dirty", "head", "task"]));
         assert!(seed.is_none() && dirty.as_deref() == Some("head"));
+        assert_eq!(pass, v(&["task"]));
+    }
+
+    #[test]
+    fn split_run_args_extracts_seed_git() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        let SplitRunArgs {
+            seed,
+            git,
+            dirty,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed-git", "https://github.com/x/y", "-y"]));
+        assert!(seed.is_none());
+        assert_eq!(git.as_deref(), Some("https://github.com/x/y"));
+        assert!(dirty.is_none());
+        assert_eq!(pass, v(&["-y"]));
+
+        // --seed-git strips itself like --seed; unknown flags pass through
+        let SplitRunArgs {
+            seed,
+            git,
+            passthrough: pass,
+            ..
+        } = split_run_args(&v(&["--seed-git", "git@host:org/repo.git", "task"]));
+        assert!(seed.is_none() && git.is_some());
         assert_eq!(pass, v(&["task"]));
     }
 
