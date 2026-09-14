@@ -73,7 +73,7 @@ fn dex_journal_path(sid: &str) -> String {
 }
 
 /// platform.db sits next to the sessions root: ~/.den/platform.db
-fn platform_db_path() -> Result<std::path::PathBuf> {
+pub(crate) fn platform_db_path() -> Result<std::path::PathBuf> {
     Ok(sessions_root()?
         .parent()
         .context("den state dir")?
@@ -171,62 +171,111 @@ fn key_hash(token: &str) -> String {
         .collect()
 }
 
+fn bearer_token(req: &Request) -> Option<String> {
+    req.headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
+/// Token -> context, shared by both transports. Root token = DEN_API_TOKEN;
+/// anything else must be a live minted `dk_...` key.
+// Response<Body> is bulky; boxing the error would touch every call site.
+#[allow(clippy::result_large_err)]
+async fn authorize_token(st: &Arc<ServeState>, token: &str) -> Result<AuthContext, Response> {
+    if ct_eq(token, &st.token) {
+        return Ok(AuthContext {
+            owner: "root".into(),
+            root: true,
+            max_concurrent: None,
+        });
+    }
+    let hash = key_hash(token);
+    match reg(&st.reg, move |r| r.find_key(&hash)).await {
+        Ok(Some(k)) if k.revoked_at.is_none() => {
+            // Caps never escalate: a key row can't raise the serve-wide
+            // limit, only lower it for that key.
+            Ok(AuthContext {
+                owner: k.owner,
+                root: false,
+                max_concurrent: k
+                    .max_concurrent
+                    .map(|c| c.min(st.max_runs as i64))
+                    .filter(|c| *c >= 0),
+            })
+        }
+        _ => Err(err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "unknown or revoked key",
+        )),
+    }
+}
+
 async fn auth_mw(
     State(st): State<Arc<ServeState>>,
     mut req: Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(token) = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|s| s.to_string())
-    else {
+    let Some(token) = bearer_token(&req) else {
         return err_json(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "missing bearer token",
         );
     };
-    let ctx = if ct_eq(&token, &st.token) {
-        AuthContext {
-            owner: "root".into(),
-            root: true,
-            max_concurrent: None,
-        }
-    } else {
-        let hash = key_hash(&token);
-        match reg(&st.reg, move |r| r.find_key(&hash)).await {
-            Ok(Some(k)) if k.revoked_at.is_none() => {
-                // Caps never escalate: a key row can't raise the serve-wide
-                // limit, only lower it for that key.
-                AuthContext {
-                    owner: k.owner,
-                    root: false,
-                    max_concurrent: k
-                        .max_concurrent
-                        .map(|c| c.min(st.max_runs as i64))
-                        .filter(|c| *c >= 0),
-                }
-            }
-            _ => {
-                return err_json(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "unknown or revoked key",
-                )
-            }
-        }
+    let ctx = match authorize_token(&st, &token).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
     };
     req.extensions_mut().insert(ctx);
     next.run(req).await
 }
 
+/// Local-socket middleware: SO_PEERCRED creds were injected per-connection
+/// by serve_unix() (docs/socket-daemon.md). Same-uid peers are root; a
+/// presented bearer key is honored first and may narrow the context.
+async fn auth_mw_socket(
+    State(st): State<Arc<ServeState>>,
+    mut req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Some(token) = bearer_token(&req) {
+        let ctx = match authorize_token(&st, &token).await {
+            Ok(c) => c,
+            Err(resp) => return resp,
+        };
+        req.extensions_mut().insert(ctx);
+        return next.run(req).await;
+    }
+    let creds = req.extensions().get::<tokio::net::unix::UCred>().copied();
+    match creds {
+        Some(c) if c.uid() == unsafe { libc::geteuid() } => {
+            req.extensions_mut().insert(AuthContext {
+                owner: "root".into(),
+                root: true,
+                max_concurrent: None,
+            });
+            next.run(req).await
+        }
+        Some(_) => err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "socket peer is another user",
+        ),
+        None => err_json(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "no peer credentials",
+        ),
+    }
+}
+
 // ---- routes ----------------------------------------------------------------
 
-fn router(st: Arc<ServeState>) -> Router {
-    let api = Router::new()
+fn api_routes() -> Router<Arc<ServeState>> {
+    Router::new()
         .route("/health", get(health))
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/{sid}", get(get_session).delete(delete_session))
@@ -243,7 +292,24 @@ fn router(st: Arc<ServeState>) -> Router {
         .route("/runs/{rid}", get(get_run))
         .route("/runs/{rid}/log", get(run_log))
         .route("/runs/{rid}/kill", post(kill_run))
+}
+
+/// TCP transport: bearer auth required (docs/socket-daemon.md §2).
+fn router(st: Arc<ServeState>) -> Router {
+    let api = api_routes()
         .layer(axum::middleware::from_fn_with_state(st.clone(), auth_mw))
+        .with_state(st);
+    Router::new().nest("/v1", api)
+}
+
+/// Local transport: SO_PEERCRED is the default context (same uid = root);
+/// a bearer token, if presented, is honored and may narrow it.
+fn socket_router(st: Arc<ServeState>) -> Router {
+    let api = api_routes()
+        .layer(axum::middleware::from_fn_with_state(
+            st.clone(),
+            auth_mw_socket,
+        ))
         .with_state(st);
     Router::new().nest("/v1", api)
 }
@@ -1691,15 +1757,45 @@ async fn kill_run(
 // ---- entry -----------------------------------------------------------------
 
 /// `den serve` — boot sweep, then serve until killed.
-pub fn cmd_serve() -> Result<()> {
-    let token = std::env::var("DEN_API_TOKEN").unwrap_or_default();
-    if token.is_empty() {
-        bail!("DEN_API_TOKEN is required — den serve executes agent CLIs on this host; refusing to listen unauthenticated");
+///
+/// Transports (docs/socket-daemon.md): `--socket PATH` (or DEN_SOCKET) adds
+/// the local unix socket with peercred auth; DEN_API_TOKEN enables the TCP
+/// listener on DEN_BIND. Socket-only mode needs no token; TCP always needs
+/// one — the two are independent.
+pub fn cmd_serve(rest: &[String]) -> Result<()> {
+    let mut socket_arg: Option<PathBuf> = None;
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        if a == "--socket" {
+            socket_arg = Some(PathBuf::from(it.next().context("--socket needs a path")?));
+        } else {
+            bail!("unknown argument to den serve: {a}");
+        }
     }
-    let bind: std::net::SocketAddr = std::env::var("DEN_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8520".into())
-        .parse()
-        .context("DEN_BIND (use [host:]port, default 127.0.0.1:8520)")?;
+    let socket: Option<PathBuf> = socket_arg.or_else(|| {
+        std::env::var("DEN_SOCKET")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+    let token = std::env::var("DEN_API_TOKEN").unwrap_or_default();
+    if socket.is_none() && token.is_empty() {
+        bail!("DEN_API_TOKEN is required (or pass --socket) — den serve executes agent CLIs on this host; refusing to listen unauthenticated");
+    }
+    let bind_env = std::env::var("DEN_BIND").ok().filter(|s| !s.is_empty());
+    if bind_env.is_some() && token.is_empty() {
+        bail!("DEN_BIND requires DEN_API_TOKEN — TCP has no peercred, refusing to listen unauthenticated");
+    }
+    let bind: Option<std::net::SocketAddr> = if token.is_empty() {
+        None
+    } else {
+        Some(
+            bind_env
+                .unwrap_or_else(|| "127.0.0.1:8520".into())
+                .parse()
+                .context("DEN_BIND (use [host:]port, default 127.0.0.1:8520)")?,
+        )
+    };
     let max_runs: usize = std::env::var("DEN_MAX_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1725,13 +1821,83 @@ pub fn cmd_serve() -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(bind)
-            .await
-            .with_context(|| format!("bind {bind}"))?;
-        eprintln!("den serve: listening on {bind} (max_runs={max_runs})");
-        axum::serve(listener, router(st)).await?;
+        let tcp = {
+            let st = st.clone();
+            async move {
+                if let Some(addr) = bind {
+                    let listener = tokio::net::TcpListener::bind(addr)
+                        .await
+                        .with_context(|| format!("bind {addr}"))?;
+                    eprintln!("den serve: listening on {addr} (max_runs={max_runs})");
+                    axum::serve(listener, router(st)).await?;
+                }
+                anyhow::Ok(())
+            }
+        };
+        let sk = {
+            let st = st.clone();
+            async move {
+                match socket {
+                    Some(path) => serve_unix(st, path).await,
+                    None => anyhow::Ok(()),
+                }
+            }
+        };
+        tokio::try_join!(tcp, sk)?;
         anyhow::Ok(())
     })
+}
+
+/// Local transport: accept loop with per-connection hyper http1 service.
+/// Peer credentials are fetched at accept time and injected as request
+/// extensions — auth_mw_socket consumes them (axum has no public
+/// connect-info extractor for unix listeners).
+async fn serve_unix(st: Arc<ServeState>, path: PathBuf) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create socket dir {}", dir.display()))?;
+    }
+    if path.exists() {
+        // Live daemon already there? Refuse rather than steal the socket.
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            bail!("den serve already listening on {}", path.display());
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("remove stale socket {}", path.display()))?;
+    }
+    let listener = tokio::net::UnixListener::bind(&path)
+        .with_context(|| format!("bind {}", path.display()))?;
+    eprintln!("den serve: listening on {}", path.display());
+    let base = socket_router(st);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let creds = stream.peer_cred().ok();
+        let base = base.clone();
+        tokio::spawn(async move {
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let service = hyper::service::service_fn(
+                move |req: axum::http::Request<hyper::body::Incoming>| {
+                    let mut svc = base.clone();
+                    async move {
+                        let (parts, body) = req.into_parts();
+                        let mut req =
+                            axum::http::Request::from_parts(parts, axum::body::Body::new(body));
+                        if let Some(c) = creds {
+                            req.extensions_mut().insert(c);
+                        }
+                        use tower::Service as _;
+                        match svc.call(req).await {
+                            Ok(resp) => Ok::<_, std::convert::Infallible>(resp),
+                            Err(e) => match e {}, // Router error type is Infallible
+                        }
+                    }
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, service)
+                .await;
+        });
+    }
 }
 
 #[cfg(test)]

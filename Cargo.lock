@@ -495,6 +495,8 @@ dependencies = [
  "async-trait",
  "axum",
  "fuser",
+ "hyper",
+ "hyper-util",
  "libc",
  "litetx",
  "rusqlite",
@@ -503,6 +505,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "tokio",
+ "tower",
 ]
 
 [[package]]

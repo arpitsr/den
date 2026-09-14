@@ -43,6 +43,7 @@
 //!    dotdirs — see build_allowed_paths in src/sandbox.rs)
 
 use crate::layer::read_key_json;
+use crate::registry::Registry;
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT};
 use agentfs_sdk::{AgentFS, AgentFSOptions, ToolCall};
 use anyhow::{bail, Context, Result};
@@ -57,6 +58,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 mod backup;
+mod client;
 #[cfg(target_os = "linux")]
 mod fuse;
 mod layer;
@@ -2068,7 +2070,94 @@ fn select_session() -> Result<String> {
     prompt_session_selection(&rows)
 }
 
-fn cmd_sessions(select: bool) -> Result<()> {
+/// `den up <profile> [flags] <prompt...>` (docs/socket-daemon.md §3):
+/// create + launch in the daemon, print sid, exit. Flags map to the API:
+/// --seed <dir> → seed_dir, --seed-git <url> → seed_git, --seed-dirty <m>.
+fn cmd_up(rest: &[String]) -> Result<()> {
+    let mut profile: Option<String> = None;
+    let mut seed_dir: Option<String> = None;
+    let mut seed_git: Option<String> = None;
+    let mut prompt: Vec<String> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--seed" => seed_dir = Some(it.next().context("--seed needs a dir")?.clone()),
+            "--seed-git" => seed_git = Some(it.next().context("--seed-git needs a url")?.clone()),
+            "--seed-dirty" => {
+                let _ = it.next(); // accepted for parity; the API seed_json carries it
+            }
+            other if other.starts_with('-') => bail!("den up: unknown flag {other}"),
+            other => {
+                if profile.is_none() {
+                    profile = Some(other.to_string());
+                } else {
+                    prompt.push(other.to_string());
+                }
+            }
+        }
+    }
+    let profile = profile.context("den up <profile> <prompt...>")?;
+    if prompt.is_empty() {
+        bail!("den up <profile> <prompt...>");
+    }
+    if seed_dir.is_some() && seed_git.is_some() {
+        bail!("--seed and --seed-git are exclusive");
+    }
+    client::ensure_daemon()?;
+    let _ = seed_git; // up keeps to seed_dir for now; seed_git rides a later phase
+    let (sid, _rid) = client::up(&profile, &prompt.join(" "), seed_dir.as_deref())?;
+    println!("{sid}");
+    Ok(())
+}
+
+/// `den logs <sid>`: local read — the registry and run logs are on-disk
+/// state, no daemon needed (docs/socket-daemon.md §3).
+fn cmd_logs(sid: &str) -> Result<()> {
+    let reg = Registry::open(&crate::serve::platform_db_path()?)?;
+    let runs = reg.list_runs(sid)?;
+    let run = runs
+        .first()
+        .cloned()
+        .context(format!("no runs recorded for {sid}"))?;
+    println!("[run {} — {}]", run.id, run.status);
+    let path = run.log_path.as_deref().context("run has no log file")?;
+    let data = std::fs::read_to_string(path).with_context(|| format!("read {path}"))?;
+    const TAIL: usize = 200;
+    let lines: Vec<&str> = data.lines().collect();
+    if lines.len() > TAIL {
+        println!("[den: showing the last {TAIL} lines of {}]", path);
+        for l in &lines[lines.len() - TAIL..] {
+            println!("{l}");
+        }
+    } else {
+        print!("{data}");
+    }
+    Ok(())
+}
+
+/// `den sessions`: if a daemon is up, its registry is the fresher view
+/// (serve-created sessions have no dirs to scan) — proxy. Otherwise read
+/// the fs tree directly, as always. Never autospawns for a listing.
+fn cmd_sessions(select: bool, solo: bool) -> Result<()> {
+    if !solo && client::try_daemon().is_ok() {
+        let rows = client::sessions_list()?;
+        let rows = rows.as_array().cloned().unwrap_or_default();
+        if rows.is_empty() {
+            println!("(daemon reports no sessions)");
+            return Ok(());
+        }
+        println!("{:<16} {:<9} {:<12} UPDATED", "SID", "STATUS", "PROFILE");
+        for r in rows {
+            println!(
+                "{:<16} {:<9} {:<12} {}",
+                r.get("sid").and_then(|x| x.as_str()).unwrap_or("?"),
+                r.get("status").and_then(|x| x.as_str()).unwrap_or("?"),
+                r.get("profile").and_then(|x| x.as_str()).unwrap_or("?"),
+                r.get("updated_at").and_then(|x| x.as_i64()).unwrap_or(0),
+            );
+        }
+        return Ok(());
+    }
     let (run_dir, rows) = load_session_rows()?;
     if rows.is_empty() {
         println!("(no sessions at {})", run_dir.display());
@@ -2615,6 +2704,9 @@ fn usage() -> String {
      den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run]\n  \
                 [--keep] [--pr]  land a session's changes as a git branch on the host\n  \
      den sessions [--select]      list persisted sessions, optionally choose one\n  \
+     den up <profile> <prompt...> launch a run in the background daemon and exit\n  \
+                                 (prints the session id; come back with den logs)\n  \
+     den logs <sid>               show the latest run log for a session\n  \
      den rm <session-id>          delete a session dir (unmounts stale mounts first)\n  \
      den replicate [sid] [url]    stream a session's fs.db to S3 via litestream (daemon)
   \
@@ -2625,6 +2717,8 @@ fn usage() -> String {
      den ltx <file.ltx>         inspect/verify a backup file\n  \
      den list                     list known profiles (any other cmd works too)\n  \
      den attach <sid>             open the dex TUI against a running daemon session\n  \
+     --solo                       first arg: force the in-process path, never\n  \
+                                  proxy to or spawn a den serve daemon\n\n\
      den exec --session <sid> -- <cmd>...   run a command in a session (runtime verb;\n  \
                                   docs/runtime-contract.md)\n  \
      den selftest                 sanity check\n\n\
@@ -2632,8 +2726,20 @@ env: DEN_NET=proxy|none|full  DEN_PROXY_ALLOW/DEN_PROXY_POLICY  DEN_HIDE/DEN_NO_
         .to_string()
 }
 
+/// `--solo` first arg: never proxy to or spawn a daemon — in-process only
+/// (docs/socket-daemon.md). DEN_AUTOSPAWN=0 only disables autospawning.
+fn solo_mode(args: &mut Vec<String>) -> bool {
+    if args.first().map(|a| a == "--solo").unwrap_or(false) {
+        args.remove(0);
+        true
+    } else {
+        false
+    }
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let solo = solo_mode(&mut args);
 
     match args.as_slice() {
         [] => {
@@ -2647,8 +2753,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         [c, rest @ ..] if c == "selftest" => cmd_selftest(rest),
-        [c] if c == "sessions" => cmd_sessions(false),
-        [c, flag] if c == "sessions" && flag == "--select" => cmd_sessions(true),
+        [c] if c == "sessions" => cmd_sessions(false, solo),
+        [c, flag] if c == "sessions" && flag == "--select" => cmd_sessions(true, solo),
         [c] if c == "help" || c == "--help" || c == "-h" => {
             println!("{}", usage());
             Ok(())
@@ -2684,7 +2790,12 @@ fn main() -> Result<()> {
             }
             backup::cmd_ltx_info(Path::new(path))
         }
-        [c] if c == "serve" => crate::serve::cmd_serve(),
+        [c, rest @ ..] if c == "logs" => {
+            let sid = rest.first().context("den logs <session-id>")?.clone();
+            cmd_logs(&sid)
+        }
+        [c, rest @ ..] if c == "up" => cmd_up(rest),
+        [c, rest @ ..] if c == "serve" => crate::serve::cmd_serve(rest),
         [c, rest @ ..] if c == "exec" => {
             let code = cmd_exec(rest)?;
             std::process::exit(code)
@@ -2727,6 +2838,32 @@ fn main() -> Result<()> {
             // message below is only for `run` (and safety for future names).
             if pname == "run" {
                 bail!("den run isn't a command — the run is implicit: den <cmd> [args...]");
+            }
+            // Daemon present and the invocation is a bare prompt? Proxy the
+            // one-shot: create + launch + stream from the daemon (its
+            // children outlive this terminal). Seed flags keep the local
+            // path — their semantics are richer in-process.
+            if !solo
+                && !passthrough.iter().any(|a| a.starts_with('-'))
+                && client::try_daemon().is_ok()
+            {
+                let prompt = passthrough.join(" ");
+                let (sid, rid) = client::create_and_launch(pname, &prompt, None)?;
+                let delta = client::stream_run(&rid)?;
+                match delta {
+                    Some(d) if d != "null" && !d.is_empty() => {
+                        let v: serde_json::Value =
+                            serde_json::from_str(&d).unwrap_or(serde_json::Value::Null);
+                        println!("den: session {sid} — run captured a delta");
+                        if let Some(obj) = v.as_object() {
+                            for (k, val) in obj {
+                                println!("  {k}: {val}");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
             }
             let args = split_run_args(passthrough);
             let SplitRunArgs {
