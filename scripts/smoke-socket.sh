@@ -107,6 +107,12 @@ head -2 "$SCRATCH/xdg3-serve.log"
 # children still running under their own pgid are unaffected)
 ok "restart with fresh socket dir (boot sweep ran)"
 
+# --- 9b) den serve restart: stop + respawn on the same socket ---------------
+"$BIN" serve restart --socket "$XDG_RUNTIME_DIR/den/den.sock" | grep -q "restarted pid" \
+  || { echo "FAIL: serve restart"; exit 1; }
+"$BIN" sessions >/dev/null || { echo "FAIL: daemon down after restart"; exit 1; }
+ok "den serve restart (stop + respawn, health verified)"
+
 # --- 10) den serve stop: SIGTERM, socket+pid file removed, idempotent --------
 SOCK3="$XDG_RUNTIME_DIR/den/den.sock"
 "$BIN" serve stop --socket "$SOCK3" | grep -q "stopped pid" \
@@ -116,5 +122,13 @@ if "$BIN" serve stop --socket "$SOCK3" 2>/dev/null; then
   echo "FAIL: stop on a stopped daemon should fail"; exit 1
 fi
 ok "den serve stop (graceful; second stop reports not running)"
+
+# --- 10b) restart from cold: nothing running -> start a fresh daemon --------
+"$BIN" serve restart --socket "$SOCK3" | grep -q "restarted pid" \
+  || { echo "FAIL: cold restart"; exit 1; }
+"$BIN" sessions >/dev/null || { echo "FAIL: cold-restarted daemon down"; exit 1; }
+"$BIN" serve stop --socket "$SOCK3" >/dev/null \
+  || { echo "FAIL: stop after cold restart"; exit 1; }
+ok "den serve restart from cold"
 
 echo "SMOKE-SOCKET-OK"

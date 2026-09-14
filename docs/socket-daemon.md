@@ -114,7 +114,9 @@ Solo mode keeps waiting synchronously — no behavior change for scripts.
    Old daemons without the route fall back to polling. Plus
    `den serve stop`: pid file at `<socket>.pid`, SIGTERM → 10 s → SIGKILL,
    socket + pid file removed on the way down. Gate: smoke-socket.sh steps
-   9–10. *Still open:* `den serve restart`, TUI attach over socket.
+   9–11. *Still open:* TUI attach over socket — moot for the local daemon
+   (the CLI reaches the dex TUI on its own localhost port today); it only
+   matters for remote daemons, which the socket daemon doesn't serve.
 
 Total ~650 lines, no new dependencies (unix sockets via tokio net, peercred
 via nix/libc getsockopt — std `std::os::unix` + libc, both already in tree).

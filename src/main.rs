@@ -2796,8 +2796,11 @@ fn main() -> Result<()> {
         }
         [c, rest @ ..] if c == "up" => cmd_up(rest),
         [c, rest @ ..] if c == "serve" => {
-            if rest.first().map(|a| a.as_str()) == Some("stop") {
+            let first = rest.first().map(|a| a.as_str());
+            if first == Some("stop") {
                 crate::serve::cmd_serve_stop(&rest[1..])
+            } else if first == Some("restart") {
+                crate::serve::cmd_serve_restart(&rest[1..])
             } else {
                 crate::serve::cmd_serve(rest)
             }

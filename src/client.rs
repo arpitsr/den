@@ -45,7 +45,7 @@ fn home() -> PathBuf {
 }
 
 /// Log file for autospawned daemons (stdout+stderr).
-fn daemon_log_path() -> PathBuf {
+pub(crate) fn daemon_log_path() -> PathBuf {
     socket_path()
         .parent()
         .map(|p| p.join("daemon.log"))
@@ -117,16 +117,15 @@ fn parse_status(head: &[u8]) -> Option<u16> {
 
 // ---- daemon discovery / autospawn ------------------------------------------
 
-/// Health of a live daemon, if one answers on the socket. Never spawns.
-pub fn try_health() -> Result<Value> {
-    let sp = socket_path();
-    let (_, h) = request(&sp, "GET", "/v1/health", None, None)?;
-    Ok(h)
-}
-
 /// Connect to the running daemon; error (not autospawn) if absent.
 pub fn try_daemon() -> Result<Value> {
-    let h = try_health()?;
+    try_daemon_at(&socket_path())
+}
+
+/// Same health+version check against an exact socket path (`den serve
+/// restart` waits on the socket it (re)spawned, not the default chain).
+pub(crate) fn try_daemon_at(sp: &PathBuf) -> Result<Value> {
+    let (_, h) = request(sp, "GET", "/v1/health", None, None)?;
     check_version(&h)?;
     Ok(h)
 }
@@ -160,7 +159,12 @@ pub fn ensure_daemon() -> Result<()> {
 /// Detached spawn, serialized by an flock-ed lock file so parallel first
 /// calls don't race: the winner spawns, losers just wait for the socket.
 fn spawn_daemon() -> Result<()> {
-    let sp = socket_path();
+    spawn_daemon_at(&socket_path())
+}
+
+/// Spawn a daemon on an exact socket path — `den serve restart` uses this so
+/// a `--socket` override survives the stop/start round trip.
+pub(crate) fn spawn_daemon_at(sp: &PathBuf) -> Result<()> {
     let lock_path = sp.with_extension("autospawn.lock");
     if let Some(dir) = lock_path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -171,7 +175,7 @@ fn spawn_daemon() -> Result<()> {
         bail!("flock autospawn lock {}", lock_path.display());
     }
     // Re-check: the lock holder may have finished spawning already.
-    if try_daemon().is_ok() {
+    if try_daemon_at(sp).is_ok() {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
@@ -182,7 +186,7 @@ fn spawn_daemon() -> Result<()> {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("serve")
         .arg("--socket")
-        .arg(&sp)
+        .arg(sp)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);

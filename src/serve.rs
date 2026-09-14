@@ -27,7 +27,7 @@ use std::os::fd::AsRawFd as _;
 use sha2::{Digest, Sha256};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2009,44 +2009,61 @@ pub fn cmd_serve(rest: &[String]) -> Result<()> {
 /// `den serve stop [--socket PATH]` — graceful stop of the daemon on the
 /// given socket: SIGTERM, 10 s grace, then SIGKILL. The daemon removes its
 /// socket + pid file on the way down; the SIGKILL path cleans up here.
-pub fn cmd_serve_stop(rest: &[String]) -> Result<()> {
+/// Parse `--socket PATH` — the only flag `stop`/`restart` accept — and
+/// resolve it the way the CLI does everywhere: --socket, DEN_SOCKET, then
+/// the standard dir chain (XDG_RUNTIME_DIR → XDG_STATE_HOME → $HOME).
+fn resolved_socket(rest: &[String], cmd: &str) -> Result<PathBuf> {
     let mut socket: Option<PathBuf> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         if a == "--socket" {
             socket = Some(PathBuf::from(it.next().context("--socket needs a path")?));
         } else {
-            bail!("unknown argument to den serve stop: {a}");
+            bail!("unknown argument to {cmd}: {a}");
         }
     }
-    // Same resolution order the CLI uses everywhere: --socket, DEN_SOCKET,
-    // then the standard dir chain (XDG_RUNTIME_DIR → XDG_STATE_HOME → $HOME).
-    let path = socket
+    Ok(socket
         .or_else(|| {
             std::env::var("DEN_SOCKET")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from)
         })
-        .unwrap_or_else(crate::client::socket_path);
-    let pid_file = pid_file_path(&path);
+        .unwrap_or_else(crate::client::socket_path))
+}
+
+pub fn cmd_serve_stop(rest: &[String]) -> Result<()> {
+    let path = resolved_socket(rest, "den serve stop")?;
+    match stop_daemon_at(&path)? {
+        Some(pid) => println!("den serve: stopped pid {pid} ({})", path.display()),
+        None => bail!("den serve: not running on {}", path.display()),
+    }
+    Ok(())
+}
+
+/// Signal, wait for, and clean up after the daemon on `path`. Returns the
+/// stopped pid, or None when nothing was running — a dead socket/pid file
+/// pair is tidied either way. Bails on a self-referential or foreign pid.
+fn stop_daemon_at(path: &Path) -> Result<Option<i32>> {
+    let sp = path.to_path_buf();
+    let pid_file = pid_file_path(&sp);
 
     let mut pid = std::fs::read_to_string(&pid_file)
         .ok()
         .and_then(|s| s.trim().parse::<i32>().ok());
     if pid.is_none() {
         // Daemon from before the pid file existed: health carries the pid.
-        pid = crate::client::request(&path, "GET", "/v1/health", None, None)
+        pid = crate::client::request(&sp, "GET", "/v1/health", None, None)
             .ok()
             .and_then(|(_, h)| h.get("pid").and_then(|p| p.as_u64()).map(|p| p as i32));
     }
     let Some(pid) = pid else {
         // Nothing to signal — still tidy a dead socket/pid file pair.
-        if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
-            let _ = std::fs::remove_file(&path);
+        if sp.exists() && std::os::unix::net::UnixStream::connect(&sp).is_err() {
+            let _ = std::fs::remove_file(&sp);
         }
         let _ = std::fs::remove_file(&pid_file);
-        bail!("den serve: not running on {}", path.display());
+        return Ok(None);
     };
     if pid == std::process::id() as i32 {
         bail!(
@@ -2077,8 +2094,8 @@ pub fn cmd_serve_stop(rest: &[String]) -> Result<()> {
         }
     }
     // The SIGKILL path skips the daemon's own cleanup — finish the job.
-    if path.exists() && std::os::unix::net::UnixStream::connect(&path).is_err() {
-        let _ = std::fs::remove_file(&path);
+    if sp.exists() && std::os::unix::net::UnixStream::connect(&sp).is_err() {
+        let _ = std::fs::remove_file(&sp);
     }
     if std::fs::read_to_string(&pid_file)
         .ok()
@@ -2087,7 +2104,40 @@ pub fn cmd_serve_stop(rest: &[String]) -> Result<()> {
     {
         let _ = std::fs::remove_file(&pid_file);
     }
-    println!("den serve: stopped pid {pid} ({})", path.display());
+    Ok(Some(pid))
+}
+
+/// `den serve restart [--socket PATH]` — stop the daemon if one is running,
+/// then boot a fresh daemon on the same socket and wait for /v1/health.
+/// In-flight runs are orphaned by the stop and swept as such at the next boot.
+pub fn cmd_serve_restart(rest: &[String]) -> Result<()> {
+    let path = resolved_socket(rest, "den serve restart")?;
+    if let Some(pid) = stop_daemon_at(&path)? {
+        println!("den serve: stopped pid {pid}");
+    } // none running — starting fresh
+    crate::client::spawn_daemon_at(&path)?;
+    let mut health = None;
+    let mut last_err = String::new();
+    for _ in 0..60 {
+        match crate::client::try_daemon_at(&path) {
+            Ok(h) => {
+                health = Some(h);
+                break;
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let h = health.with_context(|| {
+        format!(
+            "den daemon did not come up at {} ({}; log: {})",
+            path.display(),
+            last_err,
+            crate::client::daemon_log_path().display()
+        )
+    })?;
+    let pid = h.get("pid").and_then(|p| p.as_u64()).unwrap_or(0);
+    println!("den serve: restarted pid {pid} ({})", path.display());
     Ok(())
 }
 
