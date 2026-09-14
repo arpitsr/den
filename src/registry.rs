@@ -169,7 +169,6 @@ impl Registry {
     pub fn set_session_status(&self, sid: &str, status: &str) -> Result<()> {
         self.store.set_session_status(sid, status)
     }
-    #[allow(dead_code)] // daemon sessions record their host port in Phase 2
     pub fn set_attach_port(&self, sid: &str, port: i64) -> Result<()> {
         self.store.set_attach_port(sid, port)
     }
@@ -348,7 +347,6 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    #[allow(dead_code)] // daemon sessions record their host port in Phase 2
     fn set_attach_port(&self, sid: &str, port: i64) -> Result<()> {
         let n = self
             .conn()

@@ -14,6 +14,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # platform API server (docs/platform-api.md): axum over the existing tokio
 # runtime; json + http1 + tokio only — no form/multipart/query extras
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+# unix-socket transport for serve (docs/socket-daemon.md): accept the local
+# connection ourselves and inject SO_PEERCRED creds as request extensions
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+# tower::Service needed to invoke the axum Router from the socket accept loop
+tower = { version = "0.5", default-features = false }
+# Stream trait for run-log streaming responses (Body::from_stream) — traits
+# only, no futures-runtime
+futures-core = "0.3"
 anyhow = "1"
 libc = "0.2"
 litetx = "0.1.0"
