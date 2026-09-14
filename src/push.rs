@@ -16,6 +16,7 @@ use crate::snapshot_fs;
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT, S_IFREG};
 use agentfs_sdk::{AgentFS, AgentFSOptions};
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -222,6 +223,7 @@ pub(crate) struct PushOpts {
     pub pr: bool,
 }
 
+#[derive(Debug, Serialize)]
 pub(crate) struct PushOutcome {
     pub changed: Vec<String>,
     pub deleted: Vec<String>,
@@ -639,16 +641,21 @@ mod tests {
     use super::*;
     use crate::{block_on, seed_session, seed_tree};
 
-    fn snap(pairs: &[(&str, (i64, u32, i64))]) -> Snap {
+    type Attr = (i64, u32, i64);
+    type Pair<'a> = (&'a str, Attr);
+    type OptPair<'a> = (&'a str, Option<Attr>);
+    type AttrMap = HashMap<String, Attr>;
+    type OptAttrMap = HashMap<String, Option<Attr>>;
+
+    fn snap(pairs: &[Pair<'_>]) -> Snap {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
-    #[allow(clippy::type_complexity)] // test helper; pre-existing lint under clippy 1.98
-    fn hm(pairs: &[(&str, Option<(i64, u32, i64)>)]) -> HashMap<String, Option<(i64, u32, i64)>> {
+    fn hm(pairs: &[OptPair<'_>]) -> OptAttrMap {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
-    fn hmb(pairs: &[(&str, (i64, u32, i64))]) -> HashMap<String, (i64, u32, i64)> {
+    fn hmb(pairs: &[Pair<'_>]) -> AttrMap {
         pairs.iter().map(|(p, v)| (p.to_string(), *v)).collect()
     }
 
