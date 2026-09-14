@@ -95,8 +95,10 @@ Any agent CLI you wrap must already be installed and authed on your `PATH`.
 API — the same lifecycle the CLI uses, reachable from scripts, CI, or a UI.
 
 ```bash
-export DEN_API_TOKEN=$(openssl rand -hex 24)   # required; refuses to listen without it
+export DEN_API_TOKEN=$(openssl rand -hex 24)   # TCP mode: required; refuses to listen without it
 den serve                                      # binds 127.0.0.1:8520
+# or, local daemon mode (no token; SO_PEERCRED, same-uid only):
+den serve --socket $XDG_RUNTIME_DIR/den/den.sock
 ```
 
 ```bash
@@ -112,12 +114,14 @@ curl -s -XPOST -H "Authorization: Bearer $DEN_API_TOKEN" \
 Routes (`/v1`): `POST/GET /sessions`, `GET/DELETE /sessions/{sid}`,
 `POST /sessions/{sid}/attach|stop|push`, `GET /sessions/{sid}/files`,
 `POST/GET /sessions/{sid}/runs`, `GET /runs/{rid}`, `GET /runs/{rid}/log`,
-`POST /runs/{rid}/kill`, `POST/GET /keys`. Minted `dk_…` keys are scoped to
+`GET /runs/{rid}/stream` (live run log, pushed), `POST /runs/{rid}/kill`,
+`POST/GET /keys`, `POST /keys/{key_id}/revoke`. Minted `dk_…` keys are scoped to
 their owner and stored hashed; foreign sessions 404.
 
 | Env | Meaning | Default |
 |---|---|---|
-| `DEN_API_TOKEN` | root bearer token (required) | — |
+| `DEN_API_TOKEN` | root bearer token (TCP mode) | — |
+| `DEN_SOCKET` | unix-socket path (local daemon mode; `--socket` flag also works) | `$XDG_RUNTIME_DIR/den/den.sock` |
 | `DEN_BIND` | listen address | `127.0.0.1:8520` |
 | `DEN_MAX_RUNS` | concurrent child runs | 8 |
 | `DEN_RUNNER` | isolation backend: `process` or `sandbox` | `process` |
@@ -132,7 +136,7 @@ The registry is a `Store` trait; SQLite ships here.
 
 ```bash
 cd den
-cargo build --release           # heavy first build: pulls turso + sync (~280 crates)
+cargo build --release           # heavy first build: pulls turso + sync (~315 crates)
 # then either:
 cargo run --release -- <cmd> [args...]          # from the project dir
 cargo install --path .                         # installs a binary named `den`
@@ -156,11 +160,17 @@ den dump codex exec --json    # print the exact run argv (no exec)
 den sessions                  # list persisted sessions with entry counts
 den sessions --select         # show numbered sessions, choose one, print its id
 den inspect [session-id]      # open a session's fs.db; omit id to choose interactively
+den up [flags] <profile> <prompt...>   # launch a session run in the background daemon and exit
+den logs <sid>                # show the latest run log for a session
+den attach <sid>              # open the dex TUI against a daemon-attached session (needs POST /attach first)
 den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run] [--keep] [--pr]
                               # land a session's changes as a git branch on the host
 den backup [sid] [--from prev.ltx] [--out path] [-c] [--watch]  # LTX backup of a session's fs.db
 den restore <file.ltx> [--to db]                      # apply an LTX backup (and chain) back
 den ltx <file.ltx>            # inspect/verify a backup file
+den exec --session <sid> -- <cmd>...  # run a command inside a new session sandbox (also --seed/--seed-git/--autostart)
+den serve [--socket PATH]     # durable sessions over HTTP (see above); `den serve stop|restart` too
+--solo                        # first arg: force the in-process path, never proxy to a daemon
 den replicate [sid] [url]     # litestream daemon: stream the session's fs.db to S3
 den pull [sid] [url] [--force] [--to db]              # restore the session from its S3 replica
 ```
@@ -353,10 +363,16 @@ den/
   src/main.rs           profiles, argv assembly, seed/base/snapshot, run/inspect/sessions/dump/selftest
   src/sandbox.rs        fork/unshare namespaces, read-only remount, exec, signals
   src/proxy.rs          egress allowlist proxy (CONNECT + absolute-form HTTP)
+  src/policy.rs         egress policy sources (YAML FilePolicy, re-read live; cloud later)
   src/layer.rs          base+delta merge layer (copy-up, tombstones, merged listings)
   src/fuse.rs           FUSE filesystem serving the session's SQLite virtual FS (fuser)
   src/mount.rs          mount lifecycle (fusermount), MountHandle, helpers
   src/backup.rs         LTX backup/restore/inspect of session fs.db files (litetx + rusqlite)
+  src/serve.rs          den serve: axum HTTP API, supervision, registry, auth (bearer + dk_ keys)
+  src/registry.rs       platform.db — run/session bookkeeping (rebuildable from ~/.den/sessions)
+  src/runner.rs         Runner trait: process (default) vs sandbox isolation backends
+  src/client.rs         CLI↔daemon client: opportunistic unix-socket proxy (--solo disables)
+  src/push.rs           den push: session VFS diff → throwaway worktree → git branch on the host
   examples/mkdelta.rs   throwaway: builds a fake session fs.db via the SDK (used to test
                         inspect/sessions + backups without the real agentfs CLI)
 ```
@@ -376,8 +392,6 @@ den/
   litestream at a config file instead of env vars (`den replicate` uses
   command-line mode; a hand-written `litestream.yml` still works — it's just
   a binary litestream is exec'd with either way).
-- **TOML config + a TUI** → once there are several custom agents or you want a
-  session browser over the fs.db files.
-
-The bash `./den` at the repo root (the original prototype) can be deleted once this
-Rust binary is installed; it's kept only as a reference for the same behaviour.
+- **TOML config + a TUI** → partially here: `den attach` opens the dex TUI
+  against a running daemon session. A richer session browser over the fs.db
+  files is still future work.
