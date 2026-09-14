@@ -7,7 +7,8 @@
 //!
 //! Supports CONNECT (the bulk of agent traffic) and absolute-form HTTP.
 //! Hosts are checked against the egress policy (see policy.rs: built-in
-//! defaults + DEN_PROXY_POLICY yaml + DEN_PROXY_ALLOW). If
+//! defaults + ~/.config/den/egress.yaml + DEN_PROXY_POLICY yaml +
+//! DEN_PROXY_ALLOW). If
 //! DEN_PROXY_UPSTREAM is set (the host's own proxy), requests chain
 //! through it.
 
@@ -346,7 +347,7 @@ fn check_allowed(host: &str, policy: &EgressPolicy) -> Result<()> {
     let already = approved().lock().unwrap().contains(&normalized);
     if !already && !prompt_and_persist(&normalized)? {
         bail!(
-            "host {} denied by egress policy (extend: DEN_PROXY_ALLOW=comma,list or DEN_PROXY_POLICY=allow-deny.yaml)",
+            "host {} denied by egress policy (extend: ~/.config/den/egress.yaml, DEN_PROXY_POLICY=allow-deny.yaml, or DEN_PROXY_ALLOW=comma,list)",
             host
         );
     }

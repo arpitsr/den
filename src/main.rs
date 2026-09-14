@@ -34,7 +34,8 @@
 //!     nft egress policy + allowlist proxy (see DEN_PROXY_ALLOW); none = netns only,
 //!     full = host network (legacy)
 //!   DEN_PROXY_ALLOW=comma,list  extra egress allowlist entries for DEN_NET=proxy
-//!   DEN_PROXY_POLICY=path.yaml  egress allow/deny lists (else ./den-egress.yaml if present;
+//!   DEN_PROXY_POLICY=path.yaml  egress allow/deny lists (user default:
+//!     ~/.config/den/egress.yaml; else ./den-egress.yaml if present;
 //!     schema: src/default-egress.yaml); deny wins
 //!   DEN_HIDE=~/.a:~/.b  extra secrets to hide (colon-separated); DEN_NO_HIDE=~/.ssh restores
 //!   DEN_LIMIT_FSIZE/NOFILE/NPROC/AS/CPU  agent rlimits (bytes or K/M/G; "unlimited")

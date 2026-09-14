@@ -3,7 +3,8 @@
 # Deliberately minimal: just the agent API endpoints a sandboxed coding
 # agent needs to function. Everything else (github, package registries,
 # docker, OS mirrors, ...) depends on your network and work setup — add it
-# via DEN_PROXY_POLICY=path/to/your.yaml or DEN_PROXY_ALLOW=host,host.
+# to ~/.config/den/egress.yaml (user-wide), a project den-egress.yaml, or
+# DEN_PROXY_POLICY=path/to/your.yaml / DEN_PROXY_ALLOW=host,host.
 #
 # This file doubles as the schema example for your own policy files:
 #
@@ -12,7 +13,8 @@
 #   deny:                 # deny wins over allow (carve out subdomains)
 #     - gist.github.com
 #
-# A DEN_PROXY_POLICY file is merged over this list and re-read live.
+# A DEN_PROXY_POLICY file (or ~/.config/den/egress.yaml) is merged over
+# this list and re-read live.
 allow:
   - anthropic.com
   - claude.ai
