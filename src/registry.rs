@@ -88,16 +88,144 @@ pub struct NewRun {
     pub argv_json: Option<String>,
 }
 
-/// Registry handle. Cheap to clone is not needed — one per serve process.
+// ---- adapter ----------------------------------------------------------------
+//
+// Registry is backend-agnostic: a `Store` trait every adapter implements,
+// one SQLite adapter today. Serve holds one `Registry` handle and only ever
+// sees the trait, so an external DB (Postgres, a remote control plane…) is a
+// new adapter plus a scheme arm in `open_url` — no serve changes. All
+// methods are blocking-simple; serve calls them from spawn_blocking, and
+// each adapter owns its own concurrency (SQLite takes a Mutex, a network DB
+// would pool).
+
+/// Storage contract. One method per registry operation; "no such row" is
+/// `Ok(None)` on reads and an error on writes (adapters must keep that
+/// shape so serve's status mapping stays backend-independent).
+pub trait Store: Send + Sync {
+    fn create_session(&self, s: &NewSession) -> Result<()>;
+    fn get_session(&self, sid: &str) -> Result<Option<SessionRow>>;
+    fn list_sessions(&self) -> Result<Vec<SessionRow>>;
+    fn set_session_status(&self, sid: &str, status: &str) -> Result<()>;
+    fn set_attach_port(&self, sid: &str, port: i64) -> Result<()>;
+    fn delete_session(&self, sid: &str) -> Result<()>;
+    fn insert_run(&self, r: &NewRun, status: &str, log_path: Option<&str>) -> Result<()>;
+    fn set_run_pid(&self, id: &str, pid: i32) -> Result<()>;
+    fn finish_run(
+        &self,
+        id: &str,
+        status: &str,
+        exit_code: Option<i64>,
+        delta_json: Option<&str>,
+    ) -> Result<()>;
+    fn get_run(&self, id: &str) -> Result<Option<RunRow>>;
+    fn list_runs(&self, sid: &str) -> Result<Vec<RunRow>>;
+    fn sweep_orphans(&self) -> Result<usize>;
+    fn create_key(&self, k: &NewKey) -> Result<()>;
+    fn find_key(&self, key_hash: &str) -> Result<Option<KeyRow>>;
+    fn list_keys(&self) -> Result<Vec<KeyRow>>;
+    fn revoke_key(&self, key_id: &str) -> Result<()>;
+}
+
+/// Adapter-selected registry handle. Cheap to clone is not needed — one per
+/// serve process.
 pub struct Registry {
-    conn: Mutex<Connection>,
+    store: Box<dyn Store>,
 }
 
 impl Registry {
-    /// Open (creating on first use) the platform DB. WAL + busy timeout:
-    /// serve writes from multiple blocking tasks; runs/sessions tables are
-    /// tiny, so contention is nil — the timeout is belt-and-braces.
+    /// Open the default (local SQLite) adapter.
     pub fn open(path: &Path) -> Result<Registry> {
+        Ok(Registry {
+            store: Box::new(SqliteStore::open(path)?),
+        })
+    }
+
+    /// Select an adapter by URL (DEN_REGISTRY_URL). Known schemes:
+    /// `sqlite://<path>`; a bare path without `://` is also SQLite. External
+    /// DB adapters register their scheme here as they land.
+    pub fn open_url(url: &str) -> Result<Registry> {
+        if let Some(p) = url.strip_prefix("sqlite://") {
+            Registry::open(Path::new(p))
+        } else if !url.contains("://") {
+            Registry::open(Path::new(url))
+        } else {
+            bail!("unsupported registry backend '{url}' (known: sqlite://)")
+        }
+    }
+}
+
+// Delegation is mechanical: the wrapper exists so serve keeps a single
+// concrete handle type while the storage behind it is swappable.
+impl Registry {
+    pub fn create_session(&self, s: &NewSession) -> Result<()> {
+        self.store.create_session(s)
+    }
+    pub fn get_session(&self, sid: &str) -> Result<Option<SessionRow>> {
+        self.store.get_session(sid)
+    }
+    pub fn list_sessions(&self) -> Result<Vec<SessionRow>> {
+        self.store.list_sessions()
+    }
+    pub fn set_session_status(&self, sid: &str, status: &str) -> Result<()> {
+        self.store.set_session_status(sid, status)
+    }
+    #[allow(dead_code)] // daemon sessions record their host port in Phase 2
+    pub fn set_attach_port(&self, sid: &str, port: i64) -> Result<()> {
+        self.store.set_attach_port(sid, port)
+    }
+    pub fn delete_session(&self, sid: &str) -> Result<()> {
+        self.store.delete_session(sid)
+    }
+    pub fn insert_run(&self, r: &NewRun, status: &str, log_path: Option<&str>) -> Result<()> {
+        self.store.insert_run(r, status, log_path)
+    }
+    pub fn set_run_pid(&self, id: &str, pid: i32) -> Result<()> {
+        self.store.set_run_pid(id, pid)
+    }
+    pub fn finish_run(
+        &self,
+        id: &str,
+        status: &str,
+        exit_code: Option<i64>,
+        delta_json: Option<&str>,
+    ) -> Result<()> {
+        self.store.finish_run(id, status, exit_code, delta_json)
+    }
+    pub fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
+        self.store.get_run(id)
+    }
+    pub fn list_runs(&self, sid: &str) -> Result<Vec<RunRow>> {
+        self.store.list_runs(sid)
+    }
+    pub fn sweep_orphans(&self) -> Result<usize> {
+        self.store.sweep_orphans()
+    }
+    pub fn create_key(&self, k: &NewKey) -> Result<()> {
+        self.store.create_key(k)
+    }
+    pub fn find_key(&self, key_hash: &str) -> Result<Option<KeyRow>> {
+        self.store.find_key(key_hash)
+    }
+    pub fn list_keys(&self) -> Result<Vec<KeyRow>> {
+        self.store.list_keys()
+    }
+    pub fn revoke_key(&self, key_id: &str) -> Result<()> {
+        self.store.revoke_key(key_id)
+    }
+}
+
+// ---- sqlite adapter ---------------------------------------------------------
+
+/// Local platform.db under the den state dir. WAL + busy timeout: serve
+/// writes from multiple blocking tasks; runs/sessions tables are tiny, so
+/// contention is nil — the timeout is belt-and-braces.
+pub struct SqliteStore {
+    conn: Mutex<Connection>,
+}
+
+impl SqliteStore {
+    /// Open (creating on first use) the platform DB.
+    pub fn open(path: &Path) -> Result<SqliteStore> {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)
                 .with_context(|| format!("create platform db dir {}", p.display()))?;
@@ -143,7 +271,7 @@ impl Registry {
                revoked_at INTEGER
              );",
         )?;
-        Ok(Registry {
+        Ok(SqliteStore {
             conn: Mutex::new(conn),
         })
     }
@@ -154,10 +282,12 @@ impl Registry {
         // panic is the bug to surface, not state to recover around.
         self.conn.lock().expect("platform registry poisoned")
     }
+}
 
+impl Store for SqliteStore {
     // ---- sessions ----
 
-    pub fn create_session(&self, s: &NewSession) -> Result<()> {
+    fn create_session(&self, s: &NewSession) -> Result<()> {
         let kind_ok = matches!(s.kind.as_str(), "turn" | "daemon");
         if !kind_ok {
             bail!("unknown session kind '{}' (turn|daemon)", s.kind);
@@ -174,7 +304,7 @@ impl Registry {
         Ok(())
     }
 
-    pub fn get_session(&self, sid: &str) -> Result<Option<SessionRow>> {
+    fn get_session(&self, sid: &str) -> Result<Option<SessionRow>> {
         self.conn()
             .query_row(
                 "SELECT sid, kind, profile, seed_json, status, owner, attach_port,
@@ -187,7 +317,7 @@ impl Registry {
             .context("read session")
     }
 
-    pub fn list_sessions(&self) -> Result<Vec<SessionRow>> {
+    fn list_sessions(&self) -> Result<Vec<SessionRow>> {
         let conn = self.conn();
         let mut st = conn
             .prepare(
@@ -204,7 +334,7 @@ impl Registry {
         Ok(rows)
     }
 
-    pub fn set_session_status(&self, sid: &str, status: &str) -> Result<()> {
+    fn set_session_status(&self, sid: &str, status: &str) -> Result<()> {
         let n = self
             .conn()
             .execute(
@@ -219,7 +349,7 @@ impl Registry {
     }
 
     #[allow(dead_code)] // daemon sessions record their host port in Phase 2
-    pub fn set_attach_port(&self, sid: &str, port: i64) -> Result<()> {
+    fn set_attach_port(&self, sid: &str, port: i64) -> Result<()> {
         let n = self
             .conn()
             .execute(
@@ -233,7 +363,7 @@ impl Registry {
         Ok(())
     }
 
-    pub fn delete_session(&self, sid: &str) -> Result<()> {
+    fn delete_session(&self, sid: &str) -> Result<()> {
         let conn = self.conn();
         conn.execute("DELETE FROM runs WHERE sid = ?1", params![sid])
             .context("delete runs")?;
@@ -248,7 +378,7 @@ impl Registry {
 
     // ---- runs (turn kind) ----
 
-    pub fn insert_run(&self, r: &NewRun, status: &str, log_path: Option<&str>) -> Result<()> {
+    fn insert_run(&self, r: &NewRun, status: &str, log_path: Option<&str>) -> Result<()> {
         self.conn()
             .execute(
                 "INSERT INTO runs (id, sid, profile, prompt, argv_json, status, log_path)
@@ -267,7 +397,7 @@ impl Registry {
         Ok(())
     }
 
-    pub fn set_run_pid(&self, id: &str, pid: i32) -> Result<()> {
+    fn set_run_pid(&self, id: &str, pid: i32) -> Result<()> {
         let n = self
             .conn()
             .execute(
@@ -283,7 +413,7 @@ impl Registry {
 
     /// Terminal transition: status becomes exited/failed/killed/orphaned,
     /// exit code and delta snapshot stored alongside.
-    pub fn finish_run(
+    fn finish_run(
         &self,
         id: &str,
         status: &str,
@@ -305,7 +435,7 @@ impl Registry {
         Ok(())
     }
 
-    pub fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
+    fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
         self.conn()
             .query_row(
                 "SELECT id, sid, profile, prompt, argv_json, status, exit_code, pid,
@@ -318,7 +448,7 @@ impl Registry {
             .context("read run")
     }
 
-    pub fn list_runs(&self, sid: &str) -> Result<Vec<RunRow>> {
+    fn list_runs(&self, sid: &str) -> Result<Vec<RunRow>> {
         let conn = self.conn();
         let mut st = conn
             .prepare(
@@ -340,7 +470,7 @@ impl Registry {
     /// observed, so mark them all `orphaned`. A live orphan child still
     /// holds the session flock, so the session stays busy until it exits.
     /// Returns how many rows moved.
-    pub fn sweep_orphans(&self) -> Result<usize> {
+    fn sweep_orphans(&self) -> Result<usize> {
         let conn = self.conn();
         let now = unix_now();
         let moved = conn
@@ -351,6 +481,72 @@ impl Registry {
             )
             .context("sweep: mark orphans")?;
         Ok(moved)
+    }
+
+    // ---- keys (platform auth; raw "dk_…" never stored) ----
+
+    fn create_key(&self, k: &NewKey) -> Result<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO keys (key_hash, key_id, owner, name, max_concurrent, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    k.key_hash,
+                    k.key_id,
+                    k.owner,
+                    k.name,
+                    k.max_concurrent,
+                    unix_now()
+                ],
+            )
+            .with_context(|| format!("create key {}", k.key_id))?;
+        Ok(())
+    }
+
+    /// The live key for a presented bearer token (by hash), or None.
+    fn find_key(&self, key_hash: &str) -> Result<Option<KeyRow>> {
+        // Bound the scan: hashes are fixed-length (64 hex), so length
+        // filtering keeps this a no-op unless the column was tampered with.
+        let n = key_hash.len();
+        self.conn()
+            .query_row(
+                "SELECT key_id, owner, name, max_concurrent, created_at, revoked_at
+                 FROM keys WHERE key_hash = ?1 AND length(key_hash) = ?2",
+                params![key_hash, n as i64],
+                row_key,
+            )
+            .optional()
+            .context("find key")
+    }
+
+    fn list_keys(&self) -> Result<Vec<KeyRow>> {
+        let conn = self.conn();
+        let mut st = conn
+            .prepare(
+                "SELECT key_id, owner, name, max_concurrent, created_at, revoked_at
+                 FROM keys ORDER BY created_at DESC, key_id",
+            )
+            .context("list keys")?;
+        let rows = st
+            .query_map([], row_key)
+            .context("list keys")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("list keys")?;
+        Ok(rows)
+    }
+
+    fn revoke_key(&self, key_id: &str) -> Result<()> {
+        let n = self
+            .conn()
+            .execute(
+                "UPDATE keys SET revoked_at = ?2 WHERE key_id = ?1 AND revoked_at IS NULL",
+                params![key_id, unix_now()],
+            )
+            .context("revoke key")?;
+        if n == 0 {
+            bail!("no live key {key_id}");
+        }
+        Ok(())
     }
 }
 
@@ -414,74 +610,6 @@ fn row_key(r: &rusqlite::Row<'_>) -> rusqlite::Result<KeyRow> {
         created_at: r.get(4)?,
         revoked_at: r.get(5)?,
     })
-}
-
-impl Registry {
-    // ---- keys (platform auth; raw "dk_…" never stored) ----
-
-    pub fn create_key(&self, k: &NewKey) -> Result<()> {
-        self.conn()
-            .execute(
-                "INSERT INTO keys (key_hash, key_id, owner, name, max_concurrent, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    k.key_hash,
-                    k.key_id,
-                    k.owner,
-                    k.name,
-                    k.max_concurrent,
-                    unix_now()
-                ],
-            )
-            .with_context(|| format!("create key {}", k.key_id))?;
-        Ok(())
-    }
-
-    /// The live key for a presented bearer token (by hash), or None.
-    pub fn find_key(&self, key_hash: &str) -> Result<Option<KeyRow>> {
-        // Bound the scan: hashes are fixed-length (64 hex), so length
-        // filtering keeps this a no-op unless the column was tampered with.
-        let n = key_hash.len();
-        self.conn()
-            .query_row(
-                "SELECT key_id, owner, name, max_concurrent, created_at, revoked_at
-                 FROM keys WHERE key_hash = ?1 AND length(key_hash) = ?2",
-                params![key_hash, n as i64],
-                row_key,
-            )
-            .optional()
-            .context("find key")
-    }
-
-    pub fn list_keys(&self) -> Result<Vec<KeyRow>> {
-        let conn = self.conn();
-        let mut st = conn
-            .prepare(
-                "SELECT key_id, owner, name, max_concurrent, created_at, revoked_at
-                 FROM keys ORDER BY created_at DESC, key_id",
-            )
-            .context("list keys")?;
-        let rows = st
-            .query_map([], row_key)
-            .context("list keys")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("list keys")?;
-        Ok(rows)
-    }
-
-    pub fn revoke_key(&self, key_id: &str) -> Result<()> {
-        let n = self
-            .conn()
-            .execute(
-                "UPDATE keys SET revoked_at = ?2 WHERE key_id = ?1 AND revoked_at IS NULL",
-                params![key_id, unix_now()],
-            )
-            .context("revoke key")?;
-        if n == 0 {
-            bail!("no live key {key_id}");
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

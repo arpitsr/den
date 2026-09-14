@@ -1696,7 +1696,12 @@ pub fn cmd_serve() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
-    let reg = Registry::open(&platform_db_path()?)?;
+    // Registry backend: DEN_REGISTRY_URL (default: the local SQLite
+    // platform.db). External DB adapters plug in via Registry::open_url.
+    let reg = match std::env::var("DEN_REGISTRY_URL") {
+        Ok(url) => Registry::open_url(&url)?,
+        Err(_) => Registry::open(&platform_db_path()?)?,
+    };
     let moved = reg.sweep_orphans()?;
     if moved > 0 {
         eprintln!("den serve: marked {moved} run(s) orphaned from a previous serve");
