@@ -1,6 +1,6 @@
 [package]
 name = "den"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Run any local coding-agent CLI inside an AgentFS sandbox, with typed SDK access to the resulting state."
 license = "MIT OR Apache-2.0"
