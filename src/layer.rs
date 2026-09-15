@@ -51,15 +51,18 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // merge engine serves the Linux FUSE backend
 const ROOT_INO: i64 = 1;
 
 /// layer debugging (DEN_LAYER_DEBUG=1): name + ino of each interesting op.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // merge engine serves the Linux FUSE backend
 fn layer_dbg(op: &str, ino: i64) {
     if std::env::var("DEN_LAYER_DEBUG").as_deref() == Ok("1") {
         eprintln!("layer: {op} ino {ino}");
     }
 }
 /// Copy-up read/write chunk: 1 MiB.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // merge engine serves the Linux FUSE backend
 const COPY_CHUNK: u64 = 1 << 20;
 
 // ── pure path/tombstone helpers (unit-tested, no FS) ────────────────────────
@@ -249,6 +252,7 @@ pub(crate) fn write_key_json(path: &Path, k: &BaseKey) -> Result<()> {
 /// the merged tree (path strings: tombstone keys, path_of); `base_ino` /
 /// `delta_ino` locate it in the layer DBs. Delta-resident ⟺ `delta_ino` set.
 #[derive(Debug, Clone)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // merge engine serves the Linux FUSE backend
 struct MergedNode {
     parent: i64, // merged ino of parent (0 = root)
     name: String,
@@ -256,6 +260,7 @@ struct MergedNode {
     delta_ino: Option<i64>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // merge engine serves the Linux FUSE backend
 pub(crate) struct LayeredFS {
     /// The shared read-only seeded DB. None ⇒ passthrough to delta (§6).
     /// Trait object on purpose: the SDK's concrete type also has PATH-based
@@ -278,6 +283,7 @@ pub(crate) struct LayeredFS {
     tombstones: Mutex<HashSet<String>>,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // merge engine serves the Linux FUSE backend
 impl LayeredFS {
     /// Open the merge layer over `base` (optional) + `delta`. Ensures the
     /// delta's tombstone table exists and loads it into memory.
@@ -691,6 +697,7 @@ impl LayeredFS {
 }
 
 /// Read a whole file from a layer through its open handle (pread loop).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // merge engine serves the Linux FUSE backend
 async fn read_all(fs: &dyn FileSystem, ino: i64) -> SdkResult<Vec<u8>> {
     let file = fs.open(ino, libc::O_RDONLY).await?;
     let mut out = Vec::new();

@@ -2711,6 +2711,7 @@ fn selftest_layered() -> Result<()> {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // selftest helper (Linux)
 fn hash_file(p: &Path) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
