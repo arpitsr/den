@@ -43,6 +43,7 @@
 //!   (writable defaults: the four XDG base dirs plus the legacy agent
 //!    dotdirs — see build_allowed_paths in src/sandbox.rs)
 
+#[cfg(target_os = "linux")]
 use crate::layer::read_key_json;
 use crate::registry::Registry;
 use agentfs_sdk::filesystem::{S_IFDIR, S_IFMT};
@@ -67,6 +68,7 @@ mod layer;
 mod mount;
 #[cfg(target_os = "linux")]
 mod policy;
+#[cfg(target_os = "linux")]
 mod proxy;
 pub(crate) mod push;
 mod registry;
@@ -1042,6 +1044,7 @@ pub(crate) async fn diff_run_snap(
 
 /// compact post-run summary: what this run touched in the virtual FS
 /// (added/modified/removed vs the pre-run snapshot) + capped listing
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux-only run path
 async fn print_run_summary(sid: &str, before: &RunSnap) -> Result<()> {
     if std::env::var("DEN_QUIET").as_deref() == Ok("1") {
         return Ok(());
@@ -1505,25 +1508,27 @@ fn cmd_run(
     // keeps the default signal dispositions (inherited across fork), and the
     // sandbox parent installs forward-to-child handlers itself, so Ctrl-C
     // reaches the agent directly — no wrapper in between to ignore it.
-    #[cfg(target_os = "linux")]
-    // block_on wraps the Result, so unwrap twice (see the `??` note at block_on).
-    let code = block_on(sandbox::run_cmd(
-        allows,
-        sid.to_string(),
-        PathBuf::from(&argv[0]),
-        argv[1..].to_vec(),
-    ))??;
     #[cfg(not(target_os = "linux"))]
-    let code = {
+    {
         // ponytail: the macOS NFS+sandbox-exec path was not ported; the FUSE
         // sandbox is Linux-only. Re-add when macOS matters (port cli/src/sandbox/darwin.rs).
-        let _ = &argv;
+        let _ = (&argv, &before);
         bail!("den's in-process sandbox is Linux-only; run den on Linux")
-    };
-    // The agent has exited and the session DB is persisted — diff what the
-    // session owns against the pre-run snapshot.
-    block_on(print_run_summary(sid, &before))??;
-    Ok(code)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // block_on wraps the Result, so unwrap twice (see the `??` note at block_on).
+        let code = block_on(sandbox::run_cmd(
+            allows,
+            sid.to_string(),
+            PathBuf::from(&argv[0]),
+            argv[1..].to_vec(),
+        ))??;
+        // The agent has exited and the session DB is persisted — diff what the
+        // session owns against the pre-run snapshot.
+        block_on(print_run_summary(sid, &before))??;
+        Ok(code)
+    }
 }
 
 /// Strip den's own flags from a run's passthrough args (the rest go to the
@@ -2526,13 +2531,14 @@ fn selftest_sandbox() -> Result<()> {
                 .unwrap_or(std::path::Path::new("")),
         );
         println!("sandbox selftest OK (seed, mount, vfs writes, ro-enforcement, join)");
+        selftest_layered()?;
+        Ok(())
     }
-    selftest_layered()?;
-    Ok(())
 }
 
 /// Layered round-trip (docs/layered-sessions.md §9 selftest): shared base +
 /// per-session delta, base reuse on identical seed, join, RO enforcement.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // exercised via selftest_sandbox (Linux)
 fn selftest_layered() -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     bail!("selftest --sandbox is Linux-only");
@@ -2701,8 +2707,8 @@ fn selftest_layered() -> Result<()> {
             }
         }
         println!("layered selftest OK (base, delta, tombstone, merge, join, DEN_LAYER=0)");
+        Ok(())
     }
-    Ok(())
 }
 
 fn hash_file(p: &Path) -> u64 {
@@ -2714,6 +2720,7 @@ fn hash_file(p: &Path) -> u64 {
     h.finish()
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // selftest helper (Linux)
 fn check_sandbox(cond: bool, expected: bool, what: &str) -> Result<()> {
     if cond != expected {
         bail!("sandbox selftest FAIL: {what} (got {cond}, expected {expected})");
