@@ -690,17 +690,21 @@ pub(crate) mod tests {
         dir: TempDir,
     }
 
-    // tiny tempdir helper (no extra dep): unique dir under std::env::temp_dir()
+    // tiny tempdir helper (no extra dep): unique dir under std::env::temp_dir().
+    // The atomic counter (not just pid+nanos) makes parallel tests collision-proof:
+    // same-nanos TempDirs would share one dir and delete each other's DBs on drop.
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
             let p = std::env::temp_dir().join(format!(
-                "den-test-{}-{:x}",
+                "den-test-{}-{:x}-{}",
                 std::process::id(),
                 SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             ));
             std::fs::create_dir_all(&p).unwrap();
             TempDir(p)
