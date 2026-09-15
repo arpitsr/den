@@ -1,0 +1,128 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Tag must point at a commit whose Cargo.toml already carries the tag's
+  # version (bump lands via normal PR — develop is protected, no bot push).
+  bump:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml
+        id: bump
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if ! printf '%s\n' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "error: tag '$GITHUB_REF_NAME' is not vX.Y.Z" >&2
+            exit 1
+          fi
+          cur="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$ver" != "$cur" ]; then
+            echo "error: tag v$ver does not match Cargo.toml $cur." >&2
+            echo "land the version bump via PR, then tag its tip." >&2
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: bump
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static Linux: run on any distro. No Windows: den uses
+          # fork/namespaces/FUSE (Linux) + process runner (Linux/macOS).
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            cross: false
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            cross: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install zig (Linux musl cross-linker)
+        if: matrix.cross
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild (Linux)
+        if: matrix.cross
+        run: cargo install cargo-zigbuild --locked
+      - name: Install qemu-user-static (Linux)
+        if: matrix.cross
+        run: sudo apt-get -y -q install qemu-user-static
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+      - name: Smoke test
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/den"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            qemu-aarch64-static "$bin" --version
+          else
+            "$bin" --version
+          fi
+      - name: Package
+        shell: bash
+        run: |
+          name="den-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/den" dist/
+          tar -czf "$name.tar.gz" -C dist den
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: den-${{ matrix.target }}
+          path: den-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+      - name: Publish release
+        run: gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes dist/*

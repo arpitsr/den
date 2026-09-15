@@ -3,6 +3,12 @@ name = "den"
 version = "0.1.0"
 edition = "2021"
 description = "Run any local coding-agent CLI inside an AgentFS sandbox, with typed SDK access to the resulting state."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/arpitsr/den"
+authors = ["Arpit Kumar <4772479+arpitsr@users.noreply.github.com>"]
+keywords = ["cli", "agent", "sandbox", "coding-assistant"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "den"

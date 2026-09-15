@@ -1367,8 +1367,8 @@ fn hide_one(target: &Path, cwd: &Path) {
 }
 
 /// Cover alias paths exposing the same files: the same (dev, ino) tree is
-/// often reachable through several mountpoints (e.g. /var/home/aks and
-/// /home/aks on btrfs subvol layouts). For every mountpoint whose root
+/// often reachable through several mountpoints (e.g. /var/home/user and
+/// /home/user on btrfs subvol layouts). For every mountpoint whose root
 /// matches an ancestor of `h`, hide `mountpoint/<rel>` too.
 fn hide_aliases(h: &Path, cwd: &Path) {
     let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {

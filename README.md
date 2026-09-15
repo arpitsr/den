@@ -396,3 +396,15 @@ den/
 - **TOML config + a TUI** → partially here: `den attach` opens the dex TUI
   against a running daemon session. A richer session browser over the fs.db
   files is still future work.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build checks and PR conventions.
+Report security issues privately per [SECURITY.md](SECURITY.md) — do not open
+public issues for vulnerabilities. The OSS scope and release plan live in
+[docs/oss-charter.md](docs/oss-charter.md) and [docs/oss-launch.md](docs/oss-launch.md).
+
+## License
+
+Dual-licensed under MIT and Apache-2.0 — see [LICENSE](LICENSE) and
+[LICENSE-APACHE](LICENSE-APACHE).

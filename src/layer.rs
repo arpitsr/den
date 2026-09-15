@@ -1588,11 +1588,11 @@ mod tests {
     fn base_key_charset_and_shape() {
         let k = base_key(
             true,
-            Path::new("/home/aks/Work/den"),
+            Path::new("/home/user/Work/den"),
             Some("0123456789abcdef"),
             "aabbccdd00112233",
         );
-        assert!(k.starts_with("git-home-aks-work-den-0123456789ab-aabbccdd00112233"));
+        assert!(k.starts_with("git-home-user-work-den-0123456789ab-aabbccdd00112233"));
         assert!(k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
         let k2 = base_key(false, Path::new("/tmp/Weird Path/Ω"), None, "ff");
         assert!(k2.starts_with("dir-tmp-weird-path-"));

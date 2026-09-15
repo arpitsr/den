@@ -13,9 +13,10 @@ cd "$(dirname "$0")/.."
 PORT="${PORT:-8520}"
 TOKEN="smoke-$RANDOM"
 # The daemon-attach test needs the PATCHED dex (--fd adoption). Point
-# DEX_WORKTREE at a dex checkout with the fd-listener patch until it is
-# merged + installed; the smoke builds it and puts it first on PATH.
-DEX_WORKTREE="${DEX_WORKTREE:-/home/aks/Work/dex/.worktrees/fd-listener}"
+# Set DEX_WORKTREE to a dex checkout to also exercise the daemon-attach
+# path; the smoke builds that dex and puts it first on PATH. Unset by
+# default so the smoke runs on any machine.
+DEX_WORKTREE="${DEX_WORKTREE:-}"
 # Scratch must NOT sit under /tmp|/var/tmp|/run: the sandbox mounts fresh
 # tmpfs over those (sandbox.rs step 4) and would swallow the scratch HOME
 # and its FUSE mountpoint. Real HOME survives (it lives on the host fs).

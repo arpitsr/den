@@ -1,2 +1,10 @@
-/target
+/target/
+/bin/
+.worktrees/
+parca-profiles/
+heaptrack.*.zst
+*.log
+.ak/sessions/
+.env.local-ci
+*.env
 .pr-review/
