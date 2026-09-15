@@ -2786,6 +2786,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        [c] if c == "--version" || c == "-V" => {
+            println!("den {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         [c, rest @ ..] if c == "selftest" => cmd_selftest(rest),
         [c] if c == "sessions" => cmd_sessions(false, solo),
         [c, flag] if c == "sessions" && flag == "--select" => cmd_sessions(true, solo),
