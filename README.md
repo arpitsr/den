@@ -17,6 +17,27 @@ Every session is still self-contained — backup/replicate/pull ship the delta
 (and its tombstones); a base is content-addressed and immutable, seeded once
 per repo state.
 
+## Platform support
+
+|                  | Linux | macOS |
+| ---------------- | ----- | ----- |
+| `den serve` API, sessions, seed/push/backup | ✅ | ✅ |
+| Strong sandbox (FUSE virtual FS, namespaces, egress proxy) | ✅ | ❌ |
+| `process` runner (same API, no isolation) | ✅ | ✅ (default) |
+
+`DEN_RUNNER=process` (default) supervises the agent as a plain child process:
+same session lifecycle, no containment — the agent runs with your full access.
+`DEN_RUNNER=sandbox` (Linux only) adds the FUSE + namespace isolation above.
+`den run`, `den proxy`, and `selftest --sandbox` are Linux-only and bail
+elsewhere. Need containment on a Mac? Run the Linux build inside
+Docker/Lima — the sandbox works unmodified in a Linux guest.
+
+## Install
+
+Grab a tarball from
+[releases](https://github.com/arpitsr/den/releases) (Linux x86_64, macOS
+arm64/x86_64), or build from source: `cargo build --release` → `den --version`.
+
 ### Seeding
 
 `--seed <dir>` copies the dir into the session's virtual FS before the agent
