@@ -3551,7 +3551,7 @@ mod tests {
     fn litestream_autostart_requires_binary_and_replica() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("LITESTREAM_BUCKET", "b");
-        std::env::set_var("DEN_LITESTREAM", "/bin/true"); // exists, so bin_found
+        std::env::set_var("DEN_LITESTREAM", "/bin/sh"); // exists on Linux+macOS, so bin_found
         assert!(litestream_autostart("x"));
 
         std::env::set_var("DEN_LITESTREAM", "/nonexistent/den-ls");
