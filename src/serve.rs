@@ -309,7 +309,9 @@ struct CreateReq {
     /// Full agent argv, e.g. ["codex", "exec"] or ["touch"]. The caller owns
     /// headless flags — serve appends the run prompt bare, no per-agent map.
     agent: Option<Vec<String>>,
-    /// Legacy single-command name (v1 clients): converted to agent=[profile].
+    /// Legacy single-command name (v1 clients): converted to agent argv with
+    /// the v1 headless flag (claude/gemini/dex get -p, codex gets exec,
+    /// opencode gets run) so old clients don't land in a TTY.
     profile: Option<String>,
     seed_dir: Option<String>,
     /// git URL — cloned to a temp dir at first run and seeded from it
@@ -318,7 +320,27 @@ struct CreateReq {
     seed_dirty: Option<String>,
 }
 
+/// Legacy v1 profile -> headless agent argv (the old per-agent map): without
+/// the flag the agent would wait on a TTY and the run would hang.
+fn legacy_agent(p: &str) -> Vec<String> {
+    match p {
+        "claude" | "gemini" | "dex" => vec![p.into(), "-p".into()],
+        "codex" => vec![p.into(), "exec".into()],
+        "opencode" => vec![p.into(), "run".into()],
+        _ => vec![p.into()],
+    }
+}
+
+/// Only dex serves a daemon — the attach token is handed to the child, so any
+/// other agent here would leak DEX_DAEMON_TOKEN to an arbitrary binary.
+fn supports_daemon(agent: &[String]) -> bool {
+    agent.first().map(String::as_str) == Some("dex")
+}
+
 /// Resolve the session agent argv: `agent` wins, else legacy `profile`.
+/// Turn sessions get the v1 headless flag (legacy_agent); daemon sessions
+/// stay bare (`dex` serves `serve --fd`, turn flags like `-p` would break
+/// the daemon verb).
 fn resolve_agent(req: &CreateReq) -> Result<Vec<String>> {
     if let Some(a) = &req.agent {
         if a.is_empty() || a.iter().any(|s| s.is_empty()) {
@@ -330,7 +352,10 @@ fn resolve_agent(req: &CreateReq) -> Result<Vec<String>> {
         if p.is_empty() {
             bail!("profile must be non-empty");
         }
-        return Ok(vec![p.clone()]);
+        if req.kind.as_deref() == Some("daemon") {
+            return Ok(vec![p.clone()]);
+        }
+        return Ok(legacy_agent(p));
     }
     bail!("missing agent (or legacy profile)");
 }
@@ -959,6 +984,16 @@ async fn attach_session(
             "session has no agent argv",
         );
     }
+    if !supports_daemon(&sess.agent) {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "unsupported_daemon",
+            format!(
+                "agent '{}' has no daemon mode yet (bridge: platform-api.md §3)",
+                sess.agent.first().cloned().unwrap_or_default()
+            ),
+        );
+    }
     // Live child -> idempotent reconnect: hand back the same port + token.
     if st.children.lock().unwrap().contains_key(&sid) {
         let info = attach_info_path(&sid)
@@ -1118,17 +1153,14 @@ async fn attach_session(
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "log_fd", format!("{e}")),
     };
     // Daemon child: `den exec --session <sid> -- <agent...> serve --fd <n>`.
-    // The agent is full argv from create (e.g. ["dex"]); serve appends the
-    // daemon verb, it never branches on the agent name.
-    let mut daemon_argv = sess.agent.clone();
-    daemon_argv.push("serve".into());
-    daemon_argv.push("--fd".into());
-    daemon_argv.push(fd.to_string());
+    // The agent is full argv from create (dex-only, checked above); serve
+    // appends the daemon verb, it never branches on the agent name.
     let child = match st.runner.launch(crate::runner::Launch {
         exe: exe.to_string_lossy().into_owned(),
         args: {
             let mut a = vec!["exec".into(), "--session".into(), sid.clone(), "--".into()];
-            a.extend(daemon_argv);
+            a.extend(sess.agent.clone());
+            a.extend(["serve".into(), "--fd".into(), fd.to_string()]);
             a
         },
         sid: sid.clone(),
@@ -2337,7 +2369,7 @@ mod tests {
             resolve_agent(&req).unwrap(),
             vec!["codex".to_string(), "exec".to_string()]
         );
-        // legacy profile -> single-element agent
+        // legacy profile -> agent with its v1 headless flag (unknown stays bare)
         let legacy = CreateReq {
             agent: None,
             profile: Some("touch".into()),
@@ -2348,6 +2380,46 @@ mod tests {
             seed_dirty: None,
         };
         assert_eq!(resolve_agent(&legacy).unwrap(), vec!["touch".to_string()]);
+        for (name, want) in [
+            ("claude", vec!["claude", "-p"]),
+            ("gemini", vec!["gemini", "-p"]),
+            ("dex", vec!["dex", "-p"]),
+            ("codex", vec!["codex", "exec"]),
+            ("opencode", vec!["opencode", "run"]),
+        ] {
+            let r = CreateReq {
+                agent: None,
+                profile: Some(name.into()),
+                sid: None,
+                kind: None,
+                seed_dir: None,
+                seed_git: None,
+                seed_dirty: None,
+            };
+            assert_eq!(
+                resolve_agent(&r).unwrap(),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "legacy {name}"
+            );
+        }
+        // daemon kind stays bare: `dex` serves `serve --fd`, no turn flag
+        let daemon_legacy = CreateReq {
+            agent: None,
+            profile: Some("dex".into()),
+            sid: None,
+            kind: Some("daemon".into()),
+            seed_dir: None,
+            seed_git: None,
+            seed_dirty: None,
+        };
+        assert_eq!(
+            resolve_agent(&daemon_legacy).unwrap(),
+            vec!["dex".to_string()]
+        );
+        // daemon allowlist: dex only, so the token never goes to arbitrary argv
+        assert!(supports_daemon(&["dex".to_string()]));
+        assert!(!supports_daemon(&["codex".to_string(), "exec".to_string()]));
+        assert!(!supports_daemon(&[]));
         // missing and empty both fail
         let missing = CreateReq {
             agent: None,

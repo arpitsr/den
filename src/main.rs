@@ -1835,15 +1835,23 @@ fn cmd_pull(sid: &str, url_opt: Option<&str>, force: bool, to: Option<PathBuf>) 
 }
 
 fn cmd_dump(cmd: &str, passthrough: &[String]) -> Result<()> {
-    let sid = session_id();
+    // Sessions are random sids now — a generated id here would be throwaway
+    // (the real run mints its own). Only show session/fs.db when DEN_SESSION
+    // pins the id; otherwise preview just the argv the agent will get.
+    let pinned = std::env::var("DEN_SESSION").ok().filter(|s| !s.is_empty());
     // Run strips den's own flags (--seed/--seed-dirty/--autostart...); dump
     // must preview the same argv the agent will actually get.
     let passthrough = split_run_args(passthrough).passthrough;
     let mut argv = build_argv(cmd, &passthrough)?;
     argv[0] = resolve_bin(&argv[0]).to_string_lossy().to_string();
     let allows = sandbox_allows();
-    println!("session: {sid}");
-    println!("fs.db: {}", session_db_path(&sid)?.display());
+    match &pinned {
+        Some(sid) => {
+            println!("session: {sid}");
+            println!("fs.db: {}", session_db_path(sid)?.display());
+        }
+        None => println!("session: (random at run time — set DEN_SESSION to pin)"),
+    }
     println!("command:  {}", argv.join(" "));
     if allows.is_empty() {
         println!("allow:    (defaults only)");
@@ -2007,18 +2015,34 @@ fn select_session() -> Result<String> {
 }
 
 /// `den up [flags] <agent...> [--] <prompt...>` (docs/socket-daemon.md §3):
-/// `den up [flags] <agent...> [--] <prompt...>`: create + launch in the
+/// create + launch in the
 /// daemon, print sid, exit. The agent is full argv (e.g. `den up codex exec
 /// -- fix the test`); without `--` the first word is the agent and the rest
 /// is the prompt (so `den up touch /hello` keeps working). Flags map to the
 /// API: --seed <dir> → seed_dir, --seed-git <url> → seed_git, --seed-dirty <m>.
 /// Seed lives once per session (stored at create, applied at first run).
-fn cmd_up(rest: &[String]) -> Result<()> {
+/// Parsed `den up` args: (agent argv, prompt words, seed_dir, seed_git,
+/// seed_dirty). Split on the first `--` (prompt side is verbatim); seed flags
+/// are only parsed left of `--` — agent flags like `-p` are positional, never
+/// den flags.
+struct UpArgs {
+    agent: Vec<String>,
+    prompt: Vec<String>,
+    seed_dir: Option<String>,
+    seed_git: Option<String>,
+    seed_dirty: Option<String>,
+}
+
+fn parse_up_args(rest: &[String]) -> Result<UpArgs> {
+    let (left, right) = match rest.iter().position(|a| a == "--") {
+        Some(i) => (&rest[..i], Some(&rest[i + 1..])),
+        None => (rest, None),
+    };
     let mut seed_dir: Option<String> = None;
     let mut seed_git: Option<String> = None;
     let mut seed_dirty: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
-    let mut it = rest.iter();
+    let mut it = left.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--seed" => seed_dir = Some(it.next().context("--seed needs a dir")?.clone()),
@@ -2037,21 +2061,38 @@ fn cmd_up(rest: &[String]) -> Result<()> {
                 parse_dirty_mode(&v)?;
                 seed_dirty = Some(v);
             }
-            other if other.starts_with('-') && other != "--" => {
-                bail!("den up: unknown flag {other}")
-            }
+            // Agent flags (`-p`, `exec`, `--model …`) are positional — only
+            // the three --seed* flags are den flags here.
             other => positional.push(other.to_string()),
         }
     }
-    // Split agent vs prompt on an explicit `--`; without it the agent is a
-    // single command and everything after is the prompt (legacy shape).
-    let (agent, prompt) = match positional.iter().position(|a| a == "--") {
-        Some(i) => (positional[..i].to_vec(), positional[i + 1..].to_vec()),
+    // With `--` the agent is full argv left of it; without it the agent is a
+    // single command and everything after is the prompt (legacy shape — use
+    // `--` for agents with flags).
+    let (agent, prompt) = match right {
+        Some(r) => (positional, r.to_vec()),
         None => match positional.split_first() {
             Some((first, rest)) => (vec![first.clone()], rest.to_vec()),
             None => (vec![], vec![]),
         },
     };
+    Ok(UpArgs {
+        agent,
+        prompt,
+        seed_dir,
+        seed_git,
+        seed_dirty,
+    })
+}
+
+fn cmd_up(rest: &[String]) -> Result<()> {
+    let UpArgs {
+        agent,
+        prompt,
+        seed_dir,
+        seed_git,
+        seed_dirty,
+    } = parse_up_args(rest)?;
     if agent.is_empty() {
         bail!("den up <agent...> [--] <prompt...>");
     }
@@ -2731,7 +2772,8 @@ fn main() -> Result<()> {
             bail!("no arguments");
         }
         [c] if c == "list" => {
-            bail!("den list is gone — sessions are dumb buckets now; run any command: den <cmd> [args...]");
+            eprintln!("den: 'list' is deprecated, use 'sessions'");
+            cmd_sessions(false, solo)
         }
         [c] if c == "--version" || c == "-V" => {
             println!("den {}", env!("CARGO_PKG_VERSION"));
@@ -2839,39 +2881,68 @@ fn main() -> Result<()> {
             // interactive TUI — it can't proxy (no prompt to send, no TTY
             // to stream) and an empty POST would 400 — so it stays solo.
             // Seed flags keep the local path — their semantics are richer
-            // in-process.
-            let proxyable =
-                !passthrough.is_empty() && !passthrough.iter().any(|a| a.starts_with('-'));
-            if !solo && proxyable {
-                match client::try_daemon() {
-                    Ok(_) => {
-                        let prompt = passthrough.join(" ");
-                        let agent = vec![pname.clone()];
-                        let (sid, rid) =
-                            client::create_and_launch(&agent, &prompt, None, None, None)?;
-                        let delta = client::stream_run(&rid)?;
-                        match delta {
-                            Some(d) if d != "null" && !d.is_empty() => {
-                                let v: serde_json::Value =
-                                    serde_json::from_str(&d).unwrap_or(serde_json::Value::Null);
-                                println!("den: session {sid} — run captured a delta");
-                                if let Some(obj) = v.as_object() {
-                                    for (k, val) in obj {
-                                        println!("  {k}: {val}");
+            // in-process. Multi-word agents need `--` (`den codex exec --
+            // fix`): without it a multi-arg invocation stays solo so argv is
+            // never re-split (agent=[codex] prompt="exec fix" would run
+            // `codex "exec fix"` instead of `codex exec fix`).
+            let has_seed_flag = passthrough.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "--seed" | "--seed-git" | "--seed-dirty" | "--autostart" | "--out"
+                )
+            });
+            let proxy_plan: Option<(Vec<String>, String)> =
+                match passthrough.iter().position(|a| a == "--") {
+                    Some(i) => {
+                        let mut agent = vec![pname.clone()];
+                        agent.extend(passthrough[..i].iter().cloned());
+                        let prompt = passthrough[i + 1..].join(" ");
+                        if prompt.is_empty() {
+                            None
+                        } else {
+                            Some((agent, prompt))
+                        }
+                    }
+                    // No separator: only a single bare prompt word proxies
+                    // (agent=[cmd], prompt=word). Anything else runs solo.
+                    None if passthrough.len() == 1
+                        && !passthrough[0].starts_with('-')
+                        && !has_seed_flag =>
+                    {
+                        Some((vec![pname.clone()], passthrough[0].clone()))
+                    }
+                    _ => None,
+                };
+            if !solo && !has_seed_flag {
+                if let Some((agent, prompt)) = proxy_plan {
+                    match client::try_daemon() {
+                        Ok(_) => {
+                            let (sid, rid) =
+                                client::create_and_launch(&agent, &prompt, None, None, None)?;
+                            let delta = client::stream_run(&rid)?;
+                            match delta {
+                                Some(d) if d != "null" && !d.is_empty() => {
+                                    let v: serde_json::Value =
+                                        serde_json::from_str(&d).unwrap_or(serde_json::Value::Null);
+                                    println!("den: session {sid} — run captured a delta");
+                                    if let Some(obj) = v.as_object() {
+                                        for (k, val) in obj {
+                                            println!("  {k}: {val}");
+                                        }
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
+                            return Ok(());
                         }
-                        return Ok(());
+                        // Refuse the proxy per docs/socket-daemon.md §4, but the
+                        // user asked for a run — say why, then fall through and
+                        // run in-process so the command still completes.
+                        Err(e) if e.downcast_ref::<client::VersionMismatch>().is_some() => {
+                            eprintln!("den: {e}; running in-process instead");
+                        }
+                        Err(_) => {} // no daemon: solo, as always
                     }
-                    // Refuse the proxy per docs/socket-daemon.md §4, but the
-                    // user asked for a run — say why, then fall through and
-                    // run in-process so the command still completes.
-                    Err(e) if e.downcast_ref::<client::VersionMismatch>().is_some() => {
-                        eprintln!("den: {e}; running in-process instead");
-                    }
-                    Err(_) => {} // no daemon: solo, as always
                 }
             }
             let args = split_run_args(passthrough);
@@ -3340,6 +3411,35 @@ mod tests {
         } = split_run_args(&v(&["--seed-git", "git@host:org/repo.git", "task"]));
         assert!(seed.is_none() && git.is_some());
         assert_eq!(pass, v(&["task"]));
+    }
+
+    #[test]
+    fn parse_up_args_keeps_agent_flags_positional() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // agent flags survive: `den up claude -p -- hi`
+        let a = parse_up_args(&v(&["claude", "-p", "--", "hi"])).unwrap();
+        assert_eq!(a.agent, v(&["claude", "-p"]));
+        assert_eq!(a.prompt, v(&["hi"]));
+        assert!(a.seed_dir.is_none());
+        // seed flags parse left of `--`, prompt side is verbatim
+        let a = parse_up_args(&v(&[
+            "--seed", "/repo", "codex", "exec", "--", "fix", "--seed",
+        ]))
+        .unwrap();
+        assert_eq!(a.agent, v(&["codex", "exec"]));
+        assert_eq!(a.prompt, v(&["fix", "--seed"]));
+        assert_eq!(a.seed_dir.as_deref(), Some("/repo"));
+        assert!(a.seed_git.is_none());
+        // no `--`: legacy single-command agent
+        let a = parse_up_args(&v(&["touch", "/hello"])).unwrap();
+        assert_eq!(a.agent, v(&["touch"]));
+        assert_eq!(a.prompt, v(&["/hello"]));
+        // missing agent or prompt fails
+        assert!(parse_up_args(&v(&[])).unwrap().agent.is_empty());
+        assert!(parse_up_args(&v(&["codex", "exec", "--"]))
+            .unwrap()
+            .prompt
+            .is_empty());
     }
 
     #[test]

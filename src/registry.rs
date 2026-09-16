@@ -228,6 +228,9 @@ pub struct SqliteStore {
 /// Columns of a table (PRAGMA table_info) — migration probes these so v1
 /// DBs (profile, nullable argv_json) open under the v2 code.
 fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    if table != "sessions" && table != "runs" {
+        bail!("unknown table '{table}'");
+    }
     let mut st = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .context("table_info")?;
@@ -239,11 +242,11 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
     Ok(cols)
 }
 
-/// v1 -> v2: sessions.profile (TEXT) becomes sessions.agent_json
-/// (JSON array, one element); runs.profile merges into runs.argv_json
-/// (existing argv_json wins, else json_array(profile)). Legacy `profile`
-/// columns are left in place — old files keep opening, new code never
-/// reads them.
+/// v1 -> v2: sessions.profile (TEXT) becomes sessions.agent_json (JSON array
+/// with the v1 headless flag); runs.profile merges into runs.argv_json
+/// (existing argv_json wins, else json_array(profile) — history only, never
+/// re-executed). Legacy `profile` columns are left in place — old files keep
+/// opening, new code never reads them.
 fn migrate_v1_profile(conn: &Connection) -> Result<()> {
     let sess_cols = table_columns(conn, "sessions")?;
     if sess_cols.contains(&"profile".to_string()) && !sess_cols.contains(&"agent_json".to_string())
@@ -254,12 +257,22 @@ fn migrate_v1_profile(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "UPDATE sessions SET agent_json = json_array(profile) WHERE agent_json = '[]';",
         )?;
+        // Old single-element backfill missed headless flags — expand the known
+        // agents so migrated sessions stay headless (unknown names stay bare).
+        conn.execute_batch(
+            "UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), '-p') WHERE json_extract(agent_json, '$[0]') IN ('claude','gemini','dex') AND json_array_length(agent_json) = 1;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'exec') WHERE json_extract(agent_json, '$[0]') = 'codex' AND json_array_length(agent_json) = 1;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'run') WHERE json_extract(agent_json, '$[0]') = 'opencode' AND json_array_length(agent_json) = 1;",
+        )?;
     } else if sess_cols.contains(&"profile".to_string())
         && sess_cols.contains(&"agent_json".to_string())
     {
         // Partial migration (crashed between ADD and backfill): finish it.
         conn.execute_batch(
-            "UPDATE sessions SET agent_json = json_array(profile) WHERE agent_json = '[]' AND profile IS NOT NULL;",
+            "UPDATE sessions SET agent_json = json_array(profile) WHERE agent_json = '[]' AND profile IS NOT NULL;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), '-p') WHERE json_extract(agent_json, '$[0]') IN ('claude','gemini','dex') AND json_array_length(agent_json) = 1 AND profile IS NOT NULL;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'exec') WHERE json_extract(agent_json, '$[0]') = 'codex' AND json_array_length(agent_json) = 1 AND profile IS NOT NULL;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'run') WHERE json_extract(agent_json, '$[0]') = 'opencode' AND json_array_length(agent_json) = 1 AND profile IS NOT NULL;",
         )?;
     }
     let run_cols = table_columns(conn, "runs")?;
@@ -280,9 +293,10 @@ fn migrate_v1_profile(conn: &Connection) -> Result<()> {
 
 impl SqliteStore {
     /// Open (creating on first use) the platform DB. Fresh DBs get the v2
-    /// schema (agent_json/argv_json, no profile). Old v1 DBs are migrated
-    /// in place: profile -> json_array(profile), legacy columns kept
-    /// unread so existing files keep opening (forward-compatible).
+    /// schema (agent_json/argv_json, plus a nullable legacy `profile` so old
+    /// binaries still open fresh DBs). Old v1 DBs are migrated in place:
+    /// profile -> agent argv with headless flag, legacy columns kept unread
+    /// so existing files keep opening (forward-compatible).
     pub fn open(path: &Path) -> Result<SqliteStore> {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)
@@ -297,6 +311,7 @@ impl SqliteStore {
                sid TEXT PRIMARY KEY,
                kind TEXT NOT NULL CHECK (kind IN ('turn','daemon')),
                agent_json TEXT NOT NULL DEFAULT '[]',
+               profile TEXT,
                seed_json TEXT,
                status TEXT NOT NULL,
                owner TEXT,
@@ -308,6 +323,7 @@ impl SqliteStore {
                id TEXT PRIMARY KEY,
                sid TEXT NOT NULL REFERENCES sessions(sid),
                argv_json TEXT NOT NULL DEFAULT '[]',
+               profile TEXT,
                prompt TEXT,
                status TEXT NOT NULL,
                exit_code INTEGER,
@@ -608,8 +624,10 @@ impl Store for SqliteStore {
     }
 }
 
-fn parse_argv(raw: String) -> Vec<String> {
-    serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default()
+fn parse_argv(raw: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str::<Vec<String>>(&raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
@@ -617,7 +635,7 @@ fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
         sid: r.get(0)?,
         kind: r.get(1)?,
-        agent: parse_argv(agent_raw),
+        agent: parse_argv(agent_raw)?,
         seed_json: r.get(3)?,
         status: r.get(4)?,
         owner: r.get(5)?,
@@ -632,7 +650,7 @@ fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
     Ok(RunRow {
         id: r.get(0)?,
         sid: r.get(1)?,
-        argv: parse_argv(argv_raw),
+        argv: parse_argv(argv_raw)?,
         prompt: r.get(3)?,
         status: r.get(4)?,
         exit_code: r.get(5)?,
@@ -809,6 +827,88 @@ mod tests {
         assert_eq!(s.agent, vec!["touch".to_string()]);
         let r = db.get_run("r1").unwrap().unwrap();
         assert_eq!(r.argv, vec!["touch".to_string()]);
+    }
+
+    #[test]
+    fn v1_migration_expands_headless_flags() {
+        let t = TempDir::new("migrate-flags").unwrap();
+        let path = t.0.join("platform.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (sid TEXT PRIMARY KEY, kind TEXT NOT NULL, profile TEXT NOT NULL, seed_json TEXT, status TEXT NOT NULL, owner TEXT, attach_port INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE runs (id TEXT PRIMARY KEY, sid TEXT NOT NULL REFERENCES sessions(sid), profile TEXT NOT NULL, prompt TEXT, argv_json TEXT, status TEXT NOT NULL, exit_code INTEGER, pid INTEGER, started_at INTEGER, finished_at INTEGER, delta_json TEXT, log_path TEXT);",
+            )
+            .unwrap();
+            for (sid, profile) in [
+                ("s-claude", "claude"),
+                ("s-codex", "codex"),
+                ("s-opencode", "opencode"),
+                ("s-unknown", "future-agent"),
+            ] {
+                conn.execute(
+                    "INSERT INTO sessions (sid, kind, profile, status, created_at, updated_at) VALUES (?1,'turn',?2,'idle',1,1)",
+                    rusqlite::params![sid, profile],
+                )
+                .unwrap();
+            }
+        }
+        let db = Registry::open(&path).unwrap();
+        let want = [
+            ("s-claude", vec!["claude", "-p"]),
+            ("s-codex", vec!["codex", "exec"]),
+            ("s-opencode", vec!["opencode", "run"]),
+            ("s-unknown", vec!["future-agent"]),
+        ];
+        for (sid, agent) in want {
+            let got = db.get_session(sid).unwrap().unwrap();
+            assert_eq!(
+                got.agent,
+                agent.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{sid}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_argv_json_is_an_error_not_silent_empty() {
+        let t = TempDir::new("corrupt").unwrap();
+        let path = t.0.join("platform.db");
+        let db = Registry::open(&path).unwrap();
+        db.create_session(&sess("s1")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE sessions SET agent_json = 'not-json' WHERE sid = 's1'",
+                [],
+            )
+            .unwrap();
+        }
+        // Corrupt bookkeeping must surface (serve maps this to 500), never
+        // masquerade as an empty agent (which would 400 as invalid_agent).
+        assert!(db.get_session("s1").is_err());
+    }
+
+    #[test]
+    fn fresh_schema_keeps_nullable_profile_for_old_binaries() {
+        let t = TempDir::new("fresh-profile").unwrap();
+        let path = t.0.join("platform.db");
+        let _db = Registry::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for table in ["sessions", "runs"] {
+            let mut st = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let cols: Vec<String> = st
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                cols.contains(&"profile".to_string()),
+                "{table} keeps profile"
+            );
+        }
     }
 
     #[test]
