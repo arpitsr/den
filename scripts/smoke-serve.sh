@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Phase 1 acceptance for den serve (platform-api.md §13, slice 1) — no LLM
-# keys needed: profile "touch"/"sleep" are unknown-to-profile() names, and
-# headless_argv passes their prompt bare, so the child runs `den touch
-# /hello.txt` / `den sleep 30` inside the real sandbox.
+# keys needed: agent ["touch"]/["sleep"] runs the prompt bare, so the child
+# runs `den exec --session <sid> -- touch ./hello.txt` / `... sleep 30`
+# inside the real sandbox. The profile= payloads below exercise the legacy
+# v1 compat path (profile -> agent=[profile]); new clients send agent=[...].
 #
 # Verifies: auth refusal, session create, run launch, sandboxed VFS write
 # captured as delta_json, process-group kill, serve-restart orphan sweep,

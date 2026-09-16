@@ -308,7 +308,7 @@ impl Watch {
 /// replays the whole chain.
 /// One watcher per session: hold an exclusive flock on a lock file next to
 /// the fs.db for the process lifetime, so a second `--watch` on the same
-/// session (e.g. a duplicate `den <profile> --autostart`) refuses instead of
+/// session (e.g. a duplicate `den <cmd> --autostart`) refuses instead of
 /// racing on the chain files. The lock dies with the process — no stale-pid
 /// bookkeeping.
 fn lock_watch(sid: &str) -> Result<File> {
@@ -330,7 +330,7 @@ fn lock_watch(sid: &str) -> Result<File> {
 /// so Ctrl-C (or a crash) always leaves the chain restorable up to the last
 /// tick, and restarting resumes from the newest file. `den restore <base>.ltx`
 /// replays the whole chain. Waits up to 30s for the session DB to appear, so
-/// `den <profile> --autostart` works on the very first run of a profile.
+/// `den <cmd> --autostart` works on the very first run of a session.
 pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
     let db = crate::session_db_path(sid)?;
     let mut waited = 0;
@@ -344,7 +344,7 @@ pub fn cmd_backup_watch(sid: &str, out: &Path, compress: bool) -> Result<()> {
         std::thread::sleep(WATCH_POLL);
         waited += 1;
     }
-    // Spawned from `den <profile> --autostart`, SIGINT/SIGTERM arrive
+    // Spawned from `den <cmd> --autostart`, SIGINT/SIGTERM arrive
     // SIG_IGN (inherited from `den run`): keep the INT-ignore so the stream
     // survives Ctrl-C on the run, but restore TERM so `kill` can stop us.
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };

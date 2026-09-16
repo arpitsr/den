@@ -1,8 +1,8 @@
 //! The Runner trait: how serve spawns session children.
 //!
 //! serve is a supervisor, not a sandbox host (docs/platform-api.md §1) — it
-//! launches `den <profile> …` children and reaps them. *How* the child is
-//! isolated is pluggable:
+//! launches `den exec --session <sid> -- <agent...> …` children and reaps
+//! them. *How* the child is isolated is pluggable:
 //!
 //! - `process` (default): plain `std::process` with its own process group.
 //!   Works on macOS, Linux, CI, plain Docker. Same API, less isolation.
@@ -20,7 +20,7 @@ use tokio::process::Command;
 
 /// What serve hands the runner: a fully-qualified argv plus stdio plumbing
 /// and per-session env. The runner decides *how* to isolate the exec,
-/// nothing else — argv is the runner's contract with profiles.
+/// nothing else — argv is opaque agent code plus the session id.
 pub struct Launch {
     pub exe: String,
     pub args: Vec<String>,
