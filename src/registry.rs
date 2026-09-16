@@ -43,11 +43,16 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Registry schema version (PRAGMA user_version). v2 replaces the
+/// agent-based `profile` columns with full-arg `agent_json`/`argv_json`:
+/// sessions are dumb buckets, the agent is just argv from create.
+pub const SCHEMA_VERSION: i64 = 2;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionRow {
     pub sid: String,
     pub kind: String,
-    pub profile: String,
+    pub agent: Vec<String>,
     pub seed_json: Option<String>,
     pub status: String,
     pub owner: Option<String>,
@@ -60,9 +65,8 @@ pub struct SessionRow {
 pub struct RunRow {
     pub id: String,
     pub sid: String,
-    pub profile: String,
+    pub argv: Vec<String>,
     pub prompt: Option<String>,
-    pub argv_json: Option<String>,
     pub status: String,
     pub exit_code: Option<i64>,
     pub pid: Option<i64>,
@@ -75,7 +79,7 @@ pub struct RunRow {
 pub struct NewSession {
     pub sid: String,
     pub kind: String, // turn | daemon
-    pub profile: String,
+    pub agent: Vec<String>,
     pub seed_json: Option<String>,
     pub owner: Option<String>,
 }
@@ -83,9 +87,8 @@ pub struct NewSession {
 pub struct NewRun {
     pub id: String,
     pub sid: String,
-    pub profile: String,
+    pub argv: Vec<String>,
     pub prompt: Option<String>,
-    pub argv_json: Option<String>,
 }
 
 // ---- adapter ----------------------------------------------------------------
@@ -222,8 +225,78 @@ pub struct SqliteStore {
     conn: Mutex<Connection>,
 }
 
+/// Columns of a table (PRAGMA table_info) — migration probes these so v1
+/// DBs (profile, nullable argv_json) open under the v2 code.
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    if table != "sessions" && table != "runs" {
+        bail!("unknown table '{table}'");
+    }
+    let mut st = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .context("table_info")?;
+    let cols = st
+        .query_map([], |r| r.get::<_, String>(1))
+        .context("table_info rows")?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("table_info rows")?;
+    Ok(cols)
+}
+
+/// v1 -> v2: sessions.profile (TEXT) becomes sessions.agent_json (JSON array
+/// with the v1 headless flag); runs.profile merges into runs.argv_json
+/// (existing argv_json wins, else json_array(profile) — history only, never
+/// re-executed). Legacy `profile` columns are left in place — old files keep
+/// opening, new code never reads them.
+fn migrate_v1_profile(conn: &Connection) -> Result<()> {
+    let sess_cols = table_columns(conn, "sessions")?;
+    if sess_cols.contains(&"profile".to_string()) && !sess_cols.contains(&"agent_json".to_string())
+    {
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN agent_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
+        conn.execute_batch(
+            "UPDATE sessions SET agent_json = json_array(profile) WHERE agent_json = '[]';",
+        )?;
+        // Old single-element backfill missed headless flags — expand the known
+        // agents so migrated sessions stay headless (unknown names stay bare).
+        conn.execute_batch(
+            "UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), '-p') WHERE json_extract(agent_json, '$[0]') IN ('claude','gemini','dex') AND json_array_length(agent_json) = 1;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'exec') WHERE json_extract(agent_json, '$[0]') = 'codex' AND json_array_length(agent_json) = 1;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'run') WHERE json_extract(agent_json, '$[0]') = 'opencode' AND json_array_length(agent_json) = 1;",
+        )?;
+    } else if sess_cols.contains(&"profile".to_string())
+        && sess_cols.contains(&"agent_json".to_string())
+    {
+        // Partial migration (crashed between ADD and backfill): finish it.
+        conn.execute_batch(
+            "UPDATE sessions SET agent_json = json_array(profile) WHERE agent_json = '[]' AND profile IS NOT NULL;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), '-p') WHERE json_extract(agent_json, '$[0]') IN ('claude','gemini','dex') AND json_array_length(agent_json) = 1 AND profile IS NOT NULL;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'exec') WHERE json_extract(agent_json, '$[0]') = 'codex' AND json_array_length(agent_json) = 1 AND profile IS NOT NULL;
+             UPDATE sessions SET agent_json = json_array(json_extract(agent_json, '$[0]'), 'run') WHERE json_extract(agent_json, '$[0]') = 'opencode' AND json_array_length(agent_json) = 1 AND profile IS NOT NULL;",
+        )?;
+    }
+    let run_cols = table_columns(conn, "runs")?;
+    if run_cols.contains(&"profile".to_string()) && !run_cols.contains(&"argv_json".to_string()) {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN argv_json TEXT NOT NULL DEFAULT '[]';")?;
+        conn.execute_batch(
+            "UPDATE runs SET argv_json = json_array(profile) WHERE argv_json = '[]';",
+        )?;
+    } else if run_cols.contains(&"profile".to_string())
+        && run_cols.contains(&"argv_json".to_string())
+    {
+        conn.execute_batch(
+            "UPDATE runs SET argv_json = json_array(profile) WHERE (argv_json IS NULL OR argv_json = '[]') AND profile IS NOT NULL;",
+        )?;
+    }
+    Ok(())
+}
+
 impl SqliteStore {
-    /// Open (creating on first use) the platform DB.
+    /// Open (creating on first use) the platform DB. Fresh DBs get the v2
+    /// schema (agent_json/argv_json, plus a nullable legacy `profile` so old
+    /// binaries still open fresh DBs). Old v1 DBs are migrated in place:
+    /// profile -> agent argv with headless flag, legacy columns kept unread
+    /// so existing files keep opening (forward-compatible).
     pub fn open(path: &Path) -> Result<SqliteStore> {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)
@@ -237,7 +310,8 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS sessions (
                sid TEXT PRIMARY KEY,
                kind TEXT NOT NULL CHECK (kind IN ('turn','daemon')),
-               profile TEXT NOT NULL,
+               agent_json TEXT NOT NULL DEFAULT '[]',
+               profile TEXT,
                seed_json TEXT,
                status TEXT NOT NULL,
                owner TEXT,
@@ -248,9 +322,9 @@ impl SqliteStore {
              CREATE TABLE IF NOT EXISTS runs (
                id TEXT PRIMARY KEY,
                sid TEXT NOT NULL REFERENCES sessions(sid),
-               profile TEXT NOT NULL,
+               argv_json TEXT NOT NULL DEFAULT '[]',
+               profile TEXT,
                prompt TEXT,
-               argv_json TEXT,
                status TEXT NOT NULL,
                exit_code INTEGER,
                pid INTEGER,
@@ -270,6 +344,8 @@ impl SqliteStore {
                revoked_at INTEGER
              );",
         )?;
+        migrate_v1_profile(&conn)?;
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         Ok(SqliteStore {
             conn: Mutex::new(conn),
         })
@@ -291,13 +367,17 @@ impl Store for SqliteStore {
         if !kind_ok {
             bail!("unknown session kind '{}' (turn|daemon)", s.kind);
         }
+        if s.agent.is_empty() {
+            bail!("session agent argv is empty");
+        }
         let now = unix_now();
+        let agent_json = serde_json::to_string(&s.agent).context("encode agent argv")?;
         self.conn()
             .execute(
-                "INSERT INTO sessions (sid, kind, profile, seed_json, status, owner,
+                "INSERT INTO sessions (sid, kind, agent_json, seed_json, status, owner,
                                        created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                params![s.sid, s.kind, s.profile, s.seed_json, S_IDLE, s.owner, now,],
+                params![s.sid, s.kind, agent_json, s.seed_json, S_IDLE, s.owner, now,],
             )
             .with_context(|| format!("create session {}", s.sid))?;
         Ok(())
@@ -306,7 +386,7 @@ impl Store for SqliteStore {
     fn get_session(&self, sid: &str) -> Result<Option<SessionRow>> {
         self.conn()
             .query_row(
-                "SELECT sid, kind, profile, seed_json, status, owner, attach_port,
+                "SELECT sid, kind, agent_json, seed_json, status, owner, attach_port,
                         created_at, updated_at
                  FROM sessions WHERE sid = ?1",
                 params![sid],
@@ -320,7 +400,7 @@ impl Store for SqliteStore {
         let conn = self.conn();
         let mut st = conn
             .prepare(
-                "SELECT sid, kind, profile, seed_json, status, owner, attach_port,
+                "SELECT sid, kind, agent_json, seed_json, status, owner, attach_port,
                         created_at, updated_at
                  FROM sessions ORDER BY updated_at DESC, sid",
             )
@@ -377,19 +457,15 @@ impl Store for SqliteStore {
     // ---- runs (turn kind) ----
 
     fn insert_run(&self, r: &NewRun, status: &str, log_path: Option<&str>) -> Result<()> {
+        if r.argv.is_empty() {
+            bail!("run argv is empty");
+        }
+        let argv_json = serde_json::to_string(&r.argv).context("encode run argv")?;
         self.conn()
             .execute(
-                "INSERT INTO runs (id, sid, profile, prompt, argv_json, status, log_path)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    r.id,
-                    r.sid,
-                    r.profile,
-                    r.prompt,
-                    r.argv_json,
-                    status,
-                    log_path
-                ],
+                "INSERT INTO runs (id, sid, argv_json, prompt, status, log_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![r.id, r.sid, argv_json, r.prompt, status, log_path],
             )
             .with_context(|| format!("insert run {}", r.id))?;
         Ok(())
@@ -436,7 +512,7 @@ impl Store for SqliteStore {
     fn get_run(&self, id: &str) -> Result<Option<RunRow>> {
         self.conn()
             .query_row(
-                "SELECT id, sid, profile, prompt, argv_json, status, exit_code, pid,
+                "SELECT id, sid, argv_json, prompt, status, exit_code, pid,
                         started_at, finished_at, delta_json, log_path
                  FROM runs WHERE id = ?1",
                 params![id],
@@ -450,7 +526,7 @@ impl Store for SqliteStore {
         let conn = self.conn();
         let mut st = conn
             .prepare(
-                "SELECT id, sid, profile, prompt, argv_json, status, exit_code, pid,
+                "SELECT id, sid, argv_json, prompt, status, exit_code, pid,
                         started_at, finished_at, delta_json, log_path
                  FROM runs WHERE sid = ?1 ORDER BY started_at, id",
             )
@@ -548,11 +624,18 @@ impl Store for SqliteStore {
     }
 }
 
+fn parse_argv(raw: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str::<Vec<String>>(&raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
 fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    let agent_raw: String = r.get(2)?;
     Ok(SessionRow {
         sid: r.get(0)?,
         kind: r.get(1)?,
-        profile: r.get(2)?,
+        agent: parse_argv(agent_raw)?,
         seed_json: r.get(3)?,
         status: r.get(4)?,
         owner: r.get(5)?,
@@ -563,19 +646,19 @@ fn row_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
 }
 
 fn row_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<RunRow> {
+    let argv_raw: String = r.get(2)?;
     Ok(RunRow {
         id: r.get(0)?,
         sid: r.get(1)?,
-        profile: r.get(2)?,
+        argv: parse_argv(argv_raw)?,
         prompt: r.get(3)?,
-        argv_json: r.get(4)?,
-        status: r.get(5)?,
-        exit_code: r.get(6)?,
-        pid: r.get(7)?,
-        started_at: r.get(8)?,
-        finished_at: r.get(9)?,
-        delta_json: r.get(10)?,
-        log_path: r.get(11)?,
+        status: r.get(4)?,
+        exit_code: r.get(5)?,
+        pid: r.get(6)?,
+        started_at: r.get(7)?,
+        finished_at: r.get(8)?,
+        delta_json: r.get(9)?,
+        log_path: r.get(10)?,
     })
 }
 
@@ -638,9 +721,18 @@ mod tests {
         NewSession {
             sid: sid.into(),
             kind: "turn".into(),
-            profile: "codex".into(),
+            agent: vec!["codex".into(), "exec".into()],
             seed_json: None,
             owner: None,
+        }
+    }
+
+    fn run(id: &str, sid: &str) -> NewRun {
+        NewRun {
+            id: id.into(),
+            sid: sid.into(),
+            argv: vec!["codex".into(), "exec".into()],
+            prompt: None,
         }
     }
 
@@ -681,17 +773,152 @@ mod tests {
     }
 
     #[test]
+    fn session_agent_is_required() {
+        let t = TempDir::new("agent").unwrap();
+        let db = t.db();
+        let bad = NewSession {
+            sid: "s-empty".into(),
+            kind: "turn".into(),
+            agent: vec![],
+            seed_json: None,
+            owner: None,
+        };
+        assert!(db.create_session(&bad).is_err());
+    }
+
+    #[test]
+    fn schema_version_is_v2() {
+        let t = TempDir::new("version").unwrap();
+        let path = t.0.join("platform.db");
+        let db = Registry::open(&path).unwrap();
+        db.create_session(&sess("s1")).unwrap();
+        assert_eq!(SCHEMA_VERSION, 2);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 2);
+    }
+
+    #[test]
+    fn v1_profile_db_migrates_to_agent() {
+        let t = TempDir::new("migrate").unwrap();
+        let path = t.0.join("platform.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (sid TEXT PRIMARY KEY, kind TEXT NOT NULL, profile TEXT NOT NULL, seed_json TEXT, status TEXT NOT NULL, owner TEXT, attach_port INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE runs (id TEXT PRIMARY KEY, sid TEXT NOT NULL REFERENCES sessions(sid), profile TEXT NOT NULL, prompt TEXT, argv_json TEXT, status TEXT NOT NULL, exit_code INTEGER, pid INTEGER, started_at INTEGER, finished_at INTEGER, delta_json TEXT, log_path TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (sid, kind, profile, status, created_at, updated_at) VALUES ('s1','turn','touch','idle',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO runs (id, sid, profile, status) VALUES ('r1','s1','touch','queued')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Registry::open(&path).unwrap();
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.agent, vec!["touch".to_string()]);
+        let r = db.get_run("r1").unwrap().unwrap();
+        assert_eq!(r.argv, vec!["touch".to_string()]);
+    }
+
+    #[test]
+    fn v1_migration_expands_headless_flags() {
+        let t = TempDir::new("migrate-flags").unwrap();
+        let path = t.0.join("platform.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (sid TEXT PRIMARY KEY, kind TEXT NOT NULL, profile TEXT NOT NULL, seed_json TEXT, status TEXT NOT NULL, owner TEXT, attach_port INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE runs (id TEXT PRIMARY KEY, sid TEXT NOT NULL REFERENCES sessions(sid), profile TEXT NOT NULL, prompt TEXT, argv_json TEXT, status TEXT NOT NULL, exit_code INTEGER, pid INTEGER, started_at INTEGER, finished_at INTEGER, delta_json TEXT, log_path TEXT);",
+            )
+            .unwrap();
+            for (sid, profile) in [
+                ("s-claude", "claude"),
+                ("s-codex", "codex"),
+                ("s-opencode", "opencode"),
+                ("s-unknown", "future-agent"),
+            ] {
+                conn.execute(
+                    "INSERT INTO sessions (sid, kind, profile, status, created_at, updated_at) VALUES (?1,'turn',?2,'idle',1,1)",
+                    rusqlite::params![sid, profile],
+                )
+                .unwrap();
+            }
+        }
+        let db = Registry::open(&path).unwrap();
+        let want = [
+            ("s-claude", vec!["claude", "-p"]),
+            ("s-codex", vec!["codex", "exec"]),
+            ("s-opencode", vec!["opencode", "run"]),
+            ("s-unknown", vec!["future-agent"]),
+        ];
+        for (sid, agent) in want {
+            let got = db.get_session(sid).unwrap().unwrap();
+            assert_eq!(
+                got.agent,
+                agent.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "{sid}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_argv_json_is_an_error_not_silent_empty() {
+        let t = TempDir::new("corrupt").unwrap();
+        let path = t.0.join("platform.db");
+        let db = Registry::open(&path).unwrap();
+        db.create_session(&sess("s1")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE sessions SET agent_json = 'not-json' WHERE sid = 's1'",
+                [],
+            )
+            .unwrap();
+        }
+        // Corrupt bookkeeping must surface (serve maps this to 500), never
+        // masquerade as an empty agent (which would 400 as invalid_agent).
+        assert!(db.get_session("s1").is_err());
+    }
+
+    #[test]
+    fn fresh_schema_keeps_nullable_profile_for_old_binaries() {
+        let t = TempDir::new("fresh-profile").unwrap();
+        let path = t.0.join("platform.db");
+        let _db = Registry::open(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for table in ["sessions", "runs"] {
+            let mut st = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let cols: Vec<String> = st
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                cols.contains(&"profile".to_string()),
+                "{table} keeps profile"
+            );
+        }
+    }
+
+    #[test]
     fn run_lifecycle() {
         let t = TempDir::new("runs").unwrap();
         let db = t.db();
         db.create_session(&sess("s1")).unwrap();
-        let r = NewRun {
-            id: "r-aaaaa".into(),
-            sid: "s1".into(),
-            profile: "codex".into(),
-            prompt: Some("touch /hello.txt".into()),
-            argv_json: Some(r#"[\"codex\",\"exec\"]"#.into()),
-        };
+        let mut r = run("r-aaaaa", "s1");
+        r.prompt = Some("touch /hello.txt".into());
+        r.argv = vec!["codex".into(), "exec".into(), "touch /hello.txt".into()];
         db.insert_run(&r, R_QUEUED, Some("/sessions/s1/runs/r-aaaaa.log"))
             .unwrap();
         assert_eq!(db.get_run("r-aaaaa").unwrap().unwrap().status, R_QUEUED);
@@ -722,13 +949,7 @@ mod tests {
     fn run_requires_existing_session() {
         let t = TempDir::new("fk").unwrap();
         let db = t.db();
-        let r = NewRun {
-            id: "r-bbbbb".into(),
-            sid: "ghost".into(),
-            profile: "codex".into(),
-            prompt: None,
-            argv_json: None,
-        };
+        let r = run("r-bbbbb", "ghost");
         assert!(db.insert_run(&r, R_QUEUED, None).is_err());
     }
 
@@ -765,13 +986,7 @@ mod tests {
         let db = t.db();
         db.create_session(&sess("s1")).unwrap();
         for (id, pid) in [("r-live", Some(7)), ("r-nopid", None)] {
-            let r = NewRun {
-                id: id.into(),
-                sid: "s1".into(),
-                profile: "codex".into(),
-                prompt: None,
-                argv_json: None,
-            };
+            let r = run(id, "s1");
             db.insert_run(&r, R_QUEUED, None).unwrap();
             if let Some(p) = pid {
                 db.set_run_pid(id, p).unwrap();

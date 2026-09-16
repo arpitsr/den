@@ -243,7 +243,7 @@ TLS is a reverse-proxy concern, out of scope.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | /v1/health | version, fusermount3/slirp4netns presence, limits, uptime |
-| POST | /v1/sessions | create/reserve: `{sid?, kind, profile, seed_dir?, seed_git?, seed_dirty?}` → `{sid}` |
+| POST | /v1/sessions | create/reserve: `{sid?, kind, agent, seed_dir?, seed_git?, seed_dirty?}` → `{sid}` (`agent` = full argv, e.g. `["codex","exec"]`; legacy `profile` still accepted as `agent=[profile]`) |
 | GET | /v1/sessions | list (registry ∪ dir scan) |
 | GET | /v1/sessions/:sid | row + fs summary (entry count, seed.sha, base key, attach info) |
 | GET | /v1/sessions/:sid/files?path=… | read file / list dir via AgentFS SDK (read-only) |
@@ -270,19 +270,14 @@ in-line. Extract into `diff_run_snap(sid, before) -> RunDelta`:
 print_run_summary calls it (CLI output byte-identical), serve serializes it
 into `runs.delta_json`. The only change touching existing run code.
 
-## 10. Headless invocation map (turn kind)
+## 10. Agent argv (turn kind; no per-agent map)
 
-Extend `Profile` (src/main.rs:79) with headless argv; serve never passes a
-TTY (child stdio = pipes + log):
-
-| profile | invocation |
-|---|---|
-| dex | `dex -p "<prompt>"` (one-shot turn; `dex serve` for daemon kind) |
-| claude | `claude -p "<prompt>"` (opt `--output-format json`, slice 3) |
-| codex | `codex exec "<prompt>"` |
-| gemini | `gemini -p "<prompt>"` |
-| opencode | `opencode run "<prompt>"` |
-| ak, pi, unknown | prompt as bare arg; documented as unproven headless |
+The session stores full agent argv at create (e.g. `["codex", "exec"]`,
+`["claude", "-p"]`, `["touch"]`); serve never passes a TTY (child stdio =
+pipes + log) and never injects per-agent flags. A run appends the prompt
+bare: `agent + [prompt]`. The caller owns headless flags — they are part of
+the agent at create. Daemon kind appends `serve --fd <n>` to the stored
+agent the same way.
 
 ## 11. Clients
 

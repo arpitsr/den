@@ -284,18 +284,19 @@ fn token() -> Option<String> {
         .filter(|t| !t.is_empty())
 }
 
-/// POST /v1/sessions → 201 SessionRow ({"sid", ...}). The seed spec passes
-/// through untouched (dir/git are exclusive — the API rejects a mixed POST);
-/// a silently-dropped seed flag here would leave the user's agent without
+/// POST /v1/sessions → 201 SessionRow ({"sid", ...}). The agent is full
+/// argv (e.g. ["codex", "exec"]); the seed spec passes through untouched
+/// (dir/git are exclusive — the API rejects a mixed POST); a
+/// silently-dropped seed flag here would leave the user's agent without
 /// code while they believe it was seeded.
 fn create_session(
-    profile: &str,
+    agent: &[String],
     seed_dir: Option<&str>,
     seed_git: Option<&str>,
     seed_dirty: Option<&str>,
 ) -> Result<String> {
     let sp = socket_path();
-    let mut body = json!({"profile": profile});
+    let mut body = json!({"agent": agent});
     if let Some(d) = seed_dir {
         body["seed_dir"] = json!(d);
     }
@@ -328,28 +329,29 @@ fn launch_run(sid: &str, prompt: &str) -> Result<String> {
         .context("launch run: no run_id in response")
 }
 
-/// Create + launch; returns (sid, rid).
+/// Create + launch; returns (sid, rid). Seed lives once per session
+/// (stored at create, applied at first run) — runs carry only the prompt.
 pub fn create_and_launch(
-    profile: &str,
+    agent: &[String],
     prompt: &str,
     seed_dir: Option<&str>,
     seed_git: Option<&str>,
     seed_dirty: Option<&str>,
 ) -> Result<(String, String)> {
-    let sid = create_session(profile, seed_dir, seed_git, seed_dirty)?;
+    let sid = create_session(agent, seed_dir, seed_git, seed_dirty)?;
     let rid = launch_run(&sid, prompt)?;
     Ok((sid, rid))
 }
 
 /// `den up`: create + launch, return (sid, rid) without streaming.
 pub fn up(
-    profile: &str,
+    agent: &[String],
     prompt: &str,
     seed_dir: Option<&str>,
     seed_git: Option<&str>,
     seed_dirty: Option<&str>,
 ) -> Result<(String, String)> {
-    create_and_launch(profile, prompt, seed_dir, seed_git, seed_dirty)
+    create_and_launch(agent, prompt, seed_dir, seed_git, seed_dirty)
 }
 
 /// GET /v1/sessions → {"sessions": [SessionRow]}.

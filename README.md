@@ -32,6 +32,76 @@ same session lifecycle, no containment — the agent runs with your full access.
 elsewhere. Need containment on a Mac? Run the Linux build inside
 Docker/Lima — the sandbox works unmodified in a Linux guest.
 
+## Architecture
+
+Components (boxes) expose interfaces (`O--`) and depend on others (`-->`).
+`serve` supervises; only `den exec` enters namespaces. The session DB is the FS.
+
+```text
+LEGEND:  [Component src/file.rs]   O-- provides   --> requires/uses
+         - - - trust boundary (sandbox code escapes only via FUSE mnt or Proxy P)
+
+ +--------------------------+      HTTPS/Bearer :8520  +-------------------------------+
+ | Clients                  |      unix socket SO_PEERCRED | <<component>> den serve      |
+ | den CLI/client.rs        | O-------------------------->O provides: REST /v1           |
+ | dex TUI, curl, CI        |                              | src/serve.rs                  |
+ +--------------------------+                              +------+------------------------+
+                                                                  | | uses
+                                            +---------------------+ +----------------------+
+                                            |                     |                        |
+                                   O--------+------O     O--------+-------O     O----------+---------O
+                                   | Registry      |     | Runner         |     | Durability (host)  |
+                                   | src/registry  |     | src/runner.rs  |     | backup/push/       |
+                                   | platform.db   |     | process|sandbox|     | replicate/pull     |
+                                   | sessions/runs |     | --spawns-->    |     | LTX, git, S3       |
+                                   | /keys         |     | den exec       |     | creds stay here    |
+                                   +---------------+     +--------+-------+     +----------+---------+
+                                                                  |                        |
+                                                        spawn     |                        | reads delta
+                                                                  v                        v
+ + - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -+
+ | <<component>> den exec <sid>  (M orchestrator, init userns, host netns)  src/sandbox.rs |
+ |                                                                                        |
+ |  +---------------------+   provides POSIX   +--------------------------------------+   |
+ |  | FUSE server         | O---------------->O LayeredFS  base U delta - whiteout    |   |
+ |  | src/fuse.rs+mount.rs|   bind mnt -> cwd  | src/layer.rs  delta-wins, copy-up     |   |
+ |  +----------+----------+                    +------+-------------------------------+   |
+ |             |                                      | requires                              |
+ |             +--------------+-----------------------+                                       |
+ |                            | bind                                                  +-----+------+
+ |  +----------------+  +-----+----------------------------------+   allows TCP only  | Proxy P    |
+ |  | N userns holder|  | U mount/pid/ipc/uts/net (in-ns root)   +--O---------------->O proxy.rs  |
+ |  | spawns slirp   +->O RO-remount, hides, fresh /dev,/tmp     |   10.0.2.2         | policy.rs  |
+ |  +-------+--------+  | nft, slirp tap0 eth0 10.0.2.100/24     |                    +-----+------+
+ |          |           | +----------------+                     |                          | allowlist
+ |          |           | | A pid-1 init   +--exec--> agent CLI  |                          v
+ |          |           | | seccomp,rlimits|  (pid 2, cwd=mnt)   |                    O-----+------O
+ |          |           | +----------------+                     |                    | EgressPolicy |
+ |          |           +----------------------------------------+                    | defaults +   |
+ + - - - - -|- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -| egress.yaml  |
+            |                                                                       +------------+-- - - - -+
+            |  Storage ~/.den (host side)                                                            |
+            |   bases/<key>/base.db (ro)  sessions/<sid>/fs.db (delta, truth)                       |
+            |   sessions/<sid>/base (pin)  sessions/<sid>/mnt  runs/<sid>/<rid>.log                 |
+            |                                                                                      |
+            |  EXTERNAL: agent CLI (claude/codex/dex) | internet (via P) | git/S3 (via Durability)  |
+            +--------------------------------------------------------------------------------------+
+```
+
+| Component | Provides | Requires | Notes |
+|---|---|---|---|
+| `den serve` (`src/serve.rs`) | `REST /v1`, socket daemon | `Registry`, `Runner` | multithreaded axum; never `fork`/`unshare` |
+| `Registry` (`src/registry.rs`) | sessions/runs/keys | `platform.db` | rebuildable index; `fs.db` is truth |
+| `Runner` (`src/runner.rs`) | `process` / `sandbox` backends | `den exec` child | `process` = plain child (macOS OK) |
+| `den exec` / Sandbox (`src/sandbox.rs`) | isolated `cwd` + `DEN_PROXY_URL` | `FUSE`, `Net`, `Proxy` | chain `M->N->U->A`; pipes: `uid_map`, `netns-ready`, `net-ready`, `agent-pid` |
+| `FUSE` (`src/fuse.rs`, `src/mount.rs`) | POSIX `mnt` | `LayeredFS` | `AgentFSFuse` over `fuser`; `mnt` bind-mounted onto `cwd` |
+| `LayeredFS` (`src/layer.rs`) | merged `base U delta - whiteout` | `base.db` (ro) + `fs.db` (rw) | delta-wins lookup, copy-up on write, `fs_whiteout` tombstones |
+| `Net` (`slirp4netns` + `nft`) | `eth0 10.0.2.100/24`, DNS `10.0.2.3` | `N` spawns after `U` ready | `DEN_NET=proxy` (default) / `none` / `full` |
+| `Proxy P` (`src/proxy.rs`, `src/policy.rs`) | allowlist egress `10.0.2.2` | `EgressPolicy` | `CONNECT` + absolute-URI; defaults + `egress.yaml` + `DEN_PROXY_ALLOW`; deny wins |
+
+Second `den exec --session <sid>` joins the same `mnt` + `fs.db`.
+See `docs/layered-sessions.md`, `docs/platform-api.md`, `docs/runtime-contract.md`.
+
 ## Install
 
 Grab a tarball from
@@ -126,7 +196,7 @@ den serve --socket $XDG_RUNTIME_DIR/den/den.sock
 curl -s -H "Authorization: Bearer $DEN_API_TOKEN" localhost:8520/v1/health
 SID=$(curl -s -XPOST -H "Authorization: Bearer $DEN_API_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"profile":"claude","seed_git":"https://github.com/you/repo"}' \
+  -d '{"agent":["claude","-p"],"seed_git":"https://github.com/you/repo"}' \
   localhost:8520/v1/sessions | jq -r .sid)
 curl -s -XPOST -H "Authorization: Bearer $DEN_API_TOKEN" \
   -d '{"prompt":"refactor auth"}' localhost:8520/v1/sessions/$SID/runs   # launch a turn
@@ -170,18 +240,18 @@ cd /path/to/your/project
 den claude --seed . "refactor auth"   # new session preloaded with the cwd; runs `claude` inside
 den claude --seed . --seed-dirty all "finish the wip"  # seed uncommitted changes too (default: ask [y/N], N seeds HEAD)
 den claude "continue the refactor"    # resumes: the DB is the whole FS, host tree ignored
-den codex  "fix the flaky test"       # separate session per profile+dir
+den codex  "fix the flaky test"       # each run gets a fresh random session (s-<id>)
 den pi     "..."                      # no --seed: starts in an empty virtual FS
 den opencode
 den dex "triage inbox"          # XDG-based agent: config/state/cache persist with zero flags
-den list                      # known profiles (any other CLI works: den <cmd> args...)
 den selftest                  # sanity-check argv assembly
 den selftest --sandbox        # full round-trip: seed, mount, vfs writes, ro-enforcement
 den dump codex exec --json    # print the exact run argv (no exec)
 den sessions                  # list persisted sessions with entry counts
 den sessions --select         # show numbered sessions, choose one, print its id
 den inspect [session-id]      # open a session's fs.db; omit id to choose interactively
-den up [flags] <profile> <prompt...>   # launch a session run in the background daemon and exit
+den up [flags] <agent...> [--] <prompt...>  # launch a run in the background daemon and exit
+                                # e.g. den up codex exec -- fix the test
 den logs <sid>                # show the latest run log for a session
 den attach <sid>              # open the dex TUI against a daemon-attached session (needs POST /attach first)
 den push [sid] [--branch b] [--to dir] [--remote r] [-m msg] [--dry-run] [--keep] [--pr]
@@ -240,13 +310,15 @@ are never pushed; the session's `.git` is its own private history.
 
 ### Resume / fresh / quiet
 
-By default the session id is `<profile>-<dirname>`, so re-running `den claude` in the
-same dir **resumes** the same sandbox (changes persist across calls).
+Each run gets a fresh random session id (`s-<id>`) unless `DEN_SESSION` pins one.
+Re-running with the same `DEN_SESSION` **resumes** that sandbox (changes
+persist across calls); otherwise sessions never collide and never silently
+join.
 
 | env            | effect                                                          |
 |----------------|----------------------------------------------------------------|
-| `DEN_SESSION`   | pin/resume this session id instead of the `<profile>-<dir>` default |
-| `DEN_NEW=1`     | start a fresh unique session, nothing carried over             |
+| `DEN_SESSION`   | pin/resume this session id instead of a fresh random one        |
+| `DEN_NEW=1`     | legacy, ignored — session ids are always random                |
 | `DEN_QUIET=1`   | don't print the post-run delta summary                          |
 | `DEN_LITESTREAM`| path to the `litestream` binary (default: from `PATH`)          |
 | `DEN_REPLICA`   | replica URL for `den replicate`/`den pull` (default: `LITESTREAM_REPLICA_URL`, then `LITESTREAM_BUCKET`) |
@@ -307,7 +379,7 @@ den restore codex-myproj.ltx --to /tmp/other.db
   LTX files rather than WAL frames. Every file is written complete, so a
   crash mid-session still leaves the chain restorable up to the last tick,
   and restarting `--watch` resumes from the newest file.
-* `den <profile> --autostart` starts the watch automatically when the agent
+* `den <cmd> --autostart` starts the watch automatically when the agent
   runs: a detached `den backup <sid> --watch` streams the session to
   `<sid>.ltx` (or `--out <base.ltx>`) while the sandbox works. It survives
   Ctrl-C on the run (log: `~/.den/sessions/<sid>/backup-watch.log`), stops on
@@ -339,13 +411,13 @@ export DEN_REPLICA=s3://my-bucket/coding-agents   # bucket is fixed; path is per
 # plus AWS creds (S3, or any S3-compatible endpoint via AWS_ENDPOINT_URL):
 export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
 
-den codex "fix the flaky test" --autostart   # litestream streams the session to S3 while the agent works
+den codex --autostart "fix the flaky test"   # litestream streams the session to S3 while the agent works
 den replicate codex-myproject                  # same, as a foreground daemon (Ctrl-C stops it)
 den pull codex-myproject                       # restore newest state back into the session dir
 den pull codex-myproject --force --to /tmp/db  # overwrite / restore elsewhere
 ```
 
-* `den <profile> --autostart` prefers litestream when a replica is configured
+* `den <cmd> --autostart` prefers litestream when a replica is configured
   **and** the binary is installed; otherwise it falls back to the local LTX
   watch above. A detached `den replicate <sid>` streams
   `~/.den/sessions/<sid>/fs.db` to `s3://<bucket>/<sid>/db` continuously
@@ -364,18 +436,16 @@ den pull codex-myproject --force --to /tmp/db  # overwrite / restore elsewhere
   refuses to overwrite an existing DB unless `--force`. Don't pull into a
   session while its agent is still running — same hazard as LTX restore.
 
-## Commands (profiles)
+## Commands (agents)
 
 Any first argument is the command to run: `den anything args...` execs
-`anything args...` inside the sandbox. A few known agents get extra host dirs
-kept writable beyond the sandbox defaults (the four XDG base dirs —
-`~/.config`, `~/.local/share`, `~/.local/state`, `~/.cache` — plus legacy
-agent dotdirs like `~/.claude`, `~/.codex`, `~/.npm`): `ak` (`.ak`),
-`pi` (`.pi`), `opencode` (`.opencode`) — see `fn profile` in `src/main.rs`
-and `build_allowed_paths` in `src/sandbox.rs`. XDG-following agents (e.g.
-`dex`, which keeps config, state, logs and caches under `<base>/dex/`)
-persist with zero flags: `den dex ...` just works.
-Unknown commands just get the defaults.
+`anything args...` inside the sandbox — the agent is just argv, sessions are
+dumb buckets. The sandbox policy is one ruleset for every agent (writable
+host dirs beyond the sandbox defaults come from `default_allows` in
+`src/main.rs` plus `build_allowed_paths` in `src/sandbox.rs` — no per-agent
+branches). XDG-following agents (e.g. `dex`, which keeps config, state,
+logs and caches under `<base>/dex/`) persist with zero flags:
+`den dex ...` just works.
 
 ## Project layout
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # docs/socket-daemon.md phase gates — no LLM keys, no FUSE needed beyond the
-# touch-profile child (same trick as smoke-serve.sh: unknown profiles get the
-# prompt bare, so the child runs `den touch /path` in the real sandbox).
+# touch-agent child (agent ["touch"] runs the prompt bare, so the child runs
+# `den exec --session <sid> -- touch /path` in the real sandbox).
 #
 # Verifies: socket-only boot without a token, peercred health, TCP not bound,
 # second-serve refusal, proxied sessions, den up (background run), den logs,

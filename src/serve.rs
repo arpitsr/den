@@ -1,9 +1,11 @@
 //! den serve — the platform API (docs/platform-api.md).
 //!
 //! A supervisor, not a sandbox host: every session is a direct child
-//! process (`den <profile> …`), spawned with its own process group and
-//! reaped here. The sandbox's fork chain stays untouched; the registry
-//! (platform.db) is bookkeeping — fs.db is the truth.
+//! process (`den exec --session <sid> -- <agent...> …`), spawned with its
+//! own process group and reaped here. The sandbox's fork chain stays
+//! untouched; the registry (platform.db) is bookkeeping — fs.db is the
+//! truth. Sessions are dumb buckets: the agent is full argv stored at
+//! create, the sandbox policy is one ruleset for every agent.
 //!
 //! Env: DEN_API_TOKEN (required — no token, no server), DEN_BIND
 //! (default 127.0.0.1:8520), DEN_MAX_RUNS (default 8).
@@ -31,46 +33,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// Per-profile headless invocation (platform-api.md §10): how a profile
-/// takes a prompt without a TTY, and how a follow-up turn resumes the same
-/// conversation. Serve builds agent argv from here instead of inheriting a
-/// TTY. Unknown profiles get the prompt bare — documented "unproven
-/// headless" (a CLI that autodetects piped stdio still works).
-///
-/// dex pre-assigns its journal inside the session VFS
-/// (`~/.local/share/dex/sessions/<cwd-slug>/den-<sid>.jsonl`) —
-/// Session::open_or_continue creates or resumes it, so turn N+1 continues
-/// turn N with no capture step. Other profiles keep a bare turn here;
-/// capture-based resume (`<sid>/agent-session` + `claude --resume <id>`,
-/// `codex exec resume <id>`) is Phase 2 (platform-build-plan.md).
-fn headless_argv(profile_name: &str, sid: &str, prompt: &str) -> Result<Vec<String>> {
-    let p = crate::profile(profile_name);
-    let mut v = p.cmd.clone();
-    let turn: &[&str] = match profile_name {
-        "claude" | "gemini" | "dex" => &["-p"],
-        "codex" => &["exec"],
-        "opencode" => &["run"],
-        _ => &[],
-    };
-    if profile_name == "dex" {
-        v.push("--session".into());
-        v.push(dex_journal_path(sid));
-    }
-    v.extend(turn.iter().map(|s| s.to_string()));
-    v.push(prompt.to_string());
-    Ok(v)
-}
-
-/// The dex journal for a den session, inside the session VFS (so it is
-/// durable + replicable with fs.db and survives daemon-less turn runs).
-fn dex_journal_path(sid: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!(
-        "{home}/.local/share/dex/sessions/{}/den-{sid}.jsonl",
-        crate::slug(&crate::cwd_string())
-    )
-}
 
 /// platform.db sits next to the sessions root: ~/.den/platform.db
 pub(crate) fn platform_db_path() -> Result<std::path::PathBuf> {
@@ -102,7 +64,7 @@ struct Child {
     pid: u32,
     killed: AtomicBool,
     /// flock(LOCK_EX) held until the child is reaped — one live process per
-    /// session, across serve restarts and manual `den <profile>` runs.
+    /// session, across serve restarts and manual `den exec` runs.
     _lock: std::fs::File,
 }
 
@@ -344,12 +306,58 @@ struct CreateReq {
     sid: Option<String>,
     /// turn | daemon
     kind: Option<String>,
-    profile: String,
+    /// Full agent argv, e.g. ["codex", "exec"] or ["touch"]. The caller owns
+    /// headless flags — serve appends the run prompt bare, no per-agent map.
+    agent: Option<Vec<String>>,
+    /// Legacy single-command name (v1 clients): converted to agent argv with
+    /// the v1 headless flag (claude/gemini/dex get -p, codex gets exec,
+    /// opencode gets run) so old clients don't land in a TTY.
+    profile: Option<String>,
     seed_dir: Option<String>,
     /// git URL — cloned to a temp dir at first run and seeded from it
     /// (den-side, so host git credentials never enter the session)
     seed_git: Option<String>,
     seed_dirty: Option<String>,
+}
+
+/// Legacy v1 profile -> headless agent argv (the old per-agent map): without
+/// the flag the agent would wait on a TTY and the run would hang.
+fn legacy_agent(p: &str) -> Vec<String> {
+    match p {
+        "claude" | "gemini" | "dex" => vec![p.into(), "-p".into()],
+        "codex" => vec![p.into(), "exec".into()],
+        "opencode" => vec![p.into(), "run".into()],
+        _ => vec![p.into()],
+    }
+}
+
+/// Only dex serves a daemon — the attach token is handed to the child, so any
+/// other agent here would leak DEX_DAEMON_TOKEN to an arbitrary binary.
+fn supports_daemon(agent: &[String]) -> bool {
+    agent.first().map(String::as_str) == Some("dex")
+}
+
+/// Resolve the session agent argv: `agent` wins, else legacy `profile`.
+/// Turn sessions get the v1 headless flag (legacy_agent); daemon sessions
+/// stay bare (`dex` serves `serve --fd`, turn flags like `-p` would break
+/// the daemon verb).
+fn resolve_agent(req: &CreateReq) -> Result<Vec<String>> {
+    if let Some(a) = &req.agent {
+        if a.is_empty() || a.iter().any(|s| s.is_empty()) {
+            bail!("agent argv must be non-empty strings");
+        }
+        return Ok(a.clone());
+    }
+    if let Some(p) = &req.profile {
+        if p.is_empty() {
+            bail!("profile must be non-empty");
+        }
+        if req.kind.as_deref() == Some("daemon") {
+            return Ok(vec![p.clone()]);
+        }
+        return Ok(legacy_agent(p));
+    }
+    bail!("missing agent (or legacy profile)");
 }
 
 async fn create_session(
@@ -363,6 +371,10 @@ async fn create_session(
             Err(e) => return err_json(StatusCode::BAD_REQUEST, "invalid_sid", e),
         },
         None => format!("s-{}", random_suffix(5)),
+    };
+    let agent = match resolve_agent(&req) {
+        Ok(a) => a,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, "invalid_agent", e),
     };
     let seed_json = match (&req.seed_dir, &req.seed_git, &req.seed_dirty) {
         (Some(_), Some(_), _) => {
@@ -390,7 +402,7 @@ async fn create_session(
     let ns = NewSession {
         sid: sid.clone(),
         kind: req.kind.unwrap_or_else(|| "turn".into()),
-        profile: req.profile.clone(),
+        agent,
         seed_json,
         owner: Some(ctx.owner.clone()),
     };
@@ -965,13 +977,20 @@ async fn attach_session(
             ),
         );
     }
-    if sess.profile != "dex" {
+    if sess.agent.is_empty() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_agent",
+            "session has no agent argv",
+        );
+    }
+    if !supports_daemon(&sess.agent) {
         return err_json(
             StatusCode::BAD_REQUEST,
             "unsupported_daemon",
             format!(
-                "profile '{}' has no daemon mode yet (bridge: platform-api.md §3)",
-                sess.profile
+                "agent '{}' has no daemon mode yet (bridge: platform-api.md §3)",
+                sess.agent.first().cloned().unwrap_or_default()
             ),
         );
     }
@@ -1133,18 +1152,17 @@ async fn attach_session(
         Ok(f) => f,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "log_fd", format!("{e}")),
     };
+    // Daemon child: `den exec --session <sid> -- <agent...> serve --fd <n>`.
+    // The agent is full argv from create (dex-only, checked above); serve
+    // appends the daemon verb, it never branches on the agent name.
     let child = match st.runner.launch(crate::runner::Launch {
         exe: exe.to_string_lossy().into_owned(),
-        args: vec![
-            "exec".into(),
-            "--session".into(),
-            sid.clone(),
-            "--".into(),
-            sess.profile.clone(),
-            "serve".into(),
-            "--fd".into(),
-            fd.to_string(),
-        ],
+        args: {
+            let mut a = vec!["exec".into(), "--session".into(), sid.clone(), "--".into()];
+            a.extend(sess.agent.clone());
+            a.extend(["serve".into(), "--fd".into(), fd.to_string()]);
+            a
+        },
         sid: sid.clone(),
         env: vec![
             ("DEX_DAEMON_TOKEN".into(), token.clone()),
@@ -1441,12 +1459,24 @@ async fn launch_run(
         Ok(f) => f,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "log_fd", format!("{e}")),
     };
+    // Full run argv: session agent + prompt bare. The caller owns headless
+    // flags (they are part of the agent at create); serve never injects
+    // per-agent args. Seed lives once per session (stored at create, applied
+    // at first run via seed_into_args when the DB is absent).
+    let mut full_argv = sess.agent.clone();
+    if full_argv.is_empty() {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_agent",
+            "session has no agent argv",
+        );
+    }
+    full_argv.push(req.prompt.clone());
     let nr = NewRun {
         id: run_id.clone(),
         sid: sid.clone(),
-        profile: sess.profile.clone(),
+        argv: full_argv.clone(),
         prompt: Some(req.prompt.clone()),
-        argv_json: None,
     };
     if let Err(e) = reg(&st.reg, move |r| {
         r.insert_run(&nr, registry::R_QUEUED, Some(&log_path_str))
@@ -1460,15 +1490,9 @@ async fn launch_run(
         );
     }
 
-    // Child argv: `den <profile> [--seed …] <headless turn>`. The child is a
-    // plain den run — it reuses the session (DEN_SESSION), stays quiet (the
-    // delta is computed here), and logs everything to the run log.
-    let mut argv = match headless_argv(&sess.profile, &sid, &req.prompt) {
-        Ok(v) => v,
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "argv", format!("{e:#}")),
-    };
-    let tail = argv.split_off(1); // [--session, path, -p, prompt] (or [flags, prompt])
-
+    // Child argv: `den exec --session <sid> [--seed …] -- <agent...> <prompt>`.
+    // The child is a plain den run — it reuses the session (DEN_SESSION),
+    // stays quiet (the delta is computed here), and logs to the run log.
     let exe = match runtime_bin() {
         Ok(e) => e,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "exe", format!("{e}")),
@@ -1479,8 +1503,7 @@ async fn launch_run(
             let mut a = vec!["exec".into(), "--session".into(), sid.clone()];
             a.extend(seed_into_args(sess.seed_json.as_deref(), &sid));
             a.push("--".into());
-            a.push(sess.profile.clone());
-            a.extend(tail);
+            a.extend(full_argv);
             a
         },
         sid: sid.clone(),
@@ -2292,9 +2315,6 @@ async fn serve_unix(st: Arc<ServeState>, path: PathBuf) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// env vars are process-global (dex_journal_path reads HOME)
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn pid_file_sits_next_to_the_socket() {
         assert_eq!(
@@ -2335,39 +2355,105 @@ mod tests {
     }
 
     #[test]
-    fn headless_argv_known_profiles() {
-        // flags + prompt assembly; path details stay out (cwd-dependent)
-        let codex = headless_argv("codex", "s1", "touch /hello.txt").unwrap();
-        assert_eq!(codex[0], "codex");
-        assert_eq!(codex[1], "exec");
-        assert_eq!(codex[codex.len() - 1], "touch /hello.txt");
-
-        for (name, flag) in [("claude", "-p"), ("gemini", "-p"), ("opencode", "run")] {
-            let v = headless_argv(name, "s1", "hi").unwrap();
-            assert_eq!(v[0], name);
-            assert!(v.contains(&flag.to_string()), "{name}: {v:?}");
-            assert_eq!(v[v.len() - 1], "hi");
+    fn resolve_agent_prefers_full_argv() {
+        let req = CreateReq {
+            sid: None,
+            kind: None,
+            agent: Some(vec!["codex".into(), "exec".into()]),
+            profile: None,
+            seed_dir: None,
+            seed_git: None,
+            seed_dirty: None,
+        };
+        assert_eq!(
+            resolve_agent(&req).unwrap(),
+            vec!["codex".to_string(), "exec".to_string()]
+        );
+        // legacy profile -> agent with its v1 headless flag (unknown stays bare)
+        let legacy = CreateReq {
+            agent: None,
+            profile: Some("touch".into()),
+            sid: None,
+            kind: None,
+            seed_dir: None,
+            seed_git: None,
+            seed_dirty: None,
+        };
+        assert_eq!(resolve_agent(&legacy).unwrap(), vec!["touch".to_string()]);
+        for (name, want) in [
+            ("claude", vec!["claude", "-p"]),
+            ("gemini", vec!["gemini", "-p"]),
+            ("dex", vec!["dex", "-p"]),
+            ("codex", vec!["codex", "exec"]),
+            ("opencode", vec!["opencode", "run"]),
+        ] {
+            let r = CreateReq {
+                agent: None,
+                profile: Some(name.into()),
+                sid: None,
+                kind: None,
+                seed_dir: None,
+                seed_git: None,
+                seed_dirty: None,
+            };
+            assert_eq!(
+                resolve_agent(&r).unwrap(),
+                want.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "legacy {name}"
+            );
         }
+        // daemon kind stays bare: `dex` serves `serve --fd`, no turn flag
+        let daemon_legacy = CreateReq {
+            agent: None,
+            profile: Some("dex".into()),
+            sid: None,
+            kind: Some("daemon".into()),
+            seed_dir: None,
+            seed_git: None,
+            seed_dirty: None,
+        };
+        assert_eq!(
+            resolve_agent(&daemon_legacy).unwrap(),
+            vec!["dex".to_string()]
+        );
+        // daemon allowlist: dex only, so the token never goes to arbitrary argv
+        assert!(supports_daemon(&["dex".to_string()]));
+        assert!(!supports_daemon(&["codex".to_string(), "exec".to_string()]));
+        assert!(!supports_daemon(&[]));
+        // missing and empty both fail
+        let missing = CreateReq {
+            agent: None,
+            profile: None,
+            sid: None,
+            kind: None,
+            seed_dir: None,
+            seed_git: None,
+            seed_dirty: None,
+        };
+        assert!(resolve_agent(&missing).is_err());
+        let empty = CreateReq {
+            agent: Some(vec![]),
+            profile: None,
+            sid: None,
+            kind: None,
+            seed_dir: None,
+            seed_git: None,
+            seed_dirty: None,
+        };
+        assert!(resolve_agent(&empty).is_err());
     }
 
     #[test]
-    fn headless_argv_dex_preassigns_journal() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let v = headless_argv("dex", "sess-42", "explain this repo").unwrap();
-        assert_eq!(v[0], "dex");
-        // journal path sits between --session and the -p flag; it must land
-        // inside the session VFS and carry the den session id
-        assert_eq!(v[1], "--session");
-        let jp = &v[2];
-        assert!(jp.contains("/.local/share/dex/sessions/"), "{jp}");
-        assert!(jp.ends_with("den-sess-42.jsonl"), "{jp}");
-        assert_eq!(v[3], "-p");
-        assert_eq!(v[v.len() - 1], "explain this repo");
-    }
-
-    #[test]
-    fn headless_argv_unknown_profile_runs_prompt_bare() {
-        let v = headless_argv("some-future-agent", "s1", "do the thing").unwrap();
-        assert_eq!(v, vec!["some-future-agent", "do the thing"]);
+    fn run_argv_is_agent_plus_prompt_bare() {
+        // No per-agent map: full argv = stored agent + prompt as one arg.
+        let agent = vec!["touch".to_string()];
+        let mut full = agent.clone();
+        full.push("./hello.txt".to_string());
+        assert_eq!(full, vec!["touch", "./hello.txt"]);
+        let agent = vec!["codex".to_string(), "exec".to_string()];
+        let mut full = agent.clone();
+        full.push("do the thing".to_string());
+        assert_eq!(full[..2], ["codex", "exec"]);
+        assert_eq!(full[2], "do the thing");
     }
 }
