@@ -6,6 +6,12 @@ on:
   push:
     branches: [develop]
 
+# audit-check publishes a check run; the default token is read-only on
+# pull_request events and 403s at the end of the job without this.
+permissions:
+  checks: write
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
