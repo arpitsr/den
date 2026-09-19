@@ -44,7 +44,7 @@ impl Drop for MountHandle {
 }
 
 /// Unmount via fusermount3/fusermount (setuid helper; `-uz` = lazy).
-fn unmount_fuse(mountpoint: &Path, lazy: bool) -> Result<()> {
+pub(crate) fn unmount_fuse(mountpoint: &Path, lazy: bool) -> Result<()> {
     const FUSERMOUNT_COMMANDS: &[&str] = &["fusermount3", "fusermount"];
     let args: &[&str] = if lazy { &["-uz"] } else { &["-u"] };
 
@@ -286,4 +286,13 @@ pub fn is_mountpoint(path: &Path) -> bool {
         Err(_) => return false,
     };
     path_meta.dev() != parent_meta.dev()
+}
+
+/// True if `path` is a FUSE mount whose daemon is gone: stat fails with
+/// ENOTCONN ("Transport endpoint is not connected"), which also means
+/// `is_mountpoint` can't compare device IDs. Any access through such a
+/// mount errors the same way, so the caller should unmount (lazy, since the
+/// dead mount may have referrers) before re-mounting.
+pub fn is_dead_mount(path: &Path) -> bool {
+    matches!(std::fs::metadata(path), Err(e) if e.raw_os_error() == Some(libc::ENOTCONN))
 }

@@ -317,6 +317,14 @@ fn drop_stale_session(sid: &str, allows: &[String]) -> Result<()> {
 /// kernel keeps a mount attached to a dead path and the next session at that
 /// path fails with ENOENT.
 fn unmount_stale(mnt: &Path) {
+    // A dead FUSE mount (daemon gone) fails stat() with ENOTCONN, so the
+    // `!mnt.exists()` check below would skip it and leave the corpse —
+    // every access through it keeps erroring with os error 107.
+    if crate::mount::is_dead_mount(mnt) {
+        let _ = Command::new("fusermount3").arg("-uz").arg(mnt).status();
+        let _ = Command::new("fusermount").arg("-uz").arg(mnt).status();
+        return;
+    }
     if !mnt.exists() {
         return;
     }
