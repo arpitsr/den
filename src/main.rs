@@ -321,8 +321,7 @@ fn unmount_stale(mnt: &Path) {
     // `!mnt.exists()` check below would skip it and leave the corpse —
     // every access through it keeps erroring with os error 107.
     if crate::mount::is_dead_mount(mnt) {
-        let _ = Command::new("fusermount3").arg("-uz").arg(mnt).status();
-        let _ = Command::new("fusermount").arg("-uz").arg(mnt).status();
+        let _ = crate::mount::unmount_fuse(mnt, true);
         return;
     }
     if !mnt.exists() {
