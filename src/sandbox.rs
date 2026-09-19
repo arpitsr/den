@@ -276,6 +276,20 @@ pub async fn run_cmd(
 
     let session = setup_run_directory(&session_id)?;
 
+    // A crashed earlier run can leave a FUSE mount whose daemon is gone:
+    // every access through it fails with ENOTCONN ("Transport endpoint is
+    // not connected"), and is_mountpoint can't even see it. Drop the corpse
+    // so this run mounts fresh instead of erroring out.
+    if crate::mount::is_dead_mount(&session.fuse_mountpoint) {
+        eprintln!(
+            "den: dead FUSE mount at {} (daemon gone) — unmounting",
+            session.fuse_mountpoint.display()
+        );
+        if let Err(e) = crate::mount::unmount_fuse(&session.fuse_mountpoint, true) {
+            eprintln!("den: failed to unmount dead mount: {e:#}");
+        }
+    }
+
     // Same layout as agentfs: if the FUSE mountpoint is already mounted, join
     // the running session instead of starting a second overlay.
     if crate::mount::is_mountpoint(&session.fuse_mountpoint) {
